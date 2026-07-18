@@ -18,7 +18,10 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Run shellcheck
-        run: shellcheck control-plane/*.sh
+        run: shellcheck -x control-plane/*.sh scripts/*.sh tests/*.sh
+
+      - name: Run auto-merge decision tests
+        run: bash tests/test_auto_merge_logic.sh
 
   powershell:
     name: PowerShell analyze + test

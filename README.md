@@ -83,12 +83,14 @@ robot.
 .
 ├── README.md                     <- you are here
 ├── in-guest/                     <- runs on the Windows EC2 box (PowerShell 5.1)
-│   ├── Config.ps1                <- single source of truth (paths, tuning, task names)
+│   ├── Config.ps1                <- single source of truth (paths, tuning, task names,
+│   │                                 CompletionSignal: WorkerOnly/GpuOnly/WorkerOrGpu)
 │   ├── Watchdog.ps1              <- detects render complete/stalled, gates on file unlock
 │   ├── Stop-Sequence.ps1         <- optional S3 sync + SNS, then Stop-Computer -Force
 │   ├── Push-GpuMetric.ps1        <- publishes GPU% to CloudWatch every minute
 │   ├── Install.ps1               <- copies scripts into C:\topaz-autostop
-│   └── Register-ScheduledTasks.ps1  <- registers the two SYSTEM scheduled tasks
+│   ├── Register-ScheduledTasks.ps1  <- registers the two SYSTEM scheduled tasks
+│   └── tests/                    <- Pester unit tests (Resolve-RenderActive)
 ├── control-plane/                <- runs from an admin workstation (AWS CLI v2)
 │   ├── 01-set-shutdown-behavior.sh   <- set InstanceInitiatedShutdownBehavior=stop
 │   ├── 02-create-iam-role.sh         <- least-privilege instance role (PutMetricData)
@@ -102,7 +104,9 @@ robot.
 ├── lambda/
 │   └── max-lifetime-stop/         <- optional wall-clock cap Lambda
 │       ├── handler.py
+│       ├── test_handler.py
 │       └── README.md
+├── .github/workflows/ci.yml      <- shellcheck + PSScriptAnalyzer/Pester + ruff/pytest
 └── docs/                          <- full documentation set (linked below)
 ```
 
@@ -185,6 +189,23 @@ license decision.** This project does not grant any right to do so and does not
 constitute legal advice. If your license terms forbid this deployment, do not
 deploy it. See [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.md).
 
+## Testing & CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push/PR:
+`shellcheck` on `control-plane/*.sh`, PSScriptAnalyzer + Pester on `in-guest/`
+(including the [`in-guest/tests/`](in-guest/tests/) suite for the
+`Resolve-RenderActive` completion-decision helper), and `ruff` + `pytest` on
+[`lambda/max-lifetime-stop/`](lambda/max-lifetime-stop/). Run the Lambda tests
+locally with:
+
+```bash
+pip install -r lambda/max-lifetime-stop/requirements-dev.txt && pytest lambda/ -q
+```
+
+The Pester tests need PowerShell 7+ (`pwsh`), which is what CI runs them under;
+see [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) for how to run them
+locally.
+
 ## Documentation
 
 | Doc | Contents |
@@ -192,9 +213,10 @@ deploy it. See [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.
 | [docs/01-architecture.md](docs/01-architecture.md) | The diagram and design principles, expanded. |
 | [docs/02-phase0-confirmations.md](docs/02-phase0-confirmations.md) | DCV vs RDP, WDDM/display adapter, observing process/output/scratch, golden AMI. |
 | [docs/03-phase1-instance-prep.md](docs/03-phase1-instance-prep.md) | Shutdown behavior, IAM instance role, AutoAdminLogon caveat, PATH deps. |
-| [docs/04-phase2-watchdog.md](docs/04-phase2-watchdog.md) | How the watchdog works, why SYSTEM, DebounceSec tuning. |
+| [docs/04-phase2-watchdog.md](docs/04-phase2-watchdog.md) | How the watchdog works, `CompletionSignal` (`WorkerOnly`/`GpuOnly`/`WorkerOrGpu`), why SYSTEM, DebounceSec tuning. |
 | [docs/05-phase3-stop-sequence.md](docs/05-phase3-stop-sequence.md) | Event-driven stop, optional S3/SNS, DryRun, why `-Force` is safe. |
-| [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md) | GPU-idle alarm, the Windows metric publisher, optional Lambda. |
+| [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md) | GPU-idle alarm, the multi-GPU-safe metric publisher, optional Lambda. |
 | [docs/07-phase5-notifications.md](docs/07-phase5-notifications.md) | Optional SNS notify, `sns:Publish` permission. |
 | [docs/08-appendix-a-corrections.md](docs/08-appendix-a-corrections.md) | Eight bugs / wrong claims removed from the prior report. |
 | [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.md) | Decided design boundaries (single-user GUI-only, one Export click, no robot). |
+| [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) | What CI checks, and how to run the Pester and Lambda pytest suites locally. |

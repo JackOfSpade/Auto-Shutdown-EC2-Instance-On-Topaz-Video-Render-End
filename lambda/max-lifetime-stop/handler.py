@@ -199,8 +199,10 @@ def handler(event, context):
     try:
         stop_response = ec2.stop_instances(InstanceIds=[instance_id])
     except ClientError as exc:
+        # Re-raise so the invocation is recorded as failed (and can be alarmed
+        # on / retried); the max-lifetime cap must not silently swallow a
+        # failed stop. The decision `result` is intentionally not returned here.
         logger.error("stop_instances failed for %s: %s", instance_id, exc)
-        result.update(action="error", reason=f"stop-failed:{exc.response.get('Error', {}).get('Code', 'Unknown')}")
         raise
 
     transitions = {

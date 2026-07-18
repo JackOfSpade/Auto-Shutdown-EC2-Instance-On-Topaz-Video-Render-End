@@ -1,0 +1,9 @@
+# Dev/test dependencies for lambda/max-lifetime-stop.
+# Install with: pip install -r requirements-dev.txt
+#
+# botocore.stub.Stubber (used by test_handler.py) ships inside botocore,
+# which boto3 pulls in as a dependency; it's listed explicitly here since
+# the tests import it directly.
+boto3>=1.34.0
+botocore>=1.34.0
+pytest>=7.4.0

@@ -60,11 +60,21 @@ The alarm is only as good as the metric feeding it, and that metric comes from
 [Phase 2](04-phase2-watchdog.md) as the once-per-minute SYSTEM task
 `TopazAutoStop-GpuMetric`. Each run:
 
-1. Reads GPU utilization from `nvidia-smi --query-gpu=utilization.gpu
-   --format=csv,noheader,nounits` (first GPU line).
-2. Resolves instance id and region from IMDSv2 (region = the availability zone
-   with its trailing zone letter stripped, e.g. `us-east-1a` -> `us-east-1` -
-   never hardcoded).
+1. Reads GPU utilization via the shared `Get-GpuUtilizationMax` helper in
+   [`Config.ps1`](../in-guest/Config.ps1), which runs `nvidia-smi
+   --query-gpu=utilization.gpu --format=csv,noheader,nounits` and publishes the
+   **maximum** value across **all** GPUs on the box, not just the first line.
+   This matters on a multi-GPU instance (e.g. a `g5.12xlarge` with 4 GPUs):
+   Topaz typically loads a single GPU, so reading only the first GPU line could
+   report ~0% during an actively-rendering job and let the idle alarm below
+   false-stop the box. Returns `$null` (rather than `0`) if the read fails, so a
+   failed read is never confused with a genuinely idle GPU.
+2. Resolves instance id and region from IMDSv2 via the shared `Get-Ec2Identity`
+   helper (also in `Config.ps1`), using ONE token for both calls. Region is read
+   from the dedicated `placement/region` endpoint - correct for Local Zones and
+   Wavelength, where stripping the trailing letter off the availability zone does
+   not yield a valid region - falling back to the AZ-letter-strip only if that
+   endpoint is unavailable.
 3. Publishes `TopazRender/GPU / GPUUtilization` (unit `Percent`, dimension
    `InstanceId=...`) via `aws cloudwatch put-metric-data`.
 

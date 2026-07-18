@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-lint:
+    name: Shell lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: shellcheck control-plane/*.sh
+
+  powershell:
+    name: PowerShell analyze + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer + Pester
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Run PSScriptAnalyzer (fail only on Error severity)
+        run: |
+          # Warnings are expected and allowed: the in-guest scripts intentionally
+          # use Windows-only cmdlets (Get-CimInstance, Get-ScheduledTask, etc.)
+          # that PSScriptAnalyzer flags as non-portable when analyzed from a
+          # non-Windows host. Only Error/ParseError severities fail the build.
+          $results = Invoke-ScriptAnalyzer -Path in-guest -Recurse
+          $results | Format-Table -AutoSize
+
+          $blocking = @($results | Where-Object { $_.Severity -in @('Error', 'ParseError') })
+          if ($blocking.Count -gt 0) {
+              Write-Host "::error::PSScriptAnalyzer found $($blocking.Count) Error-severity issue(s)."
+              $blocking | Format-Table -AutoSize
+              exit 1
+          }
+
+          Write-Host "PSScriptAnalyzer: no Error-severity issues (warnings are allowed)."
+
+      - name: Run Pester tests
+        run: |
+          # Force Pester 5 explicitly: some runners ship the legacy Pester 3.4
+          # which would otherwise auto-load first and reject the v5 -CI syntax.
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          Invoke-Pester -Path in-guest/tests -CI
+
+  python-lambda:
+    name: Python lambda lint + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install ruff pytest boto3
+
+      - name: Run ruff
+        run: ruff check lambda/
+
+      - name: Run pytest
+        run: pytest lambda/ -q

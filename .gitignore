@@ -8,6 +8,12 @@ lambda/**/*.zip
 __pycache__/
 *.pyc
 
+# Test / lint tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # Local operator overrides (never commit real instance IDs / secrets)
 *.local.ps1
 *.local.sh

@@ -47,31 +47,12 @@ Write-TopazLog -Component 'stop' -Level 'INFO' `
     -Message "Stop sequence invoked (reason=$Reason, dryRun=$($cfg.DryRun))."
 
 # ---------------------------------------------------------------------------
-# Best-effort: discover this instance's id (only for nicer notifications).
-# IMDSv2. Never let this block the stop.
+# Best-effort: discover this instance's id (only for nicer notifications) via
+# the shared IMDSv2 helper. Never let this block the stop.
 # ---------------------------------------------------------------------------
 
-function Get-InstanceIdBestEffort {
-    try {
-        $token = Invoke-RestMethod -Method Put `
-            -Uri 'http://169.254.169.254/latest/api/token' `
-            -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '60' } `
-            -TimeoutSec 3 -ErrorAction Stop
-
-        $id = Invoke-RestMethod -Method Get `
-            -Uri 'http://169.254.169.254/latest/meta-data/instance-id' `
-            -Headers @{ 'X-aws-ec2-metadata-token' = $token } `
-            -TimeoutSec 3 -ErrorAction Stop
-
-        return "$id".Trim()
-    }
-    catch {
-        return $null
-    }
-}
-
-$instanceId = Get-InstanceIdBestEffort
-if (-not $instanceId) { $instanceId = 'i-XXXXXXXXXXXXXXXXX' }
+$instanceId = (Get-Ec2Identity).InstanceId
+if ([string]::IsNullOrWhiteSpace($instanceId)) { $instanceId = 'i-XXXXXXXXXXXXXXXXX' }
 
 # ---------------------------------------------------------------------------
 # 1. Optional S3 sync (runs BEFORE power off so artifacts are safe).

@@ -18,7 +18,10 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Run shellcheck
-        run: shellcheck -x control-plane/*.sh scripts/*.sh tests/*.sh
+        # --source-path=SCRIPTDIR resolves each `# shellcheck source=` directive
+        # relative to the sourcing file's own directory (so tests/ can follow
+        # ../scripts/*.sh); without it shellcheck emits SC1091 and fails the job.
+        run: shellcheck -x --source-path=SCRIPTDIR control-plane/*.sh scripts/*.sh tests/*.sh
 
       - name: Run auto-merge decision tests
         run: bash tests/test_auto_merge_logic.sh

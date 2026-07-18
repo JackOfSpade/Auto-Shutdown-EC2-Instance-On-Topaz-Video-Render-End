@@ -1,0 +1,22 @@
+# Logs produced by the in-guest scripts at runtime
+logs/
+*.log
+
+# Lambda build artifacts
+lambda/**/build/
+lambda/**/*.zip
+__pycache__/
+*.pyc
+
+# Local operator overrides (never commit real instance IDs / secrets)
+*.local.ps1
+*.local.sh
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

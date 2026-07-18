@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StopSelfWhenTagged",
+      "Effect": "Allow",
+      "Action": "ec2:StopInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/AutoStopEligible": "true"
+        }
+      }
+    }
+  ]
+}

@@ -90,12 +90,15 @@ robot.
 │   ├── Push-GpuMetric.ps1        <- publishes GPU% to CloudWatch every minute
 │   ├── Install.ps1               <- copies scripts into C:\topaz-autostop
 │   ├── Register-ScheduledTasks.ps1  <- registers the two SYSTEM scheduled tasks
-│   └── tests/                    <- Pester unit tests (Resolve-RenderActive)
+│   └── tests/                    <- Pester unit tests (Config.ps1 + Watchdog.ps1 pure helpers)
 ├── control-plane/                <- runs from an admin workstation (AWS CLI v2)
 │   ├── 01-set-shutdown-behavior.sh   <- set InstanceInitiatedShutdownBehavior=stop
 │   ├── 02-create-iam-role.sh         <- least-privilege instance role (PutMetricData)
 │   ├── 03-create-idle-alarm.sh       <- out-of-band GPU-idle CloudWatch alarm
 │   ├── 04-deploy-max-lifetime-lambda.sh  <- optional hard-cap Lambda + schedule
+│   ├── lib/                       <- sourceable idempotency/validation helpers
+│   │   ├── aws-idempotent.sh
+│   │   └── validation.sh
 │   └── iam/                       <- trust + permission policy documents
 │       ├── instance-role-trust-policy.json
 │       ├── cloudwatch-putmetric-policy.json
@@ -109,7 +112,8 @@ robot.
 ├── scripts/
 │   └── auto_merge_decision.sh    <- sourceable CI-gate predicates for auto-merge-claude.yml
 ├── tests/
-│   └── test_auto_merge_logic.sh  <- tests for scripts/auto_merge_decision.sh
+│   ├── test_auto_merge_logic.sh  <- tests for scripts/auto_merge_decision.sh
+│   └── test_control_plane_validation.sh  <- tests for control-plane/lib/*.sh
 ├── .github/workflows/
 │   ├── ci.yml                    <- shellcheck/actionlint + PSScriptAnalyzer/Pester + ruff/pytest
 │   └── auto-merge-claude.yml     <- auto-merges CI-green branches into main
@@ -134,9 +138,12 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> ./control-plane/02-create-iam-role.sh
    ```
    `01` makes a guest shutdown stop (not terminate) the box. `02` grants only
-   `cloudwatch:PutMetricData` (optionally `ec2:StopInstances`, tag-scoped, via
+   `cloudwatch:PutMetricData`, scoped to the `METRIC_NAMESPACE` namespace
+   (default `TopazRender/GPU`; optionally `ec2:StopInstances`, tag-scoped, via
    `INCLUDE_EC2_STOP=1` - which also tags the instance `AutoStopEligible=true` so
-   that tag-scoped grant is actually usable). See
+   that tag-scoped grant is actually usable). If you override `MetricNamespace`
+   in `Config.ps1`, pass the SAME `METRIC_NAMESPACE` to `02` too, or the
+   watchdog's PutMetricData calls are denied. See
    [docs/03-phase1-instance-prep.md](docs/03-phase1-instance-prep.md).
 
 2. **In-guest - install the scripts, then register the SYSTEM tasks.** Edit the
@@ -156,9 +163,13 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    ```
    Creates a **per-instance** GPU-idle safety net alarm
    (`topaz-gpu-idle-autostop-<instance-id>`) that fires after `IDLE_MINUTES`
-   (default 30) of sustained sub-5% GPU. The script also prints
-   `disable-alarm-actions`/`enable-alarm-actions` commands for pausing it during
-   a long pre-render setup. See
+   (default 30) of sustained sub-5% GPU. Also accepts `METRIC_NAMESPACE`/
+   `METRIC_NAME` overrides (mirroring `Config.ps1`'s `MetricNamespace`/
+   `MetricName`) if you changed those from their defaults -- pass the SAME
+   `METRIC_NAMESPACE` you gave `02-create-iam-role.sh`, or this alarm watches
+   a namespace the instance role isn't even allowed to publish to. The script
+   also prints `disable-alarm-actions`/`enable-alarm-actions` commands for
+   pausing it during a long pre-render setup. See
    [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
 4. **Control plane - optional hard cap (skip if you do not want one).**
@@ -214,15 +225,19 @@ deploy it. See [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.
 ## Testing & CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push/PR:
-`shellcheck` on `control-plane/*.sh`, `scripts/*.sh`, and `tests/*.sh`;
+`shellcheck` on `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`,
+and `tests/*.sh`;
 `actionlint` (pinned Docker tag) on the workflow YAML, which also lints the
 bash embedded directly in workflow `run:` steps; the
 [`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) suite for
 the auto-merge-to-main decision logic in
 [`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh);
+[`tests/test_control_plane_validation.sh`](tests/test_control_plane_validation.sh)
+for the shared predicates in `control-plane/lib/*.sh`;
 PSScriptAnalyzer + Pester on `in-guest/` (including the
 [`in-guest/tests/`](in-guest/tests/) suite for the `Resolve-RenderActive`
-completion-decision helper; PSScriptAnalyzer fails the build on any
+completion-decision helper and `Watchdog.ps1`'s own pure helpers;
+PSScriptAnalyzer fails the build on any
 Error/ParseError, and on a Warning too unless its rule is explicitly
 allowlisted in `ci.yml`); and `ruff` + `pytest` on
 [`lambda/max-lifetime-stop/`](lambda/max-lifetime-stop/). Run the Lambda tests
@@ -236,6 +251,12 @@ Run the auto-merge decision tests locally with:
 
 ```bash
 bash tests/test_auto_merge_logic.sh
+```
+
+Run the control-plane validation tests locally with:
+
+```bash
+bash tests/test_control_plane_validation.sh
 ```
 
 The Pester tests need PowerShell 7+ (`pwsh`), which is what CI runs them under;

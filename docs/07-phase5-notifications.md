@@ -54,7 +54,8 @@ invocation has no default region and the publish call fails client-side.
 ## Best-effort: it never blocks the stop
 
 The notification is strictly best-effort. If `aws sns publish` returns a non-zero
-exit code or throws, the failure is **logged as a warning and ignored** - the box
+exit code, throws, or hangs past `AwsCliTimeoutSec` (default **60 s**, at which
+point it is killed), the failure is **logged as a warning and ignored** - the box
 still powers off. A notification problem must never keep a cost-accruing instance
 alive. This is the same discipline as the optional S3 sync
 ([Phase 3](05-phase3-stop-sequence.md)).

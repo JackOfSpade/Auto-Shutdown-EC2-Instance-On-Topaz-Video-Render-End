@@ -20,7 +20,7 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> [IDLE_MINUTES=30] \
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| Namespace / metric | `TopazRender/GPU` / `GPUUtilization` | The custom GPU metric the box publishes. |
+| Namespace / metric | `TopazRender/GPU` / `GPUUtilization` (override with `METRIC_NAMESPACE`/`METRIC_NAME`) | The custom GPU metric the box publishes. Only override these together with `Config.ps1`'s matching `MetricNamespace`/`MetricName` **and** the same `METRIC_NAMESPACE` passed to [`02-create-iam-role.sh`](03-phase1-instance-prep.md) (it re-scopes the instance role's `PutMetricData` grant to match), or the alarm ends up watching a metric nothing is even allowed to publish. |
 | Dimension | `InstanceId=<this instance>` | Scopes the alarm to one box. |
 | Statistic / period | `Average` / `60 s` | One data point per published minute. |
 | Evaluation periods | `IDLE_MINUTES` (default `30`) | `IDLE_MINUTES` x 60 s = **`IDLE_MINUTES` minutes** sustained. |
@@ -103,9 +103,15 @@ The alarm is only as good as the metric feeding it, and that metric comes from
    from the dedicated `placement/region` endpoint - correct for Local Zones and
    Wavelength, where stripping the trailing letter off the availability zone does
    not yield a valid region - falling back to the AZ-letter-strip only if that
-   endpoint is unavailable.
+   endpoint is unavailable. Even that fallback never guesses a malformed region
+   for a Local Zone/Wavelength AZ: `Convert-AzToRegion` recognizes when the
+   stripped candidate does not look like a standard region and leaves the region
+   empty (same as a full IMDS failure) instead of passing a bad `--region` to the
+   AWS CLI.
 3. Publishes `TopazRender/GPU / GPUUtilization` (unit `Percent`, dimension
-   `InstanceId=...`) via `aws cloudwatch put-metric-data`.
+   `InstanceId=...`) via `aws cloudwatch put-metric-data`, bounded to
+   `AwsCliTimeoutSec` (default **60 s**) so a hung `aws` call cannot wedge the
+   once-a-minute scheduled task forever.
 
 Every external call is wrapped in try/catch and the script **always exits 0**, so
 a bad read simply publishes nothing that minute rather than error-spamming the
@@ -143,8 +149,11 @@ performs, in order:
    it, so without this step the Lambda's stop call would fail
    `UnauthorizedOperation` on every fire - a silently dead safety net. This is
    step 1, before anything else is created.
-2. Zips [`lambda/max-lifetime-stop`](../lambda/max-lifetime-stop/) and creates the
-   execution role `topaz-max-lifetime-lambda-role` (shared across every
+2. Zips only `handler.py` from
+   [`lambda/max-lifetime-stop`](../lambda/max-lifetime-stop/) - not the test
+   suite, `conftest.py`, `requirements-dev.txt`, the README, or any stale
+   `__pycache__` bytecode - and creates the execution role
+   `topaz-max-lifetime-lambda-role` (shared across every
    instance - the policy is tag-scoped and byte-for-byte identical regardless of
    which instance it guards) from
    [`iam/lambda-execution-policy.json`](../control-plane/iam/lambda-execution-policy.json).
@@ -159,9 +168,10 @@ Per-instance function/schedule names exist for the same reason as the idle
 alarm's per-instance name above: a shared name would let a second instance's
 deploy silently clobber (re-target) the first instance's function and schedule.
 
-`MAX_LIFETIME_HOURS` (default **12**) must be a positive number (e.g. `12` or
-`4.5`); the deploy script validates this itself and rejects a bad value at
-deploy time, rather than deploying "successfully" while the Lambda silently
+`MAX_LIFETIME_HOURS` (default **12**) must be a positive, finite number (e.g.
+`12` or `4.5`); the deploy script validates this itself - including rejecting
+a numeric string long enough to overflow to infinity - and rejects a bad value
+at deploy time, rather than deploying "successfully" while the Lambda silently
 falls back to its own default and the deploy output lies about the effective
 ceiling.
 

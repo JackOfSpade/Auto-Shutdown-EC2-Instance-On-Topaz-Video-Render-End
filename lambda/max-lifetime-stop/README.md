@@ -90,8 +90,8 @@ to succeed.
 Deployed and scheduled by
 `../../control-plane/04-deploy-max-lifetime-lambda.sh`, which:
 
-- zips this source, creates the execution role + function (`python3.12`,
-  handler `handler.handler`), and
+- zips only `handler.py` (not the test suite or dev-only files), creates the
+  execution role + function (`python3.12`, handler `handler.handler`), and
 - creates an **EventBridge Scheduler** schedule that invokes the function on a
   fixed recurring cadence (the script's default expression is `rate(30 minutes)`),
   **falling back** to a classic CloudWatch Events rule when EventBridge Scheduler

@@ -128,7 +128,12 @@ jobs:
                 exit 1
               fi
               echo "::warning::Unresolved conflict merging $br."
-              gh pr create --base main --head "$br" \
+              # --head="$br" (equals form): keeps the flag and its value as a single argv
+              # token, which is safer to reason about and doesn't depend on the CLI's
+              # flag-value consumption semantics -- even though gh's current pflag-based
+              # parser happens to consume the next token as --head's value regardless of
+              # whether it starts with `-`.
+              gh pr create --base main --head="$br" \
                 --title "Auto-merge conflict: $br" \
                 --body "The auto-merge workflow hit a conflict it could not resolve automatically. Resolve manually and merge, or close if superseded." \
                 || echo "PR already exists or could not be created."
@@ -149,9 +154,13 @@ jobs:
           # fully contained in the new main, so a commit pushed during the merge window
           # is never deleted unmerged — it's left for the next run.
           for br in $merged_branches; do
-            git fetch origin "$br" >/dev/null 2>&1 || continue
+            # `--` before the positional branch name: a branch created via e.g.
+            # `git push origin HEAD:refs/heads/-x` merges fine above (those steps use the
+            # origin/-prefixed $ref), but a bare `$br` here would be parsed as a git option
+            # instead of a ref, and both calls would fail silently on every run.
+            git fetch origin -- "$br" >/dev/null 2>&1 || continue
             if is_ancestor_of "origin/$br" main; then
-              git push origin --delete "$br" || true
+              git push origin --delete -- "$br" || true
             else
               echo "::warning::$br advanced during the merge; not deleting (next run merges it)."
             fi

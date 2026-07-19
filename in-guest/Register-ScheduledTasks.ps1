@@ -48,13 +48,19 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $watchdogScript = Join-Path $cfg.InstallDir 'Watchdog.ps1'
 $metricScript   = Join-Path $cfg.InstallDir 'Push-GpuMetric.ps1'
 
-if (-not (Test-Path -LiteralPath $watchdogScript)) {
-    Write-TopazLog -Component 'register' -Level 'WARN' `
-        -Message "Expected '$watchdogScript' not found. Run Install.ps1 first so the task points at an installed copy."
-}
-if (-not (Test-Path -LiteralPath $metricScript)) {
-    Write-TopazLog -Component 'register' -Level 'WARN' `
-        -Message "Expected '$metricScript' not found. Run Install.ps1 first so the task points at an installed copy."
+# A missing installed script here means the task we are about to register
+# would point at a nonexistent file -- silently falling through to "Both
+# tasks registered." (the old behaviour) would tell the operator the
+# pipeline is live when it cannot actually run. Escalate the same way the
+# elevation check above does: throw and abort before registering anything.
+$missingScripts = @()
+if (-not (Test-Path -LiteralPath $watchdogScript)) { $missingScripts += $watchdogScript }
+if (-not (Test-Path -LiteralPath $metricScript)) { $missingScripts += $metricScript }
+if ($missingScripts.Count -gt 0) {
+    $missingList = $missingScripts -join ', '
+    Write-TopazLog -Component 'register' -Level 'ERROR' `
+        -Message "Missing installed script(s): $missingList. Run Install.ps1 first so the tasks point at installed copies. Aborting."
+    throw "Register-ScheduledTasks.ps1: missing installed script(s): $missingList. Run Install.ps1 first."
 }
 
 # ---------------------------------------------------------------------------
@@ -70,7 +76,11 @@ function Register-PipelineTask {
     <#
     .SYNOPSIS
         Idempotently (re)registers one scheduled task: unregister any existing
-        same-name task, then register the supplied definition.
+        same-name task, then register the supplied definition. Returns $true
+        only once registration has been VERIFIED (Get-ScheduledTask finds the
+        task afterwards); $false on any failure. Never throws -- the caller
+        registers two independent tasks and one failing must not prevent the
+        other attempt.
     #>
     param(
         [Parameter(Mandatory)][string]$TaskName,
@@ -81,24 +91,46 @@ function Register-PipelineTask {
         [Parameter(Mandatory)][string]$Description
     )
 
-    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($existing) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    try {
+        $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            Write-TopazLog -Component 'register' -Level 'INFO' `
+                -Message "Removed existing task '$TaskName' before re-registering."
+        }
+
+        Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Action $Action `
+            -Trigger $Trigger `
+            -Settings $Settings `
+            -Principal $Principal `
+            -Description $Description `
+            -Force -ErrorAction Stop | Out-Null
+
+        # -ErrorAction SilentlyContinue (not Stop): on real Windows, a
+        # not-found Get-ScheduledTask raises a non-terminating "No
+        # MSFT_ScheduledTask objects found" error, which -ErrorAction Stop
+        # would promote to terminating and route into the generic catch
+        # below -- silently skipping the more specific diagnostic this
+        # branch exists to log. SilentlyContinue lets a not-found result
+        # actually flow through as $null so the check below can fire.
+        $verify = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $verify) {
+            Write-TopazLog -Component 'register' -Level 'ERROR' `
+                -Message "Task '$TaskName' registration did not raise an error but Get-ScheduledTask could not find it afterwards."
+            return $false
+        }
+
         Write-TopazLog -Component 'register' -Level 'INFO' `
-            -Message "Removed existing task '$TaskName' before re-registering."
+            -Message "Registered task '$TaskName'."
+        return $true
     }
-
-    Register-ScheduledTask `
-        -TaskName $TaskName `
-        -Action $Action `
-        -Trigger $Trigger `
-        -Settings $Settings `
-        -Principal $Principal `
-        -Description $Description `
-        -Force | Out-Null
-
-    Write-TopazLog -Component 'register' -Level 'INFO' `
-        -Message "Registered task '$TaskName'."
+    catch {
+        Write-TopazLog -Component 'register' -Level 'ERROR' `
+            -Message "Failed to register task '$TaskName': $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -125,7 +157,7 @@ $watchdogSettings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 
-Register-PipelineTask `
+$watchdogRegistered = Register-PipelineTask `
     -TaskName $cfg.WatchdogTaskName `
     -Action $watchdogAction `
     -Trigger $watchdogTrigger `
@@ -153,13 +185,20 @@ $repetition = New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionDuration (New-TimeSpan -Days 10000)
 $metricTrigger.Repetition = $repetition.Repetition
 
+# -ExecutionTimeLimit bounds a single run as OS-level defense-in-depth: even
+# though Invoke-TopazAwsCli/Get-GpuUtilizationMax already bound their own
+# child-process calls, a wedged run for any other reason (e.g. the PowerShell
+# host itself hanging) would otherwise sit forever under MultipleInstances
+# IgnoreNew, starving every future minute's run. 5 minutes is generous
+# against a task that normally completes in seconds.
 $metricSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -MultipleInstances IgnoreNew   # skip a run if the previous minute is still going.
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
-Register-PipelineTask `
+$metricRegistered = Register-PipelineTask `
     -TaskName $cfg.MetricTaskName `
     -Action $metricAction `
     -Trigger $metricTrigger `
@@ -168,8 +207,21 @@ Register-PipelineTask `
     -Description 'Topaz auto-stop GPU metric publisher: pushes GPU utilization to CloudWatch every minute.'
 
 # ---------------------------------------------------------------------------
-# Done.
+# Done. Both registrations were attempted independently above (one failing
+# must not prevent the other attempt) -- report honestly which, if any,
+# failed rather than claiming success regardless of outcome.
 # ---------------------------------------------------------------------------
 
-Write-TopazLog -Component 'register' -Level 'INFO' `
-    -Message "Both tasks registered. Verify with:  Get-ScheduledTask -TaskName '$($cfg.WatchdogTaskName)','$($cfg.MetricTaskName)'  (and Get-ScheduledTaskInfo for last-run details)."
+if ($watchdogRegistered -and $metricRegistered) {
+    Write-TopazLog -Component 'register' -Level 'INFO' `
+        -Message "Both tasks registered. Verify with:  Get-ScheduledTask -TaskName '$($cfg.WatchdogTaskName)','$($cfg.MetricTaskName)'  (and Get-ScheduledTaskInfo for last-run details)."
+    exit 0
+}
+
+$failedTasks = @()
+if (-not $watchdogRegistered) { $failedTasks += $cfg.WatchdogTaskName }
+if (-not $metricRegistered) { $failedTasks += $cfg.MetricTaskName }
+
+Write-TopazLog -Component 'register' -Level 'ERROR' `
+    -Message "Registration failed for: $($failedTasks -join ', '). See the ERROR line(s) above for details. The pipeline is NOT fully live."
+exit 1

@@ -13,6 +13,9 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+# Pester's -CI flag drops NUnit results + coverage files in the working directory
+testResults.xml
+coverage.xml
 
 # Local operator overrides (never commit real instance IDs / secrets)
 *.local.ps1

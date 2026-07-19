@@ -60,34 +60,32 @@ is_ancestor_of() {
   git merge-base --is-ancestor "$1" "$2"
 }
 
-# ci_run_id_from_json <json> — the numeric id of the most recent run (for gh api/gh run rerun
-# targeting), or "" if none/unparseable. Companion to ci_conclusion_from_json. Deliberately keeps
-# FIRST-run semantics (does not search for a success like ci_conclusion_from_json does): this only
-# feeds the retry path below, which runs when NOTHING succeeded, so there is no successful run to find —
-# the most recent run is exactly the one worth re-running.
-ci_run_id_from_json() {
+# _ci_run_field_from_json <json> <field> — shared implementation behind ci_run_id_from_json and
+# ci_run_attempt_from_json (the two are identical apart from which field of the most-recent run they
+# pull), so the "" / unparseable / no-run-yet fail-closed handling lives in exactly one place. Not
+# part of the public predicate surface — the workflow and tests call the two named wrappers below.
+_ci_run_field_from_json() {
   local out
   if [ -n "$1" ] \
-     && out="$(printf '%s' "$1" | jq -r 'if (.workflow_runs | type) != "array" then "" else (.workflow_runs[0] as $r | if $r == null then "" else ($r.id // "") end) end' 2>/dev/null)"; then
+     && out="$(printf '%s' "$1" | jq -r --arg field "$2" 'if (.workflow_runs | type) != "array" then "" else (.workflow_runs[0] as $r | if $r == null then "" else ($r[$field] // "") end) end' 2>/dev/null)"; then
     printf '%s\n' "$out"
   else
     printf '\n'
   fi
 }
 
+# ci_run_id_from_json <json> — the numeric id of the most recent run (for gh api/gh run rerun
+# targeting), or "" if none/unparseable. Companion to ci_conclusion_from_json. Deliberately keeps
+# FIRST-run semantics (does not search for a success like ci_conclusion_from_json does): this only
+# feeds the retry path below, which runs when NOTHING succeeded, so there is no successful run to find —
+# the most recent run is exactly the one worth re-running.
+ci_run_id_from_json() { _ci_run_field_from_json "$1" id; }
+
 # ci_run_attempt_from_json <json> — the run_attempt of the most recent run (GitHub's own retry
 # counter — 1 for a never-retried run), or "" if none/unparseable/missing. Same first-run semantics as
 # ci_run_id_from_json, for the same reason: it only matters on the retry path, taken when no run
 # succeeded.
-ci_run_attempt_from_json() {
-  local out
-  if [ -n "$1" ] \
-     && out="$(printf '%s' "$1" | jq -r 'if (.workflow_runs | type) != "array" then "" else (.workflow_runs[0] as $r | if $r == null then "" else ($r.run_attempt // "") end) end' 2>/dev/null)"; then
-    printf '%s\n' "$out"
-  else
-    printf '\n'
-  fi
-}
+ci_run_attempt_from_json() { _ci_run_field_from_json "$1" run_attempt; }
 
 # should_retry_failed_ci <conclusion> <run_attempt> — true (exit 0) only for a GENUINE terminal
 # failure ("failure", never "in_progress"/"none"/"error"/"cancelled"/etc.) on its FIRST attempt

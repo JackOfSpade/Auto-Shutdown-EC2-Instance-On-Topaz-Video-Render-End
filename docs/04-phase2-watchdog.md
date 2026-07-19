@@ -18,7 +18,12 @@ registers the two SYSTEM scheduled tasks that point at those installed copies.
 `Watchdog.ps1`, `Stop-Sequence.ps1`, and `Push-GpuMetric.ps1`, warns if
 `nvidia-smi`/`aws` are missing, and then tells you to run
 `Register-ScheduledTasks.ps1` from an elevated shell. It does **not** register
-tasks itself - that needs elevation.
+tasks itself - that needs elevation. A directory-creation or script-copy
+failure is a hard install failure, not a warning: `Install.ps1` logs it as an
+ERROR and exits non-zero rather than reporting "Install complete" over a
+half-installed pipeline. `Register-ScheduledTasks.ps1` in turn aborts (throws)
+if either installed script is missing from `InstallDir`, rather than warning
+and registering a task that points at a nonexistent file.
 
 ## How the watchdog decides "done"
 
@@ -75,6 +80,12 @@ The worker-presence check above feeds into `CompletionSignal`, which decides wha
 | `WorkerOnly` (**default**) | Only the presence of the child encoder worker counts. This is the original, most specific behaviour - existing deployments see no change in default behavior. |
 | `GpuOnly` | Only GPU utilization `>= GpuBusyPercent` counts. |
 | `WorkerOrGpu` | Active if **either** a worker is present **or** the GPU is busy. Most robust if the worker process is not reliably a child of the GUI on your Topaz version. |
+
+An unrecognized `CompletionSignal` value fails loudly at config load time -
+`Get-TopazAutoStopConfig` throws naming the bad value and the three valid
+ones - instead of surfacing deep in the poll loop as a `Test-RenderActive`
+error or a `$null` decision that freezes the watchdog for the life of the
+instance.
 
 `GpuBusyPercent` (default **15**) is the GPU utilization percent at or above which
 the GPU counts as actively rendering, used by the `GpuOnly` and `WorkerOrGpu`
@@ -178,7 +189,8 @@ every output file to become unlocked:
   is fully flushed and closed.
 - When all such files are unlocked it proceeds. If the timeout expires with files
   still locked, it logs a warning and proceeds anyway (better to stop a
-  cost-accruing box than hang forever).
+  cost-accruing box than hang forever). It re-checks every `UnlockPollSec`
+  (default **10 s**) while waiting.
 
 Then, for a `'completed'` decision only, it re-verifies once (see above) before
 invoking [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1) with
@@ -213,10 +225,18 @@ The two tasks:
   an effectively-infinite duration (~10000 days), so it runs
   `Push-GpuMetric.ps1` once per minute forever; `-MultipleInstances IgnoreNew`
   skips a run if the previous minute is still going (see [Phase 4](06-phase4-safety-net.md)).
+  `ExecutionTimeLimit` is capped at **5 minutes** as OS-level defense-in-depth -
+  a run wedged for any reason other than a slow `aws`/`nvidia-smi` call (which
+  are already bounded, see [Phase 4](06-phase4-safety-net.md)) would otherwise
+  sit forever under `IgnoreNew`, starving every future minute's run.
 
 The registration is idempotent: it unregisters any existing same-name task before
-re-creating it, so it is safe to re-run (e.g. after flipping `DryRun`). Verify
-afterward with:
+re-creating it, so it is safe to re-run (e.g. after flipping `DryRun`). Each
+task's registration is verified (`Get-ScheduledTask` must find it afterward)
+and the two are attempted independently, so one failing does not stop the
+other from being registered; `Register-ScheduledTasks.ps1` reports honestly
+which task(s), if any, failed and exits non-zero rather than always claiming
+"Both tasks registered." Verify afterward with:
 
 ```powershell
 Get-ScheduledTask -TaskName 'TopazAutoStop-Watchdog','TopazAutoStop-GpuMetric'

@@ -59,7 +59,9 @@ Concretely, while an export runs, check:
 - **Output growth:** watch the output folder's byte total climb while encoding.
 - **Scratch files:** note any partial/temporary files created during the render
   and whether their names contain `_temp` (or something else - update
-  `TempMarker` to match).
+  `TempMarker` to match). If your workflow leaves no scratch files at all,
+  leave `TempMarker` empty - an empty/whitespace value is treated as an
+  explicit no-op (nothing is ever classified as scratch), not an error.
 
 If Topaz on your machine spawns transient `ffmpeg` children for the **live
 preview** (not just the queued export), note roughly how long they live - you may

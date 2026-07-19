@@ -348,9 +348,25 @@ def test_missing_launch_time_is_noop(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_invalid_max_lifetime_hours_falls_back_to_default(monkeypatch):
+@pytest.mark.parametrize("raw_value", ["abc", "nan", "inf", "-inf"])
+def test_bad_max_lifetime_hours_falls_back_to_default(monkeypatch, raw_value):
+    """Covers both the non-numeric-string branch ("abc") and the
+    finite-but-unusable-float branch (nan/inf/-inf) of the fallback:
+    float("nan")/float("inf") both parse without raising, but must never
+    reach the ceiling comparison -- `age_hours < nan` is always False (the
+    handler would fall through to stop_instances on *every* invocation,
+    regardless of age) and `age_hours < inf` is always True (the cap would
+    be silently disabled forever). "-inf" is included for
+    completeness/regression coverage even though it is already caught by
+    the pre-existing "not positive" fallback.
+
+    Each value is checked on both sides of the default 12h ceiling so a
+    leak in *either* direction is caught: an un-rejected "nan" would
+    wrongly stop in the under-ceiling phase, and an un-rejected "inf"
+    would wrongly no-op in the over-ceiling phase.
+    """
     monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
-    monkeypatch.setenv("MAX_LIFETIME_HOURS", "abc")
+    monkeypatch.setenv("MAX_LIFETIME_HOURS", raw_value)
 
     # 13h old: past the default 12h ceiling -> stops.
     client, stubber = _make_client()
@@ -416,77 +432,66 @@ def test_empty_max_lifetime_hours_falls_back_to_default(monkeypatch):
     assert result["max_lifetime_hours"] == 12.0
 
 
-@pytest.mark.parametrize("raw_value", ["nan", "inf", "-inf"])
-def test_non_finite_max_lifetime_hours_falls_back_to_default(monkeypatch, raw_value):
-    """float("nan") and float("inf") both parse without raising, but must
-    never reach the ceiling comparison: `age_hours < nan` is always False
-    (the handler would fall through to stop_instances on *every*
-    invocation, regardless of age) and `age_hours < inf` is always True
-    (the cap would be silently disabled forever). "-inf" is included for
-    completeness/regression coverage even though it is already caught by
-    the pre-existing "not positive" fallback.
-
-    Mirrors test_invalid_max_lifetime_hours_falls_back_to_default's
-    two-phase over/under check so a leak in *either* direction is caught:
-    an un-rejected "nan" would wrongly stop in the under-ceiling phase,
-    and an un-rejected "inf" would wrongly no-op in the over-ceiling
-    phase.
-    """
-    monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
-    monkeypatch.setenv("MAX_LIFETIME_HOURS", raw_value)
-
-    # 13h old: past the default 12h ceiling -> stops.
-    client, stubber = _make_client()
-    launch_time_over = datetime.now(timezone.utc) - timedelta(hours=13)
-    stubber.add_response(
-        "describe_instances",
-        _describe_response(INSTANCE_ID, "running", launch_time_over),
-        {"InstanceIds": [INSTANCE_ID]},
-    )
-    stubber.add_response(
-        "stop_instances", _stop_response(INSTANCE_ID), {"InstanceIds": [INSTANCE_ID]}
-    )
-    stubber.activate()
-    _patch_client(monkeypatch, client)
-
-    result_over = lambda_handler({}, None)
-
-    stubber.assert_no_pending_responses()
-    stubber.deactivate()
-    assert result_over["action"] == "stopped"
-    assert result_over["max_lifetime_hours"] == 12.0
-
-    # 11h old: under the default 12h ceiling -> noop.
-    client2, stubber2 = _make_client()
-    launch_time_under = datetime.now(timezone.utc) - timedelta(hours=11)
-    stubber2.add_response(
-        "describe_instances",
-        _describe_response(INSTANCE_ID, "running", launch_time_under),
-        {"InstanceIds": [INSTANCE_ID]},
-    )
-    stubber2.activate()
-    _patch_client(monkeypatch, client2)
-
-    result_under = lambda_handler({}, None)
-
-    stubber2.assert_no_pending_responses()
-    assert result_under["action"] == "noop"
-    assert result_under["reason"] == "under-ceiling"
-    assert result_under["max_lifetime_hours"] == 12.0
-
-
 # ---------------------------------------------------------------------------
 # instance id resolution (TARGET_INSTANCE_ID / legacy INSTANCE_ID)
 # ---------------------------------------------------------------------------
 
 
-def test_no_instance_id_env_raises_value_error():
-    # clean_env autouse fixture already guarantees both vars are unset.
+@pytest.mark.parametrize(
+    "target_value,legacy_value",
+    [
+        (None, None),
+        ("   ", None),
+        (None, "   "),
+        ("   ", "   "),
+    ],
+    ids=[
+        "both-unset",
+        "target-whitespace-only",
+        "legacy-whitespace-only",
+        "both-whitespace-only",
+    ],
+)
+def test_no_usable_instance_id_env_raises_value_error(monkeypatch, target_value, legacy_value):
+    # clean_env autouse fixture already guarantees both vars start unset.
+    if target_value is not None:
+        monkeypatch.setenv("TARGET_INSTANCE_ID", target_value)
+    if legacy_value is not None:
+        monkeypatch.setenv("INSTANCE_ID", legacy_value)
+
     with pytest.raises(ValueError):
         lambda_handler({}, None)
 
 
 def test_legacy_instance_id_env_used_when_target_absent(monkeypatch):
+    monkeypatch.setenv("INSTANCE_ID", INSTANCE_ID)
+    launch_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    client, stubber = _make_client()
+    stubber.add_response(
+        "describe_instances",
+        _describe_response(INSTANCE_ID, "running", launch_time),
+        {"InstanceIds": [INSTANCE_ID]},
+    )
+    stubber.activate()
+    _patch_client(monkeypatch, client)
+
+    result = lambda_handler({}, None)
+
+    stubber.assert_no_pending_responses()
+    assert result["instance_id"] == INSTANCE_ID
+    assert result["action"] == "noop"
+    assert result["reason"] == "under-ceiling"
+
+
+def test_whitespace_only_target_instance_id_falls_back_to_legacy(monkeypatch):
+    """A whitespace-only TARGET_INSTANCE_ID is truthy before stripping, so
+    without stripping each candidate before the `or` fallback, this would
+    wrongly win over a valid legacy INSTANCE_ID and then strip down to ''
+    -- silently disabling the guard. The Stubber's expected_params pin the
+    describe_instances call to the legacy id, so this fails loudly if the
+    empty-after-strip target leaks through instead."""
+    monkeypatch.setenv("TARGET_INSTANCE_ID", "   ")
     monkeypatch.setenv("INSTANCE_ID", INSTANCE_ID)
     launch_time = datetime.now(timezone.utc) - timedelta(hours=1)
 

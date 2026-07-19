@@ -34,9 +34,22 @@ Write-TopazLog -Component 'install' -Level 'INFO' `
 
 foreach ($dir in @($cfg.InstallDir, $cfg.LogDir)) {
     if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        Write-TopazLog -Component 'install' -Level 'INFO' `
-            -Message "Created directory '$dir'."
+        try {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+            Write-TopazLog -Component 'install' -Level 'INFO' `
+                -Message "Created directory '$dir'."
+        }
+        catch {
+            # WHY: directory creation is foundational -- every downstream step
+            # (Copy-Item into InstallDir, Write-TopazLog itself needing
+            # LogDir) depends on these existing. Logging success here on a
+            # failure (e.g. Access denied when not elevated) would leave the
+            # operator staring at confusing copy errors with no idea why.
+            # Abort immediately instead.
+            Write-TopazLog -Component 'install' -Level 'ERROR' `
+                -Message "Failed to create directory '$dir': $($_.Exception.Message). Aborting install."
+            exit 1
+        }
     }
     else {
         Write-TopazLog -Component 'install' -Level 'INFO' `
@@ -56,11 +69,19 @@ $scripts = @(
     'Push-GpuMetric.ps1'
 )
 
+# Tracked separately from $warningCount below: a missing source or failed
+# copy is a hard install failure (the pipeline cannot run without its
+# scripts), whereas a missing dependency is advisory. Mixing the two into one
+# counter would make a merely-advisory nvidia-smi/aws warning read as fatal,
+# or worse, let a genuine copy failure hide behind "it's just a warning".
+$errorCount = 0
+
 foreach ($name in $scripts) {
     $src = Join-Path $PSScriptRoot $name
     if (-not (Test-Path -LiteralPath $src)) {
         Write-TopazLog -Component 'install' -Level 'ERROR' `
             -Message "Source script '$src' not found; cannot install it."
+        $errorCount++
         continue
     }
     try {
@@ -75,12 +96,18 @@ foreach ($name in $scripts) {
         # the next file rather than aborting the whole install.
         Write-TopazLog -Component 'install' -Level 'ERROR' `
             -Message "Failed to copy '$name': $($_.Exception.Message)"
+        $errorCount++
     }
 }
 
 # ---------------------------------------------------------------------------
 # 3. Dependency sanity check (warn only; never fail the install).
 # ---------------------------------------------------------------------------
+
+# Counted separately from $errorCount -- these are advisory (the operator can
+# still install nvidia-smi/aws later, before relying on the idle alarm), so
+# they must never turn an otherwise-clean install into a reported failure.
+$warningCount = 0
 
 foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
     if (Get-Command $tool -ErrorAction SilentlyContinue) {
@@ -90,6 +117,7 @@ foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
     else {
         Write-TopazLog -Component 'install' -Level 'WARN' `
             -Message "Dependency '$tool' NOT found on PATH. Push-GpuMetric.ps1 needs it; install/add it before relying on the idle alarm."
+        $warningCount++
     }
 }
 
@@ -97,5 +125,13 @@ foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
 # 4. Next-step guidance.
 # ---------------------------------------------------------------------------
 
-Write-TopazLog -Component 'install' -Level 'INFO' `
-    -Message "Install complete. NEXT STEP: run Register-ScheduledTasks.ps1 from an ELEVATED (Administrator) PowerShell to create the SYSTEM scheduled tasks."
+if ($errorCount -eq 0) {
+    $warningNote = if ($warningCount -gt 0) { " ($warningCount dependency warning(s) above - advisory only)" } else { '' }
+    Write-TopazLog -Component 'install' -Level 'INFO' `
+        -Message "Install complete.$warningNote NEXT STEP: run Register-ScheduledTasks.ps1 from an ELEVATED (Administrator) PowerShell to create the SYSTEM scheduled tasks."
+}
+else {
+    Write-TopazLog -Component 'install' -Level 'ERROR' `
+        -Message "Install completed with $errorCount error(s) - review the log above before proceeding."
+    exit 1
+}

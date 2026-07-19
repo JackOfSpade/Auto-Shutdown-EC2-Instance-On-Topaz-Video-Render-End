@@ -12,7 +12,7 @@ caught before it reaches an EC2 box that bills by the hour.
 
 | Area | Path | Lint | Tests |
 |------|------|------|-------|
-| Control plane | `control-plane/*.sh`, `scripts/*.sh`, `tests/*.sh` | `shellcheck`, `actionlint` | `bash tests/test_auto_merge_logic.sh` |
+| Control plane | `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`, `tests/*.sh` | `shellcheck`, `actionlint` | `bash tests/test_auto_merge_logic.sh`, `bash tests/test_control_plane_validation.sh` |
 | In-guest pipeline | `in-guest/` | PSScriptAnalyzer | Pester (`in-guest/tests/`) |
 | Max-lifetime Lambda | `lambda/max-lifetime-stop/` | `ruff` | `pytest` |
 
@@ -30,6 +30,13 @@ caught before it reaches an EC2 box that bills by the hour.
   [`auto-merge-claude.yml`](../.github/workflows/auto-merge-claude.yml)), which
   the standalone `shellcheck` glob above never sees because it only looks at
   `*.sh` files on disk.
+- **`tests/test_control_plane_validation.sh`** exercises the pure predicates in
+  [`control-plane/lib/validation.sh`](../control-plane/lib/validation.sh) (the
+  `IDLE_MINUTES`/`MAX_LIFETIME_HOURS`/shutdown-behavior/profile-name checks
+  shared by `control-plane/01..04-*.sh`) and the idempotency wrapper in
+  [`control-plane/lib/aws-idempotent.sh`](../control-plane/lib/aws-idempotent.sh),
+  by sourcing the same files the production scripts source - no AWS
+  credentials or network access needed.
 - **PSScriptAnalyzer** lints the PowerShell under `in-guest/` for style and
   correctness issues. **Error/ParseError** severity always fails the build;
   **Warning** severity now also fails the build **unless** the specific rule is
@@ -48,6 +55,12 @@ caught before it reaches an EC2 box that bills by the hour.
   `Config.ps1` to load it is safe on any platform, including a non-Windows CI
   runner: dot-sourcing only *defines* the functions in that file, it never
   executes the Windows-only cmdlets used elsewhere in the pipeline.
+  `in-guest/tests/Watchdog.Tests.ps1` exercises `Watchdog.ps1`'s own pure
+  helpers (worker attribution, the idle/stall state machine, the
+  resume-vs-stop decision) the same safe way: dot-sourcing `Watchdog.ps1` only
+  defines its functions, because a top-level guard skips the file's
+  Windows-only wait-for-Topaz/monitoring loop whenever it is dot-sourced
+  rather than run directly.
 - **`ruff`** lints the Lambda handler in
   [`lambda/max-lifetime-stop/`](../lambda/max-lifetime-stop/).
 - **`pytest`** runs [`test_handler.py`](../lambda/max-lifetime-stop/test_handler.py),

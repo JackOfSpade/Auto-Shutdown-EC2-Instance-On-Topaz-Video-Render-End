@@ -47,14 +47,23 @@ DEFAULT_MAX_LIFETIME_HOURS = 12.0
 
 
 def _get_instance_id() -> str:
-    """Resolve the target instance id from env (TARGET_INSTANCE_ID preferred)."""
-    instance_id = os.environ.get("TARGET_INSTANCE_ID") or os.environ.get("INSTANCE_ID")
+    """Resolve the target instance id from env (TARGET_INSTANCE_ID preferred).
+
+    Each candidate is stripped *before* the `or` fallback decision (mirroring
+    _get_max_lifetime_hours's whitespace handling): otherwise a whitespace-only
+    TARGET_INSTANCE_ID is truthy and wins the `or` over a valid legacy
+    INSTANCE_ID, then strips down to '' -- silently disabling the guard
+    (describe_instances([""]) -> InvalidInstanceID.Malformed -> perpetual noop).
+    """
+    target = (os.environ.get("TARGET_INSTANCE_ID") or "").strip()
+    legacy = (os.environ.get("INSTANCE_ID") or "").strip()
+    instance_id = target or legacy
     if not instance_id:
         raise ValueError(
             "No target instance id configured: set TARGET_INSTANCE_ID "
             "(or INSTANCE_ID) in the Lambda environment."
         )
-    return instance_id.strip()
+    return instance_id
 
 
 def _get_max_lifetime_hours() -> float:

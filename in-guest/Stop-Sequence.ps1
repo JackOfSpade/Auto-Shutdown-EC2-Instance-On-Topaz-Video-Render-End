@@ -74,25 +74,13 @@ if ([string]::IsNullOrWhiteSpace($region)) {
 if (-not [string]::IsNullOrWhiteSpace($cfg.S3SyncTarget)) {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Syncing '$($cfg.OutputDir)' -> '$($cfg.S3SyncTarget)' before power off."
-    try {
-        # Splat the arg list (rather than a long backtick-continued command) so
-        # --region can be appended only when discovery succeeded, PS 5.1-clean.
-        $syncArgs = @('s3', 'sync', $cfg.OutputDir, $cfg.S3SyncTarget, '--only-show-errors')
-        if (-not [string]::IsNullOrWhiteSpace($region)) { $syncArgs += @('--region', $region) }
-        $out = & aws @syncArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-TopazLog -Component 'stop' -Level 'INFO' `
-                -Message "S3 sync completed successfully."
-        }
-        else {
-            Write-TopazLog -Component 'stop' -Level 'WARN' `
-                -Message "S3 sync exited with code $LASTEXITCODE. Output: $out"
-        }
-    }
-    catch {
-        Write-TopazLog -Component 'stop' -Level 'WARN' `
-            -Message "S3 sync failed (continuing to stop): $($_.Exception.Message)"
-    }
+
+    $syncArgs = Build-AwsCliArgs -Base @('s3', 'sync', $cfg.OutputDir, $cfg.S3SyncTarget, '--only-show-errors') -Region $region
+    [void] (Invoke-TopazAwsCli -Arguments $syncArgs -TimeoutSec $cfg.S3SyncTimeoutSec `
+        -Component 'stop' `
+        -SuccessMessage 'S3 sync completed successfully.' `
+        -FailureVerb 'S3 sync' `
+        -FailureContext 'continuing to stop')
 }
 else {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
@@ -106,37 +94,19 @@ else {
 if (-not [string]::IsNullOrWhiteSpace($cfg.SnsTopicArn)) {
     # DryRun never powers off (see step 3 below), so the notification text
     # must not claim the box is stopping - that would be a false alarm to
-    # whoever is subscribed to the topic.
-    if ($cfg.DryRun) {
-        $subject = "Topaz render $Reason - DRY RUN (no stop) - $instanceId"
-        $message = "Topaz watchdog decided '$Reason' on instance $instanceId at $(Get-Date -Format 's'). DryRun is enabled, so the power-off was suppressed and the instance is still running."
-    }
-    else {
-        $subject = "Topaz render $Reason - stopping $instanceId"
-        $message = "Topaz render queue reported '$Reason' on instance $instanceId at $(Get-Date -Format 's'). The guest is powering off, which stops the EC2 instance."
-    }
+    # whoever is subscribed to the topic. Get-TopazStopNotification reproduces
+    # both branches' wording exactly.
+    $notification = Get-TopazStopNotification -Reason $Reason -InstanceId $instanceId -DryRun $cfg.DryRun
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Publishing SNS notification to '$($cfg.SnsTopicArn)'."
-    try {
-        # Splat the arg list (rather than a long backtick-continued command) so
-        # --region can be appended only when discovery succeeded, PS 5.1-clean.
-        $snsArgs = @('sns', 'publish', '--topic-arn', $cfg.SnsTopicArn, '--subject', $subject, '--message', $message)
-        if (-not [string]::IsNullOrWhiteSpace($region)) { $snsArgs += @('--region', $region) }
-        $out = & aws @snsArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-TopazLog -Component 'stop' -Level 'INFO' `
-                -Message "SNS notification published."
-        }
-        else {
-            Write-TopazLog -Component 'stop' -Level 'WARN' `
-                -Message "SNS publish exited with code $LASTEXITCODE. Output: $out"
-        }
-    }
-    catch {
-        Write-TopazLog -Component 'stop' -Level 'WARN' `
-            -Message "SNS publish failed (continuing to stop): $($_.Exception.Message)"
-    }
+
+    $snsArgs = Build-AwsCliArgs -Base @('sns', 'publish', '--topic-arn', $cfg.SnsTopicArn, '--subject', $notification.Subject, '--message', $notification.Message) -Region $region
+    [void] (Invoke-TopazAwsCli -Arguments $snsArgs -TimeoutSec $cfg.AwsCliTimeoutSec `
+        -Component 'stop' `
+        -SuccessMessage 'SNS notification published.' `
+        -FailureVerb 'SNS publish' `
+        -FailureContext 'continuing to stop')
 }
 else {
     Write-TopazLog -Component 'stop' -Level 'INFO' `

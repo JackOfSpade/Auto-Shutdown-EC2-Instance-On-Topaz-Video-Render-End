@@ -11,9 +11,10 @@
 #   down. This alarm exists only to catch a truly dead / hung / idle box that the
 #   watchdog failed to stop (crashed watchdog, orphaned instance, etc.).
 #
-#   It fires on the CUSTOM GPU metric (TopazRender/GPU : GPUUtilization) published
-#   by the on-box watchdog, and uses the built-in EC2 alarm action to stop the
-#   instance. The window is deliberately LONG and conservative:
+#   It fires on the CUSTOM GPU metric (default TopazRender/GPU : GPUUtilization,
+#   see METRIC_NAMESPACE/METRIC_NAME below) published by the on-box watchdog,
+#   and uses the built-in EC2 alarm action to stop the instance. The window is
+#   deliberately LONG and conservative:
 #       period 60s  x  evaluation-periods IDLE_MINUTES (default 30)  =  IDLE_MINUTES minutes
 #   of SUSTAINED sub-5% GPU before it acts, so it can never false-stop an active
 #   render (Topaz GPU work spikes well above 5% while encoding). Raise
@@ -39,9 +40,21 @@
 #   Optional env var:  IDLE_MINUTES (default 30) -- sustained-idle window, in
 #   whole minutes, before the alarm stops the instance. Must be a positive
 #   integer.
+#   Optional env vars: METRIC_NAMESPACE (default TopazRender/GPU) and
+#   METRIC_NAME (default GPUUtilization) -- override which custom metric the
+#   alarm watches, mirroring in-guest/Config.ps1's editable
+#   MetricNamespace/MetricName. Only change these together with the
+#   watchdog's own config, or the alarm ends up watching a metric nothing
+#   publishes.
 #   The arn:aws:automate:<region>:ec2:stop action requires no extra IAM role.
 #
 set -euo pipefail
+
+# Resolve the directory this script lives in so lib/*.sh sourcing works
+# regardless of the caller's current working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/validation.sh
+source "${SCRIPT_DIR}/lib/validation.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -52,11 +65,16 @@ Required environment variables:
   AWS_REGION    The AWS region the instance lives in (e.g. <region>)
 
 Optional environment variables:
-  IDLE_MINUTES  Sustained sub-5% GPU window, in whole minutes, before the
-                alarm stops the instance (default 30). Must be a positive
-                integer. Raise this if pre-render setup (e.g. uploading
-                source files over a slow link) can leave the GPU idle for a
-                long stretch before Export is clicked.
+  IDLE_MINUTES      Sustained sub-5% GPU window, in whole minutes, before the
+                    alarm stops the instance (default 30). Must be a positive
+                    integer. Raise this if pre-render setup (e.g. uploading
+                    source files over a slow link) can leave the GPU idle for a
+                    long stretch before Export is clicked.
+  METRIC_NAMESPACE  CloudWatch namespace of the custom GPU metric to watch
+                    (default TopazRender/GPU). Mirrors in-guest/Config.ps1's
+                    MetricNamespace.
+  METRIC_NAME       CloudWatch metric name within that namespace (default
+                    GPUUtilization). Mirrors in-guest/Config.ps1's MetricName.
 EOF
   exit 1
 }
@@ -65,12 +83,13 @@ EOF
 [[ -n "${AWS_REGION:-}"  ]] || { echo "ERROR: AWS_REGION is not set."  >&2; usage; }
 
 IDLE_MINUTES="${IDLE_MINUTES:-30}"
-# The regex rejects zero and leading-zero forms ("08") outright, so the value is
-# never fed to a bash arithmetic context (which would parse "08"/"09" as octal).
-if ! [[ "$IDLE_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+if ! is_valid_idle_minutes "$IDLE_MINUTES"; then
   echo "ERROR: IDLE_MINUTES must be a positive integer with no leading zeros (got '${IDLE_MINUTES}')." >&2
   usage
 fi
+
+METRIC_NAMESPACE="${METRIC_NAMESPACE:-TopazRender/GPU}"
+METRIC_NAME="${METRIC_NAME:-GPUUtilization}"
 
 # WHY per-instance name: put-metric-alarm OVERWRITES any existing alarm that
 # has the same --alarm-name. A hardcoded shared name meant provisioning a
@@ -80,7 +99,7 @@ fi
 ALARM_NAME="topaz-gpu-idle-autostop-${INSTANCE_ID}"
 
 echo "==> Creating idle-stop alarm '${ALARM_NAME}'"
-echo "    metric  : TopazRender/GPU : GPUUtilization (custom, GPU-aware -- NOT CPUUtilization)"
+echo "    metric  : ${METRIC_NAMESPACE} : ${METRIC_NAME} (custom, GPU-aware -- NOT CPUUtilization)"
 echo "    window  : period 60s x ${IDLE_MINUTES} evaluation-periods = ${IDLE_MINUTES} min sustained < 5% GPU"
 echo "    action  : arn:aws:automate:${AWS_REGION}:ec2:stop"
 echo "    aws cloudwatch put-metric-alarm --region ${AWS_REGION} --alarm-name ${ALARM_NAME} ..."
@@ -89,8 +108,8 @@ aws cloudwatch put-metric-alarm \
   --region "$AWS_REGION" \
   --alarm-name "$ALARM_NAME" \
   --alarm-description "Safety net: stop the Topaz render box after ${IDLE_MINUTES} min of sustained sub-5% GPU. Keyed on the custom GPU metric, never on CPU." \
-  --namespace TopazRender/GPU \
-  --metric-name GPUUtilization \
+  --namespace "$METRIC_NAMESPACE" \
+  --metric-name "$METRIC_NAME" \
   --dimensions Name=InstanceId,Value="$INSTANCE_ID" \
   --statistic Average \
   --period 60 \

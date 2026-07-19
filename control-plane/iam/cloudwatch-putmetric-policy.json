@@ -5,7 +5,12 @@
       "Sid": "PutGpuMetric",
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricData",
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "TopazRender/GPU"
+        }
+      }
     }
   ]
 }

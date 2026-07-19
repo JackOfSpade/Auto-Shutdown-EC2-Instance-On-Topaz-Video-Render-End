@@ -172,6 +172,15 @@ assert_eq "error-shaped JSON (missing workflow_runs): run_attempt is empty, not 
 run_id="$(ci_run_id_from_json '{"message":"Not Found"}')"
 assert_eq "error-shaped JSON (missing workflow_runs): run id is empty, not a bogus id" "$run_id" ""
 
+# Genuinely unparseable JSON syntax (as opposed to valid-but-wrong-shape above) exercises the shared
+# _ci_run_field_from_json helper's jq-failure branch (jq itself exits non-zero) rather than the
+# "workflow_runs isn't an array" branch — both wrappers must still fail closed to "", not error out
+# under `set -euo pipefail`.
+run_id="$(ci_run_id_from_json '{not valid json')"
+assert_eq "unparseable JSON syntax: run id is empty (shared helper's jq-failure path)" "$run_id" ""
+attempt="$(ci_run_attempt_from_json '{not valid json')"
+assert_eq "unparseable JSON syntax: run_attempt is empty (shared helper's jq-failure path)" "$attempt" ""
+
 # End-to-end lock: the parser's actual no-run output, piped straight into the predicate, must NOT
 # trigger a retry (guards against a future edit that made the parser emit "1" for a no-run state).
 assert_false "no-run run_attempt piped into should_retry_failed_ci must NOT retry (fail closed end-to-end)" \

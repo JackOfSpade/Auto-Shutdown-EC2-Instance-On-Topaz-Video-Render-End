@@ -6,7 +6,7 @@ on:
 
 jobs:
   shell-lint:
-    name: Shell lint (shellcheck)
+    name: Shell + workflow checks (shellcheck, actionlint, auto-merge tests)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,10 +21,15 @@ jobs:
         # --source-path=SCRIPTDIR resolves each `# shellcheck source=` directive
         # relative to the sourcing file's own directory (so tests/ can follow
         # ../scripts/*.sh); without it shellcheck emits SC1091 and fails the job.
-        run: shellcheck -x --source-path=SCRIPTDIR control-plane/*.sh scripts/*.sh tests/*.sh
+        run: shellcheck -x --source-path=SCRIPTDIR control-plane/*.sh control-plane/lib/*.sh scripts/*.sh tests/*.sh
 
       - name: Run auto-merge decision tests
         run: bash tests/test_auto_merge_logic.sh
+
+      - name: Run control-plane validation tests
+        # tests/test_control_plane_validation.sh is being added alongside a new control-plane/lib/
+        # directory by a concurrent change; this step targets that fixed path deliberately.
+        run: bash tests/test_control_plane_validation.sh
 
       - name: Run actionlint
         # The shellcheck step above only globs standalone *.sh files — it never sees the bash embedded
@@ -64,9 +69,10 @@ jobs:
               # swallow errors: IMDS being unreachable is an expected, handled case (the caller gets
               # $null), documented in Get-Ec2Identity's own .DESCRIPTION - not a masked bug.
               'PSAvoidUsingEmptyCatchBlock',
-              # Watchdog.ps1 helper names intentionally describe what they return rather than following
-              # the strict singular-noun convention: Get-TopazPids/-TopazWorkers return arrays, and
-              # Get-OutputBytes returns a byte total - "Pid"/"Worker"/"Byte" would misdescribe the value.
+              # Watchdog.ps1 and Config.ps1 helper names intentionally describe what they return
+              # rather than following the strict singular-noun convention: Get-TopazPids/-TopazWorkers
+              # return arrays, Get-OutputBytes returns a byte total, and Build-AwsCliArgs returns an
+              # argument list - "Pid"/"Worker"/"Byte"/"Arg" would misdescribe the value.
               'PSUseSingularNouns'
           )
 

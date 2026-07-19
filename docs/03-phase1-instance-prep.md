@@ -39,20 +39,38 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> \
 role `topaz-render-instance-role` + instance profile
 `topaz-render-instance-profile`, attaches an inline policy, and associates the
 profile with the instance. It is idempotent - re-runs reuse existing entities
-rather than failing. If the instance already has *some* IAM instance profile
-associated, the script does not just assume that is fine: it looks the
-association up by name and confirms it is actually
-`topaz-render-instance-profile` before declaring success, printing the exact
-`replace-iam-instance-profile-association` command (and failing loudly) if the
-instance is wearing a different - stale, wrong-account, or hand-attached -
-profile instead.
+rather than failing. Two places it does not just assume "already exists" means
+"already correct":
+
+- If the instance profile already has *some* role attached, it looks up the
+  actually-attached role name and confirms it is `topaz-render-instance-role`
+  before declaring success, printing the exact `remove-role-from-instance-profile`
+  / `add-role-to-instance-profile` fix commands (and failing loudly) if a
+  *different* role is attached instead.
+- If the instance already has *some* IAM instance profile associated, it looks
+  the association up by name and confirms it is actually
+  `topaz-render-instance-profile` before declaring success, printing the exact
+  `replace-iam-instance-profile-association` command (and failing loudly) if the
+  instance is wearing a different - stale, wrong-account, or hand-attached -
+  profile instead.
 
 **Normal grant (all the box needs):** `cloudwatch:PutMetricData` only, from
-[`iam/cloudwatch-putmetric-policy.json`](../control-plane/iam/cloudwatch-putmetric-policy.json).
-That is the single permission the metric publisher
-([Phase 4](06-phase4-safety-net.md)) requires. The trust policy
+[`iam/cloudwatch-putmetric-policy.json`](../control-plane/iam/cloudwatch-putmetric-policy.json),
+scoped by a `cloudwatch:namespace` condition to the `TopazRender/GPU` namespace
+by default (CloudWatch metrics have no ARN to scope `Resource` down to, so the
+namespace condition is what actually keeps the grant scoped, not the
+necessarily-wildcard `Resource`). That is the single permission the metric
+publisher ([Phase 4](06-phase4-safety-net.md)) requires. The trust policy
 ([`iam/instance-role-trust-policy.json`](../control-plane/iam/instance-role-trust-policy.json))
 lets `ec2.amazonaws.com` assume the role.
+
+If you override `Config.ps1`'s `MetricNamespace` away from `TopazRender/GPU`,
+pass the SAME value as `METRIC_NAMESPACE=<namespace>` to
+`02-create-iam-role.sh` -- it renders the policy's `cloudwatch:namespace`
+condition to that value before applying it (and to
+`03-create-idle-alarm.sh`, which watches that same namespace). All three
+must agree, or the watchdog's `PutMetricData` calls to the custom namespace
+are denied outright.
 
 **Optional API-stop grant (off by default):**
 
@@ -75,6 +93,13 @@ it.
 > `ec2:StopInstances` is a *choice*, not a requirement. Keeping it off means the
 > box literally cannot call the EC2 API to stop anything - it can only shut its
 > own OS down.
+
+Re-running the script *without* `INCLUDE_EC2_STOP=1` never auto-revokes a grant
+from an earlier run that had it set - that would be a destructive surprise the
+operator did not ask for. Instead, if `topaz-ec2-stop` is still attached, the
+script notes that it (and the `AutoStopEligible` tag it depends on) remains in
+force and prints the exact `delete-role-policy` / `delete-tags` commands to
+remove it manually.
 
 ## 3. AutoAdminLogon caveat (treat any stored password as a secret)
 

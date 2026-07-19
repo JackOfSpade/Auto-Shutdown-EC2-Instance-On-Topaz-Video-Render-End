@@ -22,6 +22,12 @@
 #
 set -euo pipefail
 
+# Resolve the directory this script lives in so lib/*.sh sourcing works
+# regardless of the caller's current working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/validation.sh
+source "${SCRIPT_DIR}/lib/validation.sh"
+
 usage() {
   cat >&2 <<'EOF'
 Usage: INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> ./01-set-shutdown-behavior.sh
@@ -58,7 +64,7 @@ CURRENT_BEHAVIOR="$(aws ec2 describe-instance-attribute \
 
 echo "==> Current instance-initiated-shutdown-behavior: ${CURRENT_BEHAVIOR}"
 
-if [[ "$CURRENT_BEHAVIOR" != "stop" ]]; then
+if ! is_shutdown_behavior_confirmed "$CURRENT_BEHAVIOR"; then
   echo "ERROR: expected 'stop' but got '${CURRENT_BEHAVIOR}'. Aborting." >&2
   exit 1
 fi

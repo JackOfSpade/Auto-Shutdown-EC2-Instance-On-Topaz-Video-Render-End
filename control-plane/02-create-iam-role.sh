@@ -19,7 +19,8 @@
 #
 #   Steps:
 #     1. create-role with the ec2 trust policy      (iam/instance-role-trust-policy.json)
-#     2. put-role-policy PutMetricData              (iam/cloudwatch-putmetric-policy.json)
+#     2. put-role-policy PutMetricData              (iam/cloudwatch-putmetric-policy.json,
+#        with its cloudwatch:namespace condition rendered to METRIC_NAMESPACE below)
 #     3. optionally put-role-policy ec2:StopInstances (iam/ec2-stop-optional-policy.json),
 #        and, since that policy is tag-scoped, tag the instance AutoStopEligible=true
 #     4. create-instance-profile
@@ -30,6 +31,13 @@
 #   Run from an admin workstation with AWS CLI v2 configured.
 #   Requires env vars: INSTANCE_ID, AWS_REGION.
 #   Optional env var:  INCLUDE_EC2_STOP=1 to also attach the ec2:stop policy.
+#   Optional env var:  METRIC_NAMESPACE (default TopazRender/GPU) -- must match
+#   in-guest/Config.ps1's MetricNamespace and 03-create-idle-alarm.sh's own
+#   METRIC_NAMESPACE override EXACTLY. cloudwatch-putmetric-policy.json's
+#   cloudwatch:namespace condition is rendered to this value before being
+#   applied, so a mismatch here would deny the watchdog's PutMetricData calls
+#   outright (AccessDenied), not just leave 03's alarm watching the wrong
+#   metric.
 #   Idempotency: entity-creation calls that may fail because the entity already
 #   exists are guarded and NOTED (not silently swallowed) so re-runs are safe.
 #
@@ -45,6 +53,12 @@ Required environment variables:
 
 Optional environment variables:
   INCLUDE_EC2_STOP  Set to 1 to also attach the tag-scoped ec2:StopInstances policy.
+  METRIC_NAMESPACE  CloudWatch namespace the PutMetricData policy's
+                    cloudwatch:namespace condition is scoped to (default
+                    TopazRender/GPU). Must match in-guest/Config.ps1's
+                    MetricNamespace and 03-create-idle-alarm.sh's own
+                    METRIC_NAMESPACE override exactly, or PutMetricData calls
+                    to the custom namespace are denied.
 EOF
   exit 1
 }
@@ -53,14 +67,19 @@ EOF
 [[ -n "${AWS_REGION:-}"  ]] || { echo "ERROR: AWS_REGION is not set."  >&2; usage; }
 
 INCLUDE_EC2_STOP="${INCLUDE_EC2_STOP:-0}"
+METRIC_NAMESPACE="${METRIC_NAMESPACE:-TopazRender/GPU}"
 
 ROLE_NAME="topaz-render-instance-role"
 PROFILE_NAME="topaz-render-instance-profile"
 
-# Resolve the directory this script lives in so the iam/*.json paths work
-# regardless of the caller's current working directory.
+# Resolve the directory this script lives in so the iam/*.json paths and
+# lib/*.sh sourcing work regardless of the caller's current working directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IAM_DIR="${SCRIPT_DIR}/iam"
+# shellcheck source=lib/aws-idempotent.sh
+source "${SCRIPT_DIR}/lib/aws-idempotent.sh"
+# shellcheck source=lib/validation.sh
+source "${SCRIPT_DIR}/lib/validation.sh"
 
 TRUST_POLICY="${IAM_DIR}/instance-role-trust-policy.json"
 PUTMETRIC_POLICY="${IAM_DIR}/cloudwatch-putmetric-policy.json"
@@ -70,28 +89,48 @@ for f in "$TRUST_POLICY" "$PUTMETRIC_POLICY"; do
   [[ -f "$f" ]] || { echo "ERROR: required policy file not found: $f" >&2; exit 1; }
 done
 
+# Render cloudwatch-putmetric-policy.json's cloudwatch:namespace condition to
+# METRIC_NAMESPACE into a per-run temp copy -- the checked-in file hardcodes
+# the default "TopazRender/GPU" literal, so an operator overriding
+# METRIC_NAMESPACE without this step would get a role that denies
+# PutMetricData to their custom namespace (AccessDenied) while every step of
+# this script still reports success. A temp DIR (not just a temp file) mirrors
+# 04-deploy-max-lifetime-lambda.sh's own scratch-space pattern; the trap
+# covers every exit path (success, error, a usage() exit) so it is never
+# leaked on the admin workstation. Plain bash string substitution (not
+# sed/jq) sidesteps both a jq dependency and sed-delimiter collisions with
+# namespace values that themselves contain '/' or other sed-special chars.
+PUTMETRIC_TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$PUTMETRIC_TMP_DIR"' EXIT
+PUTMETRIC_POLICY_RENDERED="${PUTMETRIC_TMP_DIR}/cloudwatch-putmetric-policy.json"
+putmetric_policy_json="$(cat "$PUTMETRIC_POLICY")"
+putmetric_policy_json="${putmetric_policy_json//TopazRender\/GPU/$METRIC_NAMESPACE}"
+printf '%s' "$putmetric_policy_json" > "$PUTMETRIC_POLICY_RENDERED"
+
 echo "==> [1/6] Creating IAM role ${ROLE_NAME}"
 echo "    aws iam create-role --role-name ${ROLE_NAME} --assume-role-policy-document file://${TRUST_POLICY}"
 # Idempotent: if the role already exists, note it and continue instead of aborting.
-if ! aws iam create-role \
+if ! run_idempotent "EntityAlreadyExists" aws iam create-role \
       --role-name "$ROLE_NAME" \
       --assume-role-policy-document "file://${TRUST_POLICY}" \
-      --description "Least-privilege role for the Topaz render auto-stop watchdog" 2>/tmp/iam_err.$$; then
-  if grep -q "EntityAlreadyExists" /tmp/iam_err.$$; then
-    echo "    NOTE: role ${ROLE_NAME} already exists; reusing it."
-  else
-    cat /tmp/iam_err.$$ >&2; rm -f /tmp/iam_err.$$; exit 1
-  fi
+      --description "Least-privilege role for the Topaz render auto-stop watchdog"; then
+  echo "    NOTE: role ${ROLE_NAME} already exists; reusing it."
 fi
-rm -f /tmp/iam_err.$$
 
-echo "==> [2/6] Attaching inline PutMetricData policy (cloudwatch:PutMetricData only)"
-echo "    aws iam put-role-policy --role-name ${ROLE_NAME} --policy-name topaz-putmetric --policy-document file://${PUTMETRIC_POLICY}"
+echo "==> [2/6] Attaching inline PutMetricData policy (cloudwatch:PutMetricData, namespace=${METRIC_NAMESPACE} only)"
+echo "    aws iam put-role-policy --role-name ${ROLE_NAME} --policy-name topaz-putmetric --policy-document file://${PUTMETRIC_POLICY_RENDERED}"
+# WHY the namespace condition matters even though Resource stays "*":
+# PutMetricData has no resource-level ARNs to scope down (CloudWatch metrics
+# aren't ARN-addressable), so the cloudwatch:namespace StringEquals condition
+# baked into cloudwatch-putmetric-policy.json IS the enforcement -- it's what
+# keeps this role scoped to the METRIC_NAMESPACE namespace, not the
+# (necessarily wildcard) Resource field. See the METRIC_NAMESPACE rendering
+# step above for why the RENDERED copy (not the checked-in file) is applied.
 # put-role-policy is idempotent by nature (it overwrites the named inline policy).
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "topaz-putmetric" \
-  --policy-document "file://${PUTMETRIC_POLICY}"
+  --policy-document "file://${PUTMETRIC_POLICY_RENDERED}"
 
 if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
   [[ -f "$EC2_STOP_POLICY" ]] || { echo "ERROR: INCLUDE_EC2_STOP=1 but ${EC2_STOP_POLICY} not found." >&2; exit 1; }
@@ -115,32 +154,56 @@ if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
     --tags Key=AutoStopEligible,Value=true
 else
   echo "==> [2b/6] INCLUDE_EC2_STOP not set to 1: skipping the optional ec2:stop policy."
+  # WHY check-and-warn instead of auto-revoke: a PREVIOUS run with
+  # INCLUDE_EC2_STOP=1 may have already granted topaz-ec2-stop (and tagged the
+  # instance AutoStopEligible=true). Silently revoking that on a later run
+  # without the flag would be a destructive surprise the operator didn't ask
+  # for; saying nothing would leave them unaware the permission is still
+  # live. Check for it and, if present, tell them exactly how to remove it.
+  if aws iam get-role-policy --role-name "$ROLE_NAME" --policy-name topaz-ec2-stop >/dev/null 2>&1; then
+    echo "    NOTE: a previously-granted topaz-ec2-stop policy (and the"
+    echo "          AutoStopEligible tag it depends on) is still attached to"
+    echo "          ${ROLE_NAME} / ${INSTANCE_ID} and remains in force."
+    echo "          To revoke it manually:"
+    echo "            aws iam delete-role-policy --role-name ${ROLE_NAME} --policy-name topaz-ec2-stop"
+    echo "            aws ec2 delete-tags --region ${AWS_REGION} --resources ${INSTANCE_ID} --tags Key=AutoStopEligible"
+  fi
 fi
 
 echo "==> [3/6] Creating instance profile ${PROFILE_NAME}"
 echo "    aws iam create-instance-profile --instance-profile-name ${PROFILE_NAME}"
-if ! aws iam create-instance-profile \
-      --instance-profile-name "$PROFILE_NAME" 2>/tmp/iam_err.$$; then
-  if grep -q "EntityAlreadyExists" /tmp/iam_err.$$; then
-    echo "    NOTE: instance profile ${PROFILE_NAME} already exists; reusing it."
-  else
-    cat /tmp/iam_err.$$ >&2; rm -f /tmp/iam_err.$$; exit 1
-  fi
+if ! run_idempotent "EntityAlreadyExists" aws iam create-instance-profile \
+      --instance-profile-name "$PROFILE_NAME"; then
+  echo "    NOTE: instance profile ${PROFILE_NAME} already exists; reusing it."
 fi
-rm -f /tmp/iam_err.$$
 
 echo "==> [4/6] Adding role ${ROLE_NAME} to instance profile ${PROFILE_NAME}"
 echo "    aws iam add-role-to-instance-profile --instance-profile-name ${PROFILE_NAME} --role-name ${ROLE_NAME}"
-if ! aws iam add-role-to-instance-profile \
+if ! run_idempotent "LimitExceeded|already" aws iam add-role-to-instance-profile \
       --instance-profile-name "$PROFILE_NAME" \
-      --role-name "$ROLE_NAME" 2>/tmp/iam_err.$$; then
-  if grep -q "LimitExceeded\|already" /tmp/iam_err.$$; then
-    echo "    NOTE: role appears to already be attached to the instance profile; continuing."
+      --role-name "$ROLE_NAME"; then
+  # WHY confirm, not just note-and-continue: an instance profile holds exactly
+  # ONE role, and AWS returns this SAME LimitExceeded error whether the role
+  # already attached is ours or a stale different one. Blindly printing
+  # "already attached" and moving on could leave the instance running with
+  # the WRONG role and no PutMetricData permission -- a silently dead
+  # idle-alarm safety net. Look up the actually-attached role and say so,
+  # mirroring the association-mismatch handling below (the same class of bug).
+  ACTUAL_ROLE="$(aws iam get-instance-profile \
+    --instance-profile-name "$PROFILE_NAME" \
+    --query 'InstanceProfile.Roles[0].RoleName' \
+    --output text)"
+  if profile_names_match "$ACTUAL_ROLE" "$ROLE_NAME"; then
+    echo "    NOTE: confirmed -- role ${ROLE_NAME} is already attached to ${PROFILE_NAME}."
   else
-    cat /tmp/iam_err.$$ >&2; rm -f /tmp/iam_err.$$; exit 1
+    echo "ERROR: instance profile ${PROFILE_NAME} already has a DIFFERENT role attached: ${ACTUAL_ROLE:-<unknown>}" >&2
+    echo "       Expected: ${ROLE_NAME}" >&2
+    echo "       Fix with:" >&2
+    echo "         aws iam remove-role-from-instance-profile --instance-profile-name ${PROFILE_NAME} --role-name ${ACTUAL_ROLE}" >&2
+    echo "         aws iam add-role-to-instance-profile --instance-profile-name ${PROFILE_NAME} --role-name ${ROLE_NAME}" >&2
+    exit 1
   fi
 fi
-rm -f /tmp/iam_err.$$
 
 echo "==> [5/6] Waiting briefly for the instance profile to propagate (IAM is eventually consistent)..."
 # Give IAM a moment; association can fail with 'Invalid IAM Instance Profile' if
@@ -151,48 +214,42 @@ echo "==> [6/6] Associating instance profile ${PROFILE_NAME} with ${INSTANCE_ID}
 echo "    aws ec2 associate-iam-instance-profile --region ${AWS_REGION} \\"
 echo "        --instance-id ${INSTANCE_ID} \\"
 echo "        --iam-instance-profile Name=${PROFILE_NAME}"
-if ! aws ec2 associate-iam-instance-profile \
+if ! run_idempotent "IncorrectState|already" aws ec2 associate-iam-instance-profile \
       --region "$AWS_REGION" \
       --instance-id "$INSTANCE_ID" \
-      --iam-instance-profile "Name=${PROFILE_NAME}" 2>/tmp/iam_err.$$; then
-  if grep -q "IncorrectState\|already" /tmp/iam_err.$$; then
-    echo "    NOTE: instance already has an IAM instance profile associated;"
-    echo "          verifying it is the expected one (${PROFILE_NAME}) rather than"
-    echo "          just assuming any existing association is fine..."
-    # WHY: the old fallback accepted ANY existing association as "good enough".
-    # If the instance is actually wearing a DIFFERENT (stale, wrong-account,
-    # hand-attached) profile, it silently runs without the permissions this
-    # script just granted. Look up the association by name and say so.
-    ASSOCIATED_ARN="$(aws ec2 describe-iam-instance-profile-associations \
+      --iam-instance-profile "Name=${PROFILE_NAME}"; then
+  echo "    NOTE: instance already has an IAM instance profile associated;"
+  echo "          verifying it is the expected one (${PROFILE_NAME}) rather than"
+  echo "          just assuming any existing association is fine..."
+  # WHY: the old fallback accepted ANY existing association as "good enough".
+  # If the instance is actually wearing a DIFFERENT (stale, wrong-account,
+  # hand-attached) profile, it silently runs without the permissions this
+  # script just granted. Look up the association by name and say so.
+  ASSOCIATED_ARN="$(aws ec2 describe-iam-instance-profile-associations \
+    --region "$AWS_REGION" \
+    --filters "Name=instance-id,Values=${INSTANCE_ID}" "Name=state,Values=associating,associated" \
+    --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+    --output text)"
+  ASSOCIATED_NAME="${ASSOCIATED_ARN##*/}"
+  if profile_names_match "$ASSOCIATED_NAME" "$PROFILE_NAME"; then
+    echo "    NOTE: confirmed -- ${INSTANCE_ID} is already associated with ${PROFILE_NAME}."
+  else
+    ASSOCIATION_ID="$(aws ec2 describe-iam-instance-profile-associations \
       --region "$AWS_REGION" \
       --filters "Name=instance-id,Values=${INSTANCE_ID}" "Name=state,Values=associating,associated" \
-      --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+      --query 'IamInstanceProfileAssociations[0].AssociationId' \
       --output text)"
-    ASSOCIATED_NAME="${ASSOCIATED_ARN##*/}"
-    if [[ "$ASSOCIATED_NAME" == "$PROFILE_NAME" ]]; then
-      echo "    NOTE: confirmed -- ${INSTANCE_ID} is already associated with ${PROFILE_NAME}."
-    else
-      ASSOCIATION_ID="$(aws ec2 describe-iam-instance-profile-associations \
-        --region "$AWS_REGION" \
-        --filters "Name=instance-id,Values=${INSTANCE_ID}" "Name=state,Values=associating,associated" \
-        --query 'IamInstanceProfileAssociations[0].AssociationId' \
-        --output text)"
-      echo "ERROR: ${INSTANCE_ID} is associated with a DIFFERENT IAM instance profile: ${ASSOCIATED_NAME:-<unknown>}" >&2
-      echo "       Expected: ${PROFILE_NAME}" >&2
-      echo "       Fix with:" >&2
-      echo "         aws ec2 replace-iam-instance-profile-association --region ${AWS_REGION} \\" >&2
-      echo "             --association-id ${ASSOCIATION_ID} \\" >&2
-      echo "             --iam-instance-profile Name=${PROFILE_NAME}" >&2
-      rm -f /tmp/iam_err.$$
-      exit 1
-    fi
-  else
-    cat /tmp/iam_err.$$ >&2; rm -f /tmp/iam_err.$$; exit 1
+    echo "ERROR: ${INSTANCE_ID} is associated with a DIFFERENT IAM instance profile: ${ASSOCIATED_NAME:-<unknown>}" >&2
+    echo "       Expected: ${PROFILE_NAME}" >&2
+    echo "       Fix with:" >&2
+    echo "         aws ec2 replace-iam-instance-profile-association --region ${AWS_REGION} \\" >&2
+    echo "             --association-id ${ASSOCIATION_ID} \\" >&2
+    echo "             --iam-instance-profile Name=${PROFILE_NAME}" >&2
+    exit 1
   fi
 fi
-rm -f /tmp/iam_err.$$
 
-echo "==> Done. Instance ${INSTANCE_ID} can now publish the TopazRender/GPU metric."
+echo "==> Done. Instance ${INSTANCE_ID} can now publish the ${METRIC_NAMESPACE} metric."
 if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
   echo "    (Optional ec2:StopInstances also granted, tag-scoped to AutoStopEligible=true.)"
 fi

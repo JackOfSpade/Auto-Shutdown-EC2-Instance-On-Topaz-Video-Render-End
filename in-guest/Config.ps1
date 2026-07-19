@@ -26,11 +26,33 @@
     script (watchdog, stop sequence, metric publisher, installer, tests).
 #>
 
+function Assert-ValidCompletionSignal {
+    <#
+    .SYNOPSIS
+        Pure: throws a clear, actionable error if $Signal is not one of the
+        three CompletionSignal values Resolve-RenderActive accepts.
+    .DESCRIPTION
+        CompletionSignal is otherwise only enforced deep in the poll loop, by
+        Resolve-RenderActive's own ValidateSet -- where the failure mode for a
+        typo'd value is Test-RenderActive throwing (or, if that ValidateSet
+        is ever loosened, silently returning $null forever), freezing the
+        watchdog for the life of the instance. Validating here, at config
+        load, fails loudly at script start instead.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Signal)
+
+    $validSignals = @('WorkerOnly', 'GpuOnly', 'WorkerOrGpu')
+    if ($validSignals -notcontains $Signal) {
+        throw "Get-TopazAutoStopConfig: CompletionSignal '$Signal' is invalid. Valid values are: $($validSignals -join ', ')."
+    }
+}
+
 function Get-TopazAutoStopConfig {
     [CmdletBinding()]
     param()
 
-    [pscustomobject]@{
+    $config = [pscustomobject]@{
         # ------------------------------------------------------------------
         # OPERATOR SETTINGS  (set these from your Phase 0 observations)
         # ------------------------------------------------------------------
@@ -112,6 +134,23 @@ function Get-TopazAutoStopConfig {
         # output file to become unlocked before it hands off to the stop step.
         UnlockTimeoutMin = 5
 
+        # Seconds between file-unlock re-checks during the UnlockTimeoutMin
+        # gate above.
+        UnlockPollSec    = 10
+
+        # Bound (seconds) on short best-effort aws CLI calls: sns publish and
+        # cloudwatch put-metric-data. A hung aws CLI under the metric
+        # scheduled task's MultipleInstances=IgnoreNew policy would
+        # permanently kill the metric feed -- the task never gets a fresh run
+        # while the wedged one sits open, so nothing would ever call it again.
+        AwsCliTimeoutSec = 60
+
+        # Bound (seconds) on the pre-stop `aws s3 sync`. Generous because it
+        # may genuinely need to transfer a lot of rendered output before
+        # power-off; an unbounded call in Stop-Sequence would block power-off
+        # forever.
+        S3SyncTimeoutSec = 1800
+
         # ------------------------------------------------------------------
         # PATHS
         # ------------------------------------------------------------------
@@ -123,6 +162,10 @@ function Get-TopazAutoStopConfig {
         # PHASE 4 - GPU METRIC (published by Push-GpuMetric.ps1)
         # ------------------------------------------------------------------
 
+        # These two values are MIRRORED by control-plane/03-create-idle-alarm.sh
+        # (METRIC_NAMESPACE/METRIC_NAME env overrides there). If you change
+        # them here, re-run that script with matching overrides, or the idle
+        # alarm silently keeps watching a dead metric.
         MetricNamespace  = 'TopazRender/GPU'
         MetricName       = 'GPUUtilization'
 
@@ -150,6 +193,10 @@ function Get-TopazAutoStopConfig {
         WatchdogTaskName = 'TopazAutoStop-Watchdog'
         MetricTaskName   = 'TopazAutoStop-GpuMetric'
     }
+
+    Assert-ValidCompletionSignal -Signal $config.CompletionSignal
+
+    return $config
 }
 
 function Write-TopazLog {
@@ -225,6 +272,51 @@ function Get-Ec2ImdsToken {
     }
 }
 
+function Convert-AzToRegion {
+    <#
+    .SYNOPSIS
+        Pure: derive an EC2 region from an availability zone by stripping the
+        trailing zone letter, but only when the result still looks like a
+        standard region name.
+    .DESCRIPTION
+        A plain `-replace '[a-z]$', ''` strips the trailing letter from ANY
+        AZ-shaped string, including Local Zone / Wavelength AZs such as
+        'us-west-2-lax-1a', which would produce the INVALID region
+        'us-west-2-lax-1' instead of the correct 'us-west-2'. This validates
+        the stripped candidate against a standard region shape and returns
+        $null (never a guess) for anything that does not fit -- callers
+        should treat $null the same as a full IMDS failure (leave Region
+        empty) rather than pass a malformed region string to the AWS CLI.
+    .PARAMETER AvailabilityZone
+        The AZ string, e.g. 'us-east-1a'. May be $null/empty.
+    .OUTPUTS
+        The region string, or $null if AvailabilityZone is not a standard AZ
+        shape.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$AvailabilityZone)
+
+    if ([string]::IsNullOrWhiteSpace($AvailabilityZone)) { return $null }
+
+    # Only strip the trailing zone letter when it is preceded by "-<digits>",
+    # e.g. 'us-east-1a' -> 'us-east-1'. A non-AZ-shaped string is left as-is
+    # and will simply fail the region-shape check below.
+    $candidate = $AvailabilityZone
+    if ($AvailabilityZone -match '^(.+-\d+)[a-z]$') {
+        $candidate = $Matches[1]
+    }
+
+    # Standard region shape, e.g. 'us-east-1', 'ap-southeast-2', 'us-gov-west-1'.
+    # A Local Zone / Wavelength AZ ('us-west-2-lax-1a') strips down to
+    # 'us-west-2-lax-1', which has an extra '-lax' segment and correctly fails
+    # this shape check.
+    if ($candidate -match '^[a-z]{2,3}-(gov-|iso[a-z]?-)?[a-z]+-\d+$') {
+        return $candidate
+    }
+
+    return $null
+}
+
 function Get-Ec2Identity {
     <#
     .SYNOPSIS
@@ -262,12 +354,15 @@ function Get-Ec2Identity {
     catch { }
 
     # Fallback: derive region from the AZ if placement/region was unavailable.
+    # Convert-AzToRegion returns $null (leaving Region empty, same as a full
+    # IMDS failure) instead of a malformed region for Local Zone / Wavelength
+    # AZs -- see its own comment.
     if (-not $result.Region) {
         try {
             $az = ("$(Invoke-RestMethod -Method Get `
                 -Uri 'http://169.254.169.254/latest/meta-data/placement/availability-zone' `
                 -Headers $headers -TimeoutSec 3 -ErrorAction Stop)").Trim()
-            if ($az) { $result.Region = ($az -replace '[a-z]$', '') }
+            if ($az) { $result.Region = Convert-AzToRegion -AvailabilityZone $az }
         }
         catch { }
     }
@@ -436,13 +531,262 @@ function Test-TopazTempFile {
         'Reel_Template_Final.mp4' and 'temperature.mp4' through as real
         outputs. PowerShell's -match is case-insensitive by default, so
         'my_TEMP.mp4' still matches a '_temp' marker.
+
+        An empty/whitespace TempMarker is a plausible operator setting
+        meaning "my Topaz workflow leaves no scratch files" -- without
+        AllowEmptyString the Mandatory+string binding throws a
+        parameter-binding error on '', which (uncaught, inside Watchdog's
+        Where-Object filter) silently empties the unlock-gate candidate list
+        and lets the box power off mid-write. Treat it as an explicit no-op
+        instead: nothing is ever classified as scratch.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$TempMarker
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TempMarker
     )
+
+    if ([string]::IsNullOrWhiteSpace($TempMarker)) { return $false }
 
     $pattern = [regex]::Escape($TempMarker) + '([._-]|$)'
     return [bool]($Name -match $pattern)
+}
+
+function Build-AwsCliArgs {
+    <#
+    .SYNOPSIS
+        Pure: appends '--region <Region>' to $Base only when Region is set.
+    .DESCRIPTION
+        Centralizes the "only pass --region when IMDS region discovery
+        succeeded" splat pattern duplicated across the aws CLI call sites in
+        Stop-Sequence.ps1 and Push-GpuMetric.ps1 -- the SYSTEM account has no
+        default region configured anywhere in this pipeline, so omitting
+        --region when Region IS known would fail every call with
+        NoRegionError, but appending a blank/whitespace --region would be
+        just as broken.
+    .PARAMETER Base
+        The aws CLI argument list before any --region is added, e.g.
+        @('s3', 'sync', $OutputDir, $Target, '--only-show-errors').
+    .PARAMETER Region
+        The discovered region, or $null/empty/whitespace if discovery failed.
+    .OUTPUTS
+        $Base unchanged, or $Base + @('--region', $Region).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Base,
+        [string]$Region
+    )
+
+    # The leading unary comma on every return below is required, not
+    # decorative: PowerShell's pipeline/return semantics collapse a returned
+    # array to a bare scalar when it has exactly one element -- a caller
+    # passing a single-element $Base (or splatting the single-element result)
+    # would otherwise silently get a string back instead of an array.
+    if ([string]::IsNullOrWhiteSpace($Region)) { return , $Base }
+    return , ($Base + @('--region', $Region))
+}
+
+function ConvertTo-TopazCliArgument {
+    <#
+    .SYNOPSIS
+        Pure: escapes a single argument for ProcessStartInfo.Arguments using
+        the actual Win32 CommandLineToArgvW convention (mirrors .NET's own
+        internal PasteArguments.AppendArgument), so Invoke-TopazAwsCli's
+        hand-built argument string round-trips correctly through aws.exe's
+        argv parser.
+    .DESCRIPTION
+        Arguments containing no whitespace and no double quote are returned
+        unchanged. Otherwise the value is wrapped in double quotes, and while
+        walking it: a run of backslashes immediately followed by a literal
+        double quote is doubled, plus one more backslash, then the quote is
+        escaped as \" ; a run of backslashes at the very END of the value
+        (i.e. immediately before the closing quote this function adds) is
+        also doubled, otherwise it would "eat" that closing quote and merge
+        every subsequent shell-joined argument into this one -- exactly the
+        bug this replaces (see Invoke-TopazAwsCli's own history: the previous
+        '"' -> '""' doubling scheme neither doubled trailing backslashes nor
+        used \" for an embedded quote, so it did not match this convention).
+    .PARAMETER Value
+        The raw, unescaped argument value.
+    .OUTPUTS
+        $Value unchanged if it needs no quoting, otherwise a properly
+        quoted-and-escaped string safe to join with spaces into
+        ProcessStartInfo.Arguments.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            continue
+        }
+
+        if ($ch -eq '"') {
+            [void]$sb.Append('\' * ($backslashes * 2 + 1))
+            [void]$sb.Append('"')
+            $backslashes = 0
+            continue
+        }
+
+        if ($backslashes -gt 0) {
+            [void]$sb.Append('\' * $backslashes)
+            $backslashes = 0
+        }
+        [void]$sb.Append($ch)
+    }
+
+    if ($backslashes -gt 0) {
+        [void]$sb.Append('\' * ($backslashes * 2))
+    }
+
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Invoke-TopazAwsCli {
+    <#
+    .SYNOPSIS
+        Runs the aws CLI bounded by a timeout, logging success/failure via
+        Write-TopazLog. Returns $true on a clean exit 0, $false on timeout, a
+        nonzero exit, or any exception -- every aws CLI call in this pipeline
+        is strictly best-effort and must never let a failure here block
+        anything else (S3 sync / SNS publish / CloudWatch metric push).
+    .DESCRIPTION
+        Mirrors Get-GpuUtilizationMax's deadlock-avoidance pattern: BOTH
+        standard output and standard error are read via ReadToEndAsync()
+        BEFORE WaitForExit is called, because a synchronous ReadToEnd() first
+        would block until the child process closes that stream (normally at
+        exit) -- exactly the hang this timeout exists to bound around. On
+        timeout the process is Kill()ed so it cannot linger and keep holding
+        the calling scheduled task's MultipleInstances=IgnoreNew slot open.
+
+        PowerShell 5.1's ProcessStartInfo has no array-valued ArgumentList
+        (that arrived only with .NET Core / PS 6+) -- following
+        Get-GpuUtilizationMax's own precedent of a plain .Arguments STRING,
+        $Arguments is joined into one escaped string here via the pure
+        ConvertTo-TopazCliArgument, which implements the actual
+        CommandLineToArgvW convention cmd.exe/aws.exe expect on Windows (see
+        its own comment for why a naive '"' -> '""' doubling scheme, tried
+        here previously, is NOT that convention and corrupts any argument
+        that is both quoted and ends in a backslash).
+    .PARAMETER Arguments
+        The aws CLI argument list, e.g. @('s3','sync',...,'--region','us-east-1').
+    .PARAMETER TimeoutSec
+        Bound on the whole call; on expiry the process is killed and this
+        returns $false.
+    .PARAMETER Component
+        Write-TopazLog component tag (e.g. 'stop', 'metric').
+    .PARAMETER SuccessMessage
+        Logged at INFO on a clean exit 0.
+    .PARAMETER FailureVerb
+        Short present-tense phrase used in WARN messages, e.g. 'S3 sync' or
+        'SNS publish'.
+    .PARAMETER FailureContext
+        Optional extra text appended to WARN messages (e.g. a target ARN).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][string]$SuccessMessage,
+        [Parameter(Mandatory)][string]$FailureVerb,
+        [string]$FailureContext = ''
+    )
+
+    $proc = $null
+    try {
+        $escapedArgs = $Arguments | ForEach-Object { ConvertTo-TopazCliArgument -Value $_ }
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = 'aws'
+        $psi.Arguments              = [string]::Join(' ', $escapedArgs)
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow         = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill() } catch { }
+            Write-TopazLog -Component $Component -Level 'WARN' `
+                -Message "$FailureVerb timed out after ${TimeoutSec}s. $FailureContext"
+            return $false
+        }
+
+        if ($proc.ExitCode -eq 0) {
+            Write-TopazLog -Component $Component -Level 'INFO' -Message $SuccessMessage
+            return $true
+        }
+
+        $tail = "$($stdoutTask.Result)$($stderrTask.Result)".Trim()
+        Write-TopazLog -Component $Component -Level 'WARN' `
+            -Message "$FailureVerb exited with code $($proc.ExitCode). Output: $tail $FailureContext"
+        return $false
+    }
+    catch {
+        Write-TopazLog -Component $Component -Level 'WARN' `
+            -Message "$FailureVerb failed: $($_.Exception.Message) $FailureContext"
+        return $false
+    }
+    finally {
+        if ($proc) { $proc.Dispose() }
+    }
+}
+
+function Get-TopazStopNotification {
+    <#
+    .SYNOPSIS
+        Pure: build the SNS subject + message for a given stop reason,
+        reproducing Stop-Sequence.ps1's wording EXACTLY for both the DryRun
+        and real-stop branches.
+    .DESCRIPTION
+        DryRun never powers off (Stop-Sequence.ps1's dry-run guard runs
+        AFTER the notification is published), so its notification text must
+        not claim the box is stopping -- that would be a false alarm to
+        whoever is subscribed to the topic.
+    .PARAMETER Reason
+        'completed' or 'stalled'.
+    .PARAMETER InstanceId
+        The instance id to name in the text. Callers resolve any IMDS-failure
+        fallback (e.g. a placeholder id) before calling this.
+    .PARAMETER DryRun
+        Whether the power-off is being suppressed.
+    .OUTPUTS
+        @{ Subject = <string>; Message = <string> }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Reason,
+        [string]$InstanceId,
+        [Parameter(Mandatory)][bool]$DryRun
+    )
+
+    if ($DryRun) {
+        return @{
+            Subject = "Topaz render $Reason - DRY RUN (no stop) - $InstanceId"
+            Message = "Topaz watchdog decided '$Reason' on instance $InstanceId at $(Get-Date -Format 's'). DryRun is enabled, so the power-off was suppressed and the instance is still running."
+        }
+    }
+
+    return @{
+        Subject = "Topaz render $Reason - stopping $InstanceId"
+        Message = "Topaz render queue reported '$Reason' on instance $InstanceId at $(Get-Date -Format 's'). The guest is powering off, which stops the EC2 instance."
+    }
 }

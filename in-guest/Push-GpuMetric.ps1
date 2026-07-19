@@ -64,28 +64,19 @@ if ([string]::IsNullOrWhiteSpace($instanceId) -or [string]::IsNullOrWhiteSpace($
 # 3. Publish the metric via the AWS CLI.
 # ---------------------------------------------------------------------------
 
-try {
-    $out = & aws cloudwatch put-metric-data `
-        --region $region `
-        --namespace $cfg.MetricNamespace `
-        --metric-name $cfg.MetricName `
-        --unit Percent `
-        --value $util `
-        --dimensions "InstanceId=$instanceId" 2>&1
+$metricArgs = Build-AwsCliArgs -Base @(
+    'cloudwatch', 'put-metric-data',
+    '--namespace', $cfg.MetricNamespace,
+    '--metric-name', $cfg.MetricName,
+    '--unit', 'Percent',
+    '--value', $util,
+    '--dimensions', "InstanceId=$instanceId"
+) -Region $region
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-TopazLog -Component 'metric' -Level 'INFO' `
-            -Message "Published $($cfg.MetricNamespace)/$($cfg.MetricName)=$util% for $instanceId in $region."
-    }
-    else {
-        Write-TopazLog -Component 'metric' -Level 'WARN' `
-            -Message "aws put-metric-data exited with code $LASTEXITCODE. Output: $out"
-    }
-}
-catch {
-    Write-TopazLog -Component 'metric' -Level 'WARN' `
-        -Message "Failed to publish metric: $($_.Exception.Message)"
-}
+[void] (Invoke-TopazAwsCli -Arguments $metricArgs -TimeoutSec $cfg.AwsCliTimeoutSec `
+    -Component 'metric' `
+    -SuccessMessage "Published $($cfg.MetricNamespace)/$($cfg.MetricName)=$util% for $instanceId in $region." `
+    -FailureVerb 'aws put-metric-data')
 
 # Scheduled task must never error-spam; always succeed.
 exit 0

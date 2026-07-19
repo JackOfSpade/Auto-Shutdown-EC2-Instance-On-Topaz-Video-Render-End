@@ -50,8 +50,11 @@ If `S3SyncTarget` is set in [`Config.ps1`](../in-guest/Config.ps1) (e.g.
 `s3://my-bucket/renders/`), the script runs `aws s3 sync OutputDir S3SyncTarget
 --only-show-errors --region <discovered-region>` **before** powering off, so
 finished artifacts are safe even if something later goes wrong. Empty (the
-default) skips the sync. A non-zero exit or thrown error is logged as a warning
-and **does not** block the stop.
+default) skips the sync. A non-zero exit, a thrown error, or a hang past
+`S3SyncTimeoutSec` (default **1800 s**, generous since a large sync may
+genuinely need that long) is logged as a warning and **does not** block the
+stop - the call is killed on timeout rather than left to wedge power-off
+forever.
 
 > S3 sync uses the AWS CLI and therefore the instance role's credentials. The
 > default instance role only grants `cloudwatch:PutMetricData`; if you enable S3

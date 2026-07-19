@@ -77,6 +77,26 @@ conclusion="$(ci_conclusion_from_json '{"message":"Not Found"}')"
 assert_eq "malformed/error-shaped JSON (missing workflow_runs) parses to 'error', not 'none'" "$conclusion" "error"
 assert_false "is_ci_green must NOT treat a malformed API response as green" is_ci_green "$conclusion"
 
+# ---- ci_conclusion_from_json: the two-runs-per-sha (push + pull_request events) case --------
+
+# A branch with an open PR gets TWO "CI" runs per commit; the newer one (index 0, most recent) can
+# still be in_progress while the older one already succeeded. A success ANYWHERE must win so a
+# genuinely green branch is never parked behind its own duplicate run.
+conclusion="$(ci_conclusion_from_json '{"workflow_runs":[{"status":"in_progress","conclusion":null},{"conclusion":"success"}]}')"
+assert_eq "newer run in_progress, older run success: 'success' wins (duplicate-run rescue)" "$conclusion" "success"
+assert_true "duplicate-run rescue: is_ci_green must allow the merge" is_ci_green "$conclusion"
+
+# When NEITHER duplicate run succeeded, behavior is unchanged: the first (most recent) run's own
+# conclusion, not the older run's — "cancelled" here, not "failure".
+conclusion="$(ci_conclusion_from_json '{"workflow_runs":[{"conclusion":"cancelled"},{"conclusion":"failure"}]}')"
+assert_eq "newer run cancelled, older run failure, no success anywhere: first run's value ('cancelled') wins" "$conclusion" "cancelled"
+assert_false "no success among duplicate runs: is_ci_green must SKIP the merge" is_ci_green "$conclusion"
+
+# ---- is_ci_green: fail-closed lock-in for near-miss statuses that must never count as green --
+
+assert_false "is_ci_green must reject 'cancelled' (fail-closed lock-in)" is_ci_green "cancelled"
+assert_false "is_ci_green must reject 'skipped' (fail-closed lock-in)" is_ci_green "skipped"
+
 # ---- is_ancestor_of: already-merged + re-confirm-before-delete, against a scratch git repo --
 
 SCRATCH="$(mktemp -d)"

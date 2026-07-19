@@ -80,15 +80,23 @@ jobs:
 
             # --- CI gate -------------------------------------------------------------
             # Only merge a branch whose EXACT tip commit has a successful CI run. We
-            # query the latest "CI" workflow run for that precise SHA, so a commit
-            # pushed after CI passed (new tip, no green run yet) is skipped until its
-            # own CI completes green. Fail closed: any non-success (in-progress,
-            # failure, missing, or API error) skips the branch. The fail-closed logic
-            # lives in scripts/auto_merge_decision.sh and is covered by
+            # query the "CI" workflow runs for that precise SHA, so a commit pushed
+            # after CI passed (new tip, no green run yet) is skipped until its own CI
+            # completes green. Fail closed: any non-success (in-progress, failure,
+            # missing, or API error) skips the branch. The fail-closed logic lives in
+            # scripts/auto_merge_decision.sh and is covered by
             # tests/test_auto_merge_logic.sh — not just shellcheck syntax checks.
+            #
+            # per_page=10 (not 1): a branch with an open PR gets TWO "CI" workflow runs
+            # per commit — one for the `push` event, one for the `pull_request` event.
+            # These complete independently and in no guaranteed order, so the single
+            # most-recent run can be an in-progress/cancelled PR-event run while the
+            # push-event run already succeeded. Fetching several runs and letting
+            # ci_conclusion_from_json search all of them for a "success" avoids parking
+            # a genuinely green branch behind its own duplicate run.
             sha="$(git rev-parse "$ref")"
             runs_json="$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=1" \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=10" \
               2>/dev/null || echo "")"
             ci_conclusion="$(ci_conclusion_from_json "$runs_json")"
             if ! is_ci_green "$ci_conclusion"; then

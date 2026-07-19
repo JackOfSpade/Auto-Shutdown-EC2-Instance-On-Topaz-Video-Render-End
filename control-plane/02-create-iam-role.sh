@@ -20,7 +20,8 @@
 #   Steps:
 #     1. create-role with the ec2 trust policy      (iam/instance-role-trust-policy.json)
 #     2. put-role-policy PutMetricData              (iam/cloudwatch-putmetric-policy.json)
-#     3. optionally put-role-policy ec2:StopInstances (iam/ec2-stop-optional-policy.json)
+#     3. optionally put-role-policy ec2:StopInstances (iam/ec2-stop-optional-policy.json),
+#        and, since that policy is tag-scoped, tag the instance AutoStopEligible=true
 #     4. create-instance-profile
 #     5. add-role-to-instance-profile
 #     6. associate-iam-instance-profile with the instance
@@ -100,6 +101,18 @@ if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
     --role-name "$ROLE_NAME" \
     --policy-name "topaz-ec2-stop" \
     --policy-document "file://${EC2_STOP_POLICY}"
+
+  # WHY: the policy above only grants ec2:StopInstances when the target instance
+  # carries AutoStopEligible=true (see iam/ec2-stop-optional-policy.json). Nothing
+  # else in this pipeline ever applies that tag -- without it, an in-guest API
+  # stop call would fail UnauthorizedOperation every single time. Tag the
+  # instance now so the permission we just granted is actually usable.
+  echo "==> [2c/6] Tagging ${INSTANCE_ID} with AutoStopEligible=true (required by the policy's tag condition)"
+  echo "    aws ec2 create-tags --region ${AWS_REGION} --resources ${INSTANCE_ID} --tags Key=AutoStopEligible,Value=true"
+  aws ec2 create-tags \
+    --region "$AWS_REGION" \
+    --resources "$INSTANCE_ID" \
+    --tags Key=AutoStopEligible,Value=true
 else
   echo "==> [2b/6] INCLUDE_EC2_STOP not set to 1: skipping the optional ec2:stop policy."
 fi
@@ -143,8 +156,36 @@ if ! aws ec2 associate-iam-instance-profile \
       --instance-id "$INSTANCE_ID" \
       --iam-instance-profile "Name=${PROFILE_NAME}" 2>/tmp/iam_err.$$; then
   if grep -q "IncorrectState\|already" /tmp/iam_err.$$; then
-    echo "    NOTE: instance may already have an IAM instance profile associated."
-    echo "          Review with: aws ec2 describe-iam-instance-profile-associations --region ${AWS_REGION} --filters Name=instance-id,Values=${INSTANCE_ID}"
+    echo "    NOTE: instance already has an IAM instance profile associated;"
+    echo "          verifying it is the expected one (${PROFILE_NAME}) rather than"
+    echo "          just assuming any existing association is fine..."
+    # WHY: the old fallback accepted ANY existing association as "good enough".
+    # If the instance is actually wearing a DIFFERENT (stale, wrong-account,
+    # hand-attached) profile, it silently runs without the permissions this
+    # script just granted. Look up the association by name and say so.
+    ASSOCIATED_ARN="$(aws ec2 describe-iam-instance-profile-associations \
+      --region "$AWS_REGION" \
+      --filters "Name=instance-id,Values=${INSTANCE_ID}" "Name=state,Values=associating,associated" \
+      --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' \
+      --output text)"
+    ASSOCIATED_NAME="${ASSOCIATED_ARN##*/}"
+    if [[ "$ASSOCIATED_NAME" == "$PROFILE_NAME" ]]; then
+      echo "    NOTE: confirmed -- ${INSTANCE_ID} is already associated with ${PROFILE_NAME}."
+    else
+      ASSOCIATION_ID="$(aws ec2 describe-iam-instance-profile-associations \
+        --region "$AWS_REGION" \
+        --filters "Name=instance-id,Values=${INSTANCE_ID}" "Name=state,Values=associating,associated" \
+        --query 'IamInstanceProfileAssociations[0].AssociationId' \
+        --output text)"
+      echo "ERROR: ${INSTANCE_ID} is associated with a DIFFERENT IAM instance profile: ${ASSOCIATED_NAME:-<unknown>}" >&2
+      echo "       Expected: ${PROFILE_NAME}" >&2
+      echo "       Fix with:" >&2
+      echo "         aws ec2 replace-iam-instance-profile-association --region ${AWS_REGION} \\" >&2
+      echo "             --association-id ${ASSOCIATION_ID} \\" >&2
+      echo "             --iam-instance-profile Name=${PROFILE_NAME}" >&2
+      rm -f /tmp/iam_err.$$
+      exit 1
+    fi
   else
     cat /tmp/iam_err.$$ >&2; rm -f /tmp/iam_err.$$; exit 1
   fi

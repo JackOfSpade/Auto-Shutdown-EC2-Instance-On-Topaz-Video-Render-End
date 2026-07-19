@@ -13,10 +13,12 @@
 #   box that somehow keeps the GPU busy past any reasonable session length.
 #
 #   Steps performed here:
-#     1. Zip the Lambda source at ../lambda/max-lifetime-stop
-#     2. Create the Lambda execution role (iam/lambda-execution-policy.json)
-#     3. Create the Lambda function (handler wired to that zip)
-#     4. Create an EventBridge Scheduler schedule (falls back to a CloudWatch
+#     1. Tag the instance AutoStopEligible=true (the Lambda's stop permission
+#        is tag-scoped -- see iam/lambda-execution-policy.json)
+#     2. Zip the Lambda source at ../lambda/max-lifetime-stop
+#     3. Create the Lambda execution role (iam/lambda-execution-policy.json)
+#     4. Create the Lambda function (handler wired to that zip)
+#     5. Create an EventBridge Scheduler schedule (falls back to a CloudWatch
 #        Events rule) that invokes the function on a fixed cadence
 #
 #   The ceiling is parameterized via env MAX_LIFETIME_HOURS (default 12) and is
@@ -26,7 +28,10 @@
 # .NOTES
 #   Run from an admin workstation with AWS CLI v2 configured.
 #   Requires env vars: INSTANCE_ID, AWS_REGION.
-#   Optional env var:  MAX_LIFETIME_HOURS (default 12)
+#   Optional env var:  MAX_LIFETIME_HOURS (default 12) -- must be a positive
+#   number (matches handler.py's own validation); an invalid value is rejected
+#   here at deploy time rather than silently deploying a Lambda that falls
+#   back to its own default and lies about the effective ceiling.
 #
 #   PREREQUISITES / assumptions:
 #     * The Lambda source directory ../lambda/max-lifetime-stop exists and
@@ -47,7 +52,8 @@ Required environment variables:
   AWS_REGION          The AWS region the instance lives in (e.g. <region>)
 
 Optional environment variables:
-  MAX_LIFETIME_HOURS  Absolute run-time ceiling in hours (default 12)
+  MAX_LIFETIME_HOURS  Absolute run-time ceiling in hours (default 12).
+                      Must be a positive number, e.g. 12 or 4.5.
 EOF
   exit 1
 }
@@ -56,10 +62,26 @@ if [[ -z "${INSTANCE_ID:-}" ]]; then echo "ERROR: INSTANCE_ID is not set." >&2; 
 if [[ -z "${AWS_REGION:-}"  ]]; then echo "ERROR: AWS_REGION is not set."  >&2; usage; fi
 
 MAX_LIFETIME_HOURS="${MAX_LIFETIME_HOURS:-12}"
+# Mirror handler.py's own validation here so a bad value fails LOUDLY at
+# deploy time instead of deploying "successfully" while the Lambda silently
+# substitutes its default 12h ceiling -- the deploy output would otherwise
+# lie about the effective cap.
+if ! [[ "$MAX_LIFETIME_HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v h="$MAX_LIFETIME_HOURS" 'BEGIN { exit !(h > 0) }'; then
+  echo "ERROR: MAX_LIFETIME_HOURS must be a positive number, e.g. 12 or 4.5 (got '${MAX_LIFETIME_HOURS}')." >&2
+  usage
+fi
 
-FUNCTION_NAME="topaz-max-lifetime-stop"
+# WHY per-instance names: like the idle alarm, create-function/create-schedule
+# target a fixed name -- a shared name would let a second instance's deploy
+# silently clobber (re-target) the first instance's function and schedule.
+FUNCTION_NAME="topaz-max-lifetime-stop-${INSTANCE_ID}"
+SCHEDULE_NAME="topaz-max-lifetime-schedule-${INSTANCE_ID}"
+# WHY shared (not per-instance): unlike the function/schedule above, every
+# instance's execution policy is byte-for-byte identical and tag-scoped
+# (aws:ResourceTag/AutoStopEligible=true, see iam/lambda-execution-policy.json)
+# -- there is nothing instance-specific to separate, so one role safely serves
+# every instance.
 LAMBDA_ROLE_NAME="topaz-max-lifetime-lambda-role"
-SCHEDULE_NAME="topaz-max-lifetime-schedule"
 HANDLER="handler.handler"
 RUNTIME="python3.12"
 SCHEDULE_EXPRESSION="rate(30 minutes)"
@@ -72,16 +94,29 @@ TRUST_POLICY_JSON='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Princ
 
 ZIP_PATH="$(mktemp -d)/max-lifetime-stop.zip"
 
-echo "==> [0/4] Sanity checks"
+echo "==> [0/5] Sanity checks"
 [[ -d "$LAMBDA_SRC_DIR" ]]     || { echo "ERROR: Lambda source dir not found: ${LAMBDA_SRC_DIR}" >&2; exit 1; }
 [[ -f "$LAMBDA_EXEC_POLICY" ]] || { echo "ERROR: execution policy not found: ${LAMBDA_EXEC_POLICY}" >&2; exit 1; }
 command -v zip >/dev/null 2>&1 || { echo "ERROR: 'zip' is required but not installed." >&2; exit 1; }
 
-echo "==> [1/4] Zipping Lambda source ${LAMBDA_SRC_DIR} -> ${ZIP_PATH}"
+# WHY tag first: the Lambda's ec2:StopInstances permission (see
+# iam/lambda-execution-policy.json) is conditioned on
+# aws:ResourceTag/AutoStopEligible=true. Nothing else in this pipeline ever
+# applies that tag -- without it, the Lambda's stop call fails
+# UnauthorizedOperation every time it fires, a silently dead safety net.
+# create-tags is idempotent, so this is safe to re-run.
+echo "==> [1/5] Tagging ${INSTANCE_ID} with AutoStopEligible=true (required by the Lambda's tag-scoped stop permission)"
+echo "    aws ec2 create-tags --region ${AWS_REGION} --resources ${INSTANCE_ID} --tags Key=AutoStopEligible,Value=true"
+aws ec2 create-tags \
+  --region "$AWS_REGION" \
+  --resources "$INSTANCE_ID" \
+  --tags Key=AutoStopEligible,Value=true
+
+echo "==> [2/5] Zipping Lambda source ${LAMBDA_SRC_DIR} -> ${ZIP_PATH}"
 ( cd "$LAMBDA_SRC_DIR" && zip -r -q "$ZIP_PATH" . )
 echo "    built ${ZIP_PATH}"
 
-echo "==> [2/4] Creating the Lambda execution role ${LAMBDA_ROLE_NAME}"
+echo "==> [3/5] Creating the Lambda execution role ${LAMBDA_ROLE_NAME}"
 echo "    aws iam create-role --role-name ${LAMBDA_ROLE_NAME} --assume-role-policy-document <lambda trust policy>"
 if ! aws iam create-role \
       --role-name "$LAMBDA_ROLE_NAME" \
@@ -108,7 +143,7 @@ echo "    role arn: ${LAMBDA_ROLE_ARN}"
 echo "    Waiting for IAM role to propagate before creating the function..."
 sleep 10
 
-echo "==> [3/4] Creating (or updating) Lambda function ${FUNCTION_NAME}"
+echo "==> [4/5] Creating (or updating) Lambda function ${FUNCTION_NAME}"
 echo "    env: INSTANCE_ID=${INSTANCE_ID} AWS_TARGET_REGION=${AWS_REGION} MAX_LIFETIME_HOURS=${MAX_LIFETIME_HOURS}"
 echo "    aws lambda create-function --region ${AWS_REGION} --function-name ${FUNCTION_NAME} ..."
 if ! aws lambda create-function \
@@ -148,7 +183,7 @@ rm -f /tmp/lam_err.$$
 FUNCTION_ARN="$(aws lambda get-function --region "$AWS_REGION" --function-name "$FUNCTION_NAME" --query 'Configuration.FunctionArn' --output text)"
 echo "    function arn: ${FUNCTION_ARN}"
 
-echo "==> [4/4] Creating the invocation schedule (${SCHEDULE_EXPRESSION})"
+echo "==> [5/5] Creating the invocation schedule (${SCHEDULE_EXPRESSION})"
 if aws scheduler create-schedule --help >/dev/null 2>&1; then
   echo "    Using EventBridge Scheduler."
   echo "    aws scheduler create-schedule --region ${AWS_REGION} --name ${SCHEDULE_NAME} ..."
@@ -181,13 +216,20 @@ if aws scheduler create-schedule --help >/dev/null 2>&1; then
       --schedule-expression "$SCHEDULE_EXPRESSION_EB" \
       --query 'RuleArn' --output text)"
     echo "    aws lambda add-permission (allow events.amazonaws.com to invoke ${FUNCTION_NAME})"
-    aws lambda add-permission \
-      --region "$AWS_REGION" \
-      --function-name "$FUNCTION_NAME" \
-      --statement-id "topaz-max-lifetime-eventbridge" \
-      --action "lambda:InvokeFunction" \
-      --principal "events.amazonaws.com" \
-      --source-arn "$RULE_ARN" 2>/dev/null || echo "    NOTE: permission may already exist; continuing."
+    if ! aws lambda add-permission \
+          --region "$AWS_REGION" \
+          --function-name "$FUNCTION_NAME" \
+          --statement-id "topaz-max-lifetime-eventbridge" \
+          --action "lambda:InvokeFunction" \
+          --principal "events.amazonaws.com" \
+          --source-arn "$RULE_ARN" 2>/tmp/lam_err.$$; then
+      if grep -q "ResourceConflictException" /tmp/lam_err.$$; then
+        echo "    NOTE: permission already exists; continuing."
+      else
+        cat /tmp/lam_err.$$ >&2; rm -f /tmp/lam_err.$$; exit 1
+      fi
+    fi
+    rm -f /tmp/lam_err.$$
     echo "    aws events put-targets --region ${AWS_REGION} --rule ${SCHEDULE_NAME} --targets Id=1,Arn=${FUNCTION_ARN}"
     aws events put-targets \
       --region "$AWS_REGION" \
@@ -203,13 +245,20 @@ else
     --schedule-expression "$SCHEDULE_EXPRESSION" \
     --query 'RuleArn' --output text)"
   echo "    aws lambda add-permission (allow events.amazonaws.com to invoke ${FUNCTION_NAME})"
-  aws lambda add-permission \
-    --region "$AWS_REGION" \
-    --function-name "$FUNCTION_NAME" \
-    --statement-id "topaz-max-lifetime-eventbridge" \
-    --action "lambda:InvokeFunction" \
-    --principal "events.amazonaws.com" \
-    --source-arn "$RULE_ARN" 2>/dev/null || echo "    NOTE: permission may already exist; continuing."
+  if ! aws lambda add-permission \
+        --region "$AWS_REGION" \
+        --function-name "$FUNCTION_NAME" \
+        --statement-id "topaz-max-lifetime-eventbridge" \
+        --action "lambda:InvokeFunction" \
+        --principal "events.amazonaws.com" \
+        --source-arn "$RULE_ARN" 2>/tmp/lam_err.$$; then
+    if grep -q "ResourceConflictException" /tmp/lam_err.$$; then
+      echo "    NOTE: permission already exists; continuing."
+    else
+      cat /tmp/lam_err.$$ >&2; rm -f /tmp/lam_err.$$; exit 1
+    fi
+  fi
+  rm -f /tmp/lam_err.$$
   echo "    aws events put-targets --region ${AWS_REGION} --rule ${SCHEDULE_NAME} --targets Id=1,Arn=${FUNCTION_ARN}"
   aws events put-targets \
     --region "$AWS_REGION" \

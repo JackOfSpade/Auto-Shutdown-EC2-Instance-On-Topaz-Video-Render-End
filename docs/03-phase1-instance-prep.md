@@ -39,7 +39,13 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> \
 role `topaz-render-instance-role` + instance profile
 `topaz-render-instance-profile`, attaches an inline policy, and associates the
 profile with the instance. It is idempotent - re-runs reuse existing entities
-rather than failing.
+rather than failing. If the instance already has *some* IAM instance profile
+associated, the script does not just assume that is fine: it looks the
+association up by name and confirms it is actually
+`topaz-render-instance-profile` before declaring success, printing the exact
+`replace-iam-instance-profile-association` command (and failing loudly) if the
+instance is wearing a different - stale, wrong-account, or hand-attached -
+profile instead.
 
 **Normal grant (all the box needs):** `cloudwatch:PutMetricData` only, from
 [`iam/cloudwatch-putmetric-policy.json`](../control-plane/iam/cloudwatch-putmetric-policy.json).
@@ -58,9 +64,12 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> INCLUDE_EC2_STOP=1 \
 `INCLUDE_EC2_STOP=1` additionally attaches
 [`iam/ec2-stop-optional-policy.json`](../control-plane/iam/ec2-stop-optional-policy.json),
 an `ec2:StopInstances` grant **tag-scoped** to instances tagged
-`AutoStopEligible=true`. This is belt-and-suspenders for operators who want an
-API stop path; the normal guest-shutdown stop does not use it. Leave it off
-unless you specifically want it.
+`AutoStopEligible=true`, and **also tags the instance `AutoStopEligible=true`**
+itself as part of the same run - without that tag the grant it just attached
+would be unusable (every API stop call would fail `UnauthorizedOperation`). This
+is belt-and-suspenders for operators who want an API stop path; the normal
+guest-shutdown stop does not use it. Leave it off unless you specifically want
+it.
 
 > **The primary path deliberately does not need this permission.** Granting
 > `ec2:StopInstances` is a *choice*, not a requirement. Keeping it off means the

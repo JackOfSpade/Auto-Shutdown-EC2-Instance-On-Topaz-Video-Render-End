@@ -26,6 +26,16 @@ jobs:
       - name: Run auto-merge decision tests
         run: bash tests/test_auto_merge_logic.sh
 
+      - name: Run actionlint
+        # The shellcheck step above only globs standalone *.sh files — it never sees the bash embedded
+        # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
+        # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
+        # so this is the only gate that covers that bash. Pinned to a specific tag (not `:latest`) so a
+        # new actionlint release can't silently turn this job red on an unrelated change.
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
   powershell:
     name: PowerShell analyze + test
     runs-on: ubuntu-latest
@@ -42,23 +52,38 @@ jobs:
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
           Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser -SkipPublisherCheck
 
-      - name: Run PSScriptAnalyzer (fail only on Error severity)
+      - name: Run PSScriptAnalyzer (Error/ParseError + non-allowlisted Warnings fail the build)
         run: |
-          # Warnings are expected and allowed: the in-guest scripts intentionally
-          # use Windows-only cmdlets (Get-CimInstance, Get-ScheduledTask, etc.)
-          # that PSScriptAnalyzer flags as non-portable when analyzed from a
-          # non-Windows host. Only Error/ParseError severities fail the build.
+          # This gate must catch real correctness/best-practice issues, not just parse errors, so
+          # Warning severity fails the build too UNLESS the rule is explicitly allowlisted below.
+          # Only add a rule here when the in-guest tree triggers it because of a DELIBERATE design
+          # choice (verified against the current tree, not assumed) — never to silence a real finding.
+          # Never allowlist a security-class rule (credential/secret handling, injection, etc.).
+          $allowedWarningRules = @(
+              # Config.ps1's best-effort IMDS helpers (Get-Ec2ImdsToken / Get-Ec2Identity) intentionally
+              # swallow errors: IMDS being unreachable is an expected, handled case (the caller gets
+              # $null), documented in Get-Ec2Identity's own .DESCRIPTION - not a masked bug.
+              'PSAvoidUsingEmptyCatchBlock',
+              # Watchdog.ps1 helper names intentionally describe what they return rather than following
+              # the strict singular-noun convention: Get-TopazPids/-TopazWorkers return arrays, and
+              # Get-OutputBytes returns a byte total - "Pid"/"Worker"/"Byte" would misdescribe the value.
+              'PSUseSingularNouns'
+          )
+
           $results = Invoke-ScriptAnalyzer -Path in-guest -Recurse
           $results | Format-Table -AutoSize
 
-          $blocking = @($results | Where-Object { $_.Severity -in @('Error', 'ParseError') })
+          $blocking = @($results | Where-Object {
+              $_.Severity -in @('Error', 'ParseError') -or
+              ($_.Severity -eq 'Warning' -and $allowedWarningRules -notcontains $_.RuleName)
+          })
           if ($blocking.Count -gt 0) {
-              Write-Host "::error::PSScriptAnalyzer found $($blocking.Count) Error-severity issue(s)."
+              Write-Host "::error::PSScriptAnalyzer found $($blocking.Count) blocking issue(s): Error/ParseError severity, or a Warning whose rule is not on the explicit allowlist."
               $blocking | Format-Table -AutoSize
               exit 1
           }
 
-          Write-Host "PSScriptAnalyzer: no Error-severity issues (warnings are allowed)."
+          Write-Host "PSScriptAnalyzer: no Error/ParseError issues, and every Warning found is on the explicit allowlist."
 
       - name: Run Pester tests
         run: |

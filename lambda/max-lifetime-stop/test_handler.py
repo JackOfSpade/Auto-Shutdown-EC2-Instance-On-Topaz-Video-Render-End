@@ -284,6 +284,29 @@ def test_instance_not_found_client_error_is_noop(monkeypatch):
     assert result["reason"] == "instance-not-found"
 
 
+def test_describe_instances_other_client_error_propagates(monkeypatch):
+    """Only InvalidInstanceID.NotFound/.Malformed are treated as "not found
+    -> noop" by _describe_instance. Any other describe_instances failure
+    (e.g. a permissions problem) must propagate out of handler() so the
+    invocation is recorded as failed, not silently swallowed as a noop."""
+    monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
+
+    client, stubber = _make_client()
+    stubber.add_client_error(
+        "describe_instances",
+        service_error_code="UnauthorizedOperation",
+        service_message="You are not authorized to perform this operation.",
+        http_status_code=403,
+    )
+    stubber.activate()
+    _patch_client(monkeypatch, client)
+
+    with pytest.raises(ClientError):
+        lambda_handler({}, None)
+
+    stubber.assert_no_pending_responses()
+
+
 def test_describe_returns_empty_reservations_is_noop(monkeypatch):
     monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
 
@@ -391,6 +414,65 @@ def test_empty_max_lifetime_hours_falls_back_to_default(monkeypatch):
     stubber.assert_no_pending_responses()
     assert result["action"] == "stopped"
     assert result["max_lifetime_hours"] == 12.0
+
+
+@pytest.mark.parametrize("raw_value", ["nan", "inf", "-inf"])
+def test_non_finite_max_lifetime_hours_falls_back_to_default(monkeypatch, raw_value):
+    """float("nan") and float("inf") both parse without raising, but must
+    never reach the ceiling comparison: `age_hours < nan` is always False
+    (the handler would fall through to stop_instances on *every*
+    invocation, regardless of age) and `age_hours < inf` is always True
+    (the cap would be silently disabled forever). "-inf" is included for
+    completeness/regression coverage even though it is already caught by
+    the pre-existing "not positive" fallback.
+
+    Mirrors test_invalid_max_lifetime_hours_falls_back_to_default's
+    two-phase over/under check so a leak in *either* direction is caught:
+    an un-rejected "nan" would wrongly stop in the under-ceiling phase,
+    and an un-rejected "inf" would wrongly no-op in the over-ceiling
+    phase.
+    """
+    monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
+    monkeypatch.setenv("MAX_LIFETIME_HOURS", raw_value)
+
+    # 13h old: past the default 12h ceiling -> stops.
+    client, stubber = _make_client()
+    launch_time_over = datetime.now(timezone.utc) - timedelta(hours=13)
+    stubber.add_response(
+        "describe_instances",
+        _describe_response(INSTANCE_ID, "running", launch_time_over),
+        {"InstanceIds": [INSTANCE_ID]},
+    )
+    stubber.add_response(
+        "stop_instances", _stop_response(INSTANCE_ID), {"InstanceIds": [INSTANCE_ID]}
+    )
+    stubber.activate()
+    _patch_client(monkeypatch, client)
+
+    result_over = lambda_handler({}, None)
+
+    stubber.assert_no_pending_responses()
+    stubber.deactivate()
+    assert result_over["action"] == "stopped"
+    assert result_over["max_lifetime_hours"] == 12.0
+
+    # 11h old: under the default 12h ceiling -> noop.
+    client2, stubber2 = _make_client()
+    launch_time_under = datetime.now(timezone.utc) - timedelta(hours=11)
+    stubber2.add_response(
+        "describe_instances",
+        _describe_response(INSTANCE_ID, "running", launch_time_under),
+        {"InstanceIds": [INSTANCE_ID]},
+    )
+    stubber2.activate()
+    _patch_client(monkeypatch, client2)
+
+    result_under = lambda_handler({}, None)
+
+    stubber2.assert_no_pending_responses()
+    assert result_under["action"] == "noop"
+    assert result_under["reason"] == "under-ceiling"
+    assert result_under["max_lifetime_hours"] == 12.0
 
 
 # ---------------------------------------------------------------------------

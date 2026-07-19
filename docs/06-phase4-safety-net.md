@@ -11,22 +11,31 @@ guarding.
 ## The GPU-idle CloudWatch alarm
 
 ```bash
-INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> \
+INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> [IDLE_MINUTES=30] \
   ./control-plane/03-create-idle-alarm.sh
 ```
 
-[`03-create-idle-alarm.sh`](../control-plane/03-create-idle-alarm.sh) creates the
-alarm `topaz-gpu-idle-autostop`:
+[`03-create-idle-alarm.sh`](../control-plane/03-create-idle-alarm.sh) creates a
+**per-instance** alarm named `topaz-gpu-idle-autostop-<instance-id>`:
 
 | Setting | Value | Why |
 |---------|-------|-----|
 | Namespace / metric | `TopazRender/GPU` / `GPUUtilization` | The custom GPU metric the box publishes. |
 | Dimension | `InstanceId=<this instance>` | Scopes the alarm to one box. |
 | Statistic / period | `Average` / `60 s` | One data point per published minute. |
-| Evaluation periods | `30` | 30 x 60 s = **30 minutes** sustained. |
+| Evaluation periods | `IDLE_MINUTES` (default `30`) | `IDLE_MINUTES` x 60 s = **`IDLE_MINUTES` minutes** sustained. |
 | Threshold / operator | `< 5%` | Sub-5% GPU = idle. |
 | `treat-missing-data` | `notBreaching` | Missing data is ambiguous; do **not** stop on it. |
 | Action | `arn:aws:automate:<region>:ec2:stop` | Built-in EC2 stop action; needs no IAM role. |
+
+### Why per-instance, not a shared alarm name
+
+`put-metric-alarm` **overwrites** any existing alarm with the same
+`--alarm-name`. An earlier shared name (`topaz-gpu-idle-autostop`) meant
+provisioning a **second** instance silently repointed - and thereby disabled -
+the first box's safety net. Keying the name on `INSTANCE_ID` gives every
+instance its own alarm; upgrading an older deployment should delete the
+orphaned shared-name alarm (the script prints the exact command).
 
 ### Why GPU, not CPU
 
@@ -36,12 +45,17 @@ render can peg the GPU while the CPU sits near idle, so a CPU-based alarm would
 the box publishes a custom GPU metric is so the safety net can observe the actual
 work. (This is a corrected assumption - see [Appendix A](08-appendix-a-corrections.md).)
 
-### Why 30 minutes, and why `notBreaching`
+### Why 30 minutes by default, and why `notBreaching`
 
-- **30 minutes of sustained sub-5% GPU** is deliberately long and conservative.
-  Topaz GPU work spikes well above 5% while encoding, so a real render can never
-  accumulate 30 continuous idle minutes. The window only elapses when the box is
-  genuinely doing nothing.
+- **`IDLE_MINUTES` minutes of sustained sub-5% GPU** (default **30**) is
+  deliberately long and conservative. Topaz GPU work spikes well above 5% while
+  encoding, so a real render can never accumulate that many continuous idle
+  minutes. The window only elapses when the box is genuinely doing nothing.
+  `IDLE_MINUTES` must be a positive integer with no leading zeros; raise it if a
+  slow pre-render setup (uploading source files, configuring the export) or a
+  large post-render S3 sync routinely leaves the GPU idle longer than the
+  default before/after the render itself - see "Safety-net operational windows"
+  below.
 - **`treat-missing-data notBreaching`** means that if the metric stops arriving
   entirely (e.g. the publisher died), the alarm does **not** interpret absence as
   "idle" and stop the box on missing data alone. Missing data is ambiguous, so the
@@ -50,8 +64,23 @@ work. (This is a corrected assumption - see [Appendix A](08-appendix-a-correctio
 Verify the alarm:
 
 ```bash
-aws cloudwatch describe-alarms --region <region> --alarm-names topaz-gpu-idle-autostop
+aws cloudwatch describe-alarms --region <region> --alarm-names topaz-gpu-idle-autostop-<instance-id>
 ```
+
+### Pausing the alarm during a long pre-render setup
+
+The script also prints the exact commands to pause and resume the alarm's stop
+action, for the case where you need the GPU to sit idle longer than
+`IDLE_MINUTES` without triggering a stop (e.g. uploading large source files
+before clicking Export):
+
+```bash
+aws cloudwatch disable-alarm-actions --region <region> --alarm-names topaz-gpu-idle-autostop-<instance-id>
+aws cloudwatch enable-alarm-actions  --region <region> --alarm-names topaz-gpu-idle-autostop-<instance-id>
+```
+
+Disable before the idle stretch, then re-enable right after clicking Export so
+the safety net is back in place for the actual render.
 
 ## The Windows GPU metric publisher
 
@@ -107,36 +136,92 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> MAX_LIFETIME_HOURS=12 \
 ```
 
 [`04-deploy-max-lifetime-lambda.sh`](../control-plane/04-deploy-max-lifetime-lambda.sh)
-zips [`lambda/max-lifetime-stop`](../lambda/max-lifetime-stop/), creates the
-execution role `topaz-max-lifetime-lambda-role` (from
-[`iam/lambda-execution-policy.json`](../control-plane/iam/lambda-execution-policy.json)),
-creates the `topaz-max-lifetime-stop` function (`python3.12`, handler
-`handler.handler`), and schedules it with **EventBridge Scheduler** at
-`rate(30 minutes)` - falling back to a classic CloudWatch Events rule when
-EventBridge Scheduler is not usable (e.g. no `SCHEDULER_ROLE_ARN` supplied).
+performs, in order:
+
+1. **Tags the instance `AutoStopEligible=true`.** The Lambda's `ec2:StopInstances`
+   grant (below) is tag-scoped to that tag. Nothing else in this stage applies
+   it, so without this step the Lambda's stop call would fail
+   `UnauthorizedOperation` on every fire - a silently dead safety net. This is
+   step 1, before anything else is created.
+2. Zips [`lambda/max-lifetime-stop`](../lambda/max-lifetime-stop/) and creates the
+   execution role `topaz-max-lifetime-lambda-role` (shared across every
+   instance - the policy is tag-scoped and byte-for-byte identical regardless of
+   which instance it guards) from
+   [`iam/lambda-execution-policy.json`](../control-plane/iam/lambda-execution-policy.json).
+3. Creates a **per-instance** function `topaz-max-lifetime-stop-<instance-id>`
+   (`python3.12`, handler `handler.handler`).
+4. Schedules it under a **per-instance** name
+   `topaz-max-lifetime-schedule-<instance-id>` with **EventBridge Scheduler** at
+   `rate(30 minutes)` - falling back to a classic CloudWatch Events rule when
+   EventBridge Scheduler is not usable (e.g. no `SCHEDULER_ROLE_ARN` supplied).
+
+Per-instance function/schedule names exist for the same reason as the idle
+alarm's per-instance name above: a shared name would let a second instance's
+deploy silently clobber (re-target) the first instance's function and schedule.
+
+`MAX_LIFETIME_HOURS` (default **12**) must be a positive number (e.g. `12` or
+`4.5`); the deploy script validates this itself and rejects a bad value at
+deploy time, rather than deploying "successfully" while the Lambda silently
+falls back to its own default and the deploy output lies about the effective
+ceiling.
 
 What the [handler](../lambda/max-lifetime-stop/handler.py) does on each fire:
 
 - Reads the target instance's `LaunchTime` and state via `ec2:DescribeInstances`.
-- If the instance is **`running`** and its age `>= MAX_LIFETIME_HOURS` (default
-  **12**), calls `ec2:StopInstances`. Otherwise it is a no-op.
+- If the instance is **`running`** and its age `>= MAX_LIFETIME_HOURS`, calls
+  `ec2:StopInstances`. Otherwise it is a no-op.
 - **Stop only, never terminate.** Idempotent: already-stopping/stopped is a no-op.
   Timezone-aware UTC math. Graceful if the instance id can't be found.
+- **`MAX_LIFETIME_HOURS` validation is defense-in-depth, not just deploy-time.**
+  The handler independently re-validates the env var on every invocation and
+  falls back to the 12h default on anything non-numeric, non-positive, **or
+  non-finite** (`nan`/`inf`). The non-finite check matters specifically:
+  `age_hours < nan` is always `False` (which would invert the cap into
+  stop-immediately on every fire) and `age_hours < inf` is always `True` (which
+  would silently disable the cap forever) - both parse fine as a `float` but
+  would otherwise defeat the ceiling check silently.
 
 The `ec2:StopInstances` grant in the Lambda's execution policy is **tag-scoped to
 `AutoStopEligible=true`**, so the target instance must carry that tag for the stop
-to succeed. See [`lambda/max-lifetime-stop/README.md`](../lambda/max-lifetime-stop/README.md)
+to succeed - which is exactly why tagging is step 1 above. See
+[`lambda/max-lifetime-stop/README.md`](../lambda/max-lifetime-stop/README.md)
 for the full environment-variable contract and a local smoke test.
 
 This whole stage is **optional**. If you do not want a hard wall-clock ceiling,
 skip it - delete the function and schedule to remove it later.
+
+## Safety-net operational windows
+
+Both out-of-band safety nets watch **wall-clock/GPU state**, not "is a render
+actually supposed to be happening" - so two ordinary operational windows can
+trip the idle alarm if you are not deliberate about them:
+
+- **Pre-render setup.** The idle alarm has no concept of "the operator is still
+  setting up." If uploading source files or configuring the export keeps the GPU
+  idle longer than `IDLE_MINUTES` **before** Export is clicked, the alarm will
+  stop the box out from under you mid-setup. Pause it first with the
+  `disable-alarm-actions` command above, and re-enable it right after clicking
+  Export.
+- **Post-render S3 sync.** If `S3SyncTarget` is configured
+  ([Phase 3](05-phase3-stop-sequence.md)), the GPU has already been idle since
+  the debounce window started - well before `Stop-Sequence.ps1` even begins the
+  sync. A large sync of big output files can push the *cumulative* idle time
+  (debounce + unlock wait + sync) past `IDLE_MINUTES`, and the idle alarm does
+  not know a sync is in flight: its `ec2:stop` action would abruptly stop the
+  instance mid-sync, ahead of `Stop-Sequence.ps1`'s own graceful
+  `Stop-Computer -Force`. Size `IDLE_MINUTES` generously (covering debounce +
+  unlock wait + your largest expected sync) whenever `S3SyncTarget` is set.
 
 ## The three layers together
 
 | Layer | Fires when | Plane | Shares fate with guest? |
 |-------|-----------|-------|------------------------|
 | Watchdog (primary) | Queue drained / stalled + files unlocked | In-guest | n/a (it *is* the guest) |
-| GPU-idle alarm | 30 min sustained sub-5% GPU | Control plane | No |
+| GPU-idle alarm | `IDLE_MINUTES` min sustained sub-5% GPU (default 30) | Control plane | No |
 | Max-lifetime Lambda (optional) | Instance age >= ceiling, any GPU load | Control plane | No |
+
+**None of these three layers is gated by `Config.ps1`'s `DryRun` switch** - only
+the in-guest watchdog/stop-sequence path is. See the `DryRun` caveat in
+[Phase 3](05-phase3-stop-sequence.md).
 
 Continue to [Phase 5 - notifications](07-phase5-notifications.md).

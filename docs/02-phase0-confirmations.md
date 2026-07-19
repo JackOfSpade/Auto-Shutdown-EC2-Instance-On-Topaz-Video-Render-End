@@ -47,8 +47,8 @@ one-to-one to the `OPERATOR SETTINGS` block in
 | Observe | Why | Config key | Default |
 |---------|-----|-----------|---------|
 | The **Topaz GUI process name** | The watchdog matches it with a CIM `LIKE` pattern; the `ffmpeg` workers are found as *children* of this process. | `TopazNameLike` | `'Topaz Video%'` (matches both `Topaz Video.exe` and `Topaz Video AI.exe`) |
-| The **output directory** Topaz writes finished exports into | "No growth here while a worker is alive" is the stall signal; the file-unlock gate scans this folder. | `OutputDir` | `'D:\Exports'` |
-| The **scratch / temp file naming** Topaz leaves behind | Files whose name contains this marker are excluded from the unlock check, so leftover scratch files never block the stop. | `TempMarker` | `'_temp'` |
+| The **output directory** Topaz writes finished exports into | "No byte-count change here while a render is active" is the stall signal; the file-unlock gate scans this folder. | `OutputDir` | `'D:\Exports'` |
+| The **scratch / temp file naming** Topaz leaves behind | Files whose name matches this marker (anchored to a following separator or the end of the name - not a bare substring) are excluded from the unlock check, so leftover scratch files never block the stop. | `TempMarker` | `'_temp'` |
 
 Concretely, while an export runs, check:
 

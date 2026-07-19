@@ -25,9 +25,18 @@ task runs picks up the new value.
 From [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1), after the optional S3
 sync and before the power-off:
 
-- **Subject:** `Topaz render <completed|stalled> - stopping <instance-id>`
-- **Message:** a one-line summary with the reason, the instance id, and a
-  timestamp, noting that the guest is powering off (which stops the instance).
+- **Subject / message when actually stopping:**
+  `Topaz render <completed|stalled> - stopping <instance-id>`, with a one-line
+  summary of the reason, the instance id, and a timestamp, noting that the guest
+  is powering off (which stops the instance).
+- **Subject / message under `DryRun`:**
+  `Topaz render <completed|stalled> - DRY RUN (no stop) - <instance-id>`, stating
+  explicitly that `DryRun` is enabled and the power-off was **suppressed** - the
+  instance is still running. The wording is deliberately different so a `DryRun`
+  test run can never be mistaken for a real stop notification. See the `DryRun`
+  caveat in [Phase 3](05-phase3-stop-sequence.md): this SNS gating is purely a
+  courtesy of the in-guest path and has no bearing on the out-of-band safety
+  nets in [Phase 4](06-phase4-safety-net.md), which are never suppressed.
 
 The instance id is the best-effort IMDSv2 value from
 [Phase 3](05-phase3-stop-sequence.md) (a placeholder if IMDS was unreachable).
@@ -35,8 +44,12 @@ The instance id is the best-effort IMDSv2 value from
 It publishes with:
 
 ```
-aws sns publish --topic-arn <SnsTopicArn> --subject <...> --message <...>
+aws sns publish --topic-arn <SnsTopicArn> --subject <...> --message <...> --region <discovered-region>
 ```
+
+The `--region` flag is required, not cosmetic - see the IMDSv2 discovery note in
+[Phase 3](05-phase3-stop-sequence.md); without it the SYSTEM account's `aws`
+invocation has no default region and the publish call fails client-side.
 
 ## Best-effort: it never blocks the stop
 

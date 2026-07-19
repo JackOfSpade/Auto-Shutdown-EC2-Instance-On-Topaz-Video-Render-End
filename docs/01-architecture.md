@@ -104,16 +104,25 @@ observable state:
 
 - **Child-`ffmpeg` lifecycle.** Topaz spawns `ffmpeg.exe` children to encode a
   queued job. The watchdog matches `ffmpeg` processes whose `ParentProcessId`
-  is a live Topaz GUI PID. "Queue complete" = GUI still up, but **no** such
-  child for `DebounceSec` (the debounce absorbs transient live-preview
-  children).
-- **Stall detection.** If an `ffmpeg` child is alive but the output folder has
-  not grown for `StallSec`, the job is treated as stalled and the box stops
-  anyway.
+  is a live Topaz GUI PID - and keeps counting a worker whose GUI parent
+  crashed or was closed until the worker itself exits, so a dead GUI is never
+  misread as "queue complete" mid-encode. "Queue complete" = no active render
+  for `DebounceSec` (the debounce absorbs transient live-preview children and
+  ordinary inter-clip lulls).
+- **Stall detection.** If a render is active but the output folder's byte total
+  has not *changed* (grown or shrunk) for `StallSec`, the job is treated as
+  stalled and the box stops anyway.
 - **File-unlock gate.** Before handing off to the stop step, the watchdog waits
-  (up to `UnlockTimeoutMin`) for every non-`_temp` output file to be openable
-  with no sharing - i.e. nothing still holds a write handle. Only then does it
-  power off, so a stop can never truncate a file mid-write.
+  (up to `UnlockTimeoutMin`) for every output file - other than a `_temp`
+  scratch file, anchored so a real deliverable merely containing that text is
+  never skipped - to be openable with no sharing, i.e. nothing still holds a
+  write handle. Only then does it power off, so a stop can never truncate a
+  file mid-write.
+- **Unreadable signals freeze, they never guess.** Both the worker-presence and
+  GPU signals can come back "unknown this poll" (e.g. a transient CIM query
+  failure); when that happens the watchdog freezes its idle/stall bookkeeping
+  for that poll rather than risk misreading an outage as "no worker" (a false
+  complete) or "stalled" (a false stall).
 
 See [Phase 2](04-phase2-watchdog.md) for the full state machine.
 
@@ -134,8 +143,8 @@ automated.
 | Detect render complete / stalled | `Watchdog.ps1` (SYSTEM task) | In-guest |
 | Perform the stop | `Stop-Sequence.ps1` -> `Stop-Computer -Force` | In-guest |
 | Publish GPU utilization | `Push-GpuMetric.ps1` (SYSTEM task) | In-guest |
-| Idle safety net | `topaz-gpu-idle-autostop` alarm | Control plane |
-| Wall-clock cap | `topaz-max-lifetime-stop` Lambda | Control plane (optional) |
+| Idle safety net | `topaz-gpu-idle-autostop-<instance-id>` alarm (per-instance) | Control plane |
+| Wall-clock cap | `topaz-max-lifetime-stop-<instance-id>` Lambda (per-instance) | Control plane (optional) |
 | Least-privilege identity | `topaz-render-instance-role` | Control plane |
 
 Continue to [Phase 0 - confirmations](02-phase0-confirmations.md).

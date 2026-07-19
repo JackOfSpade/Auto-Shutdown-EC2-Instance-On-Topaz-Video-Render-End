@@ -63,8 +63,8 @@ so a render can stall the moment the operator disconnects. The display protocol 
 **Wrong.** "GUI up, no worker" is **also the normal pre-render state** (opening a
 project, adding clips, configuring the export). Treating it as "complete" would
 stop the instance **before the first render even begins**. The watchdog uses a
-`sawWorker` guard: it only arms the completion path **after** it has observed at
-least one real `ffmpeg` encode worker. See
+`$sawActivity` guard: it only arms the completion path **after** it has observed at
+least one active render (worker and/or GPU, per `CompletionSignal`). See
 [`Watchdog.ps1`](../in-guest/Watchdog.ps1) and [Phase 2](04-phase2-watchdog.md).
 
 ## 8. "Drive / detect Topaz via its command-line interface."

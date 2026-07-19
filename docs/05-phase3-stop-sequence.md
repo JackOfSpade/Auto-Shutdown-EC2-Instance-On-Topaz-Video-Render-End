@@ -21,26 +21,37 @@ central design property of the whole pipeline (see [Architecture](01-architectur
 ## Order of operations
 
 ```
-1. (best-effort) IMDSv2 lookup of this instance's id   -- only to prettify notifications
-2. (optional)    aws s3 sync OutputDir -> S3SyncTarget -- BEFORE power off
-3. (optional)    aws sns publish "render complete/stalled"
-4. DryRun?  -> log the decision and RETURN (no power off)
+1. (best-effort) IMDSv2 lookup of this instance's id + region -- id prettifies
+                 notifications; region is REQUIRED by steps 2-3 below
+2. (optional)    aws s3 sync OutputDir -> S3SyncTarget --region <region> -- BEFORE power off
+3. (optional)    aws sns publish "render complete/stalled" --region <region>
+4. DryRun?  -> log the decision and RETURN (no power off; Watchdog.ps1 re-arms)
 5. else     -> Stop-Computer -Force   (guest shutdown => instance STOP)
 ```
 
-### 1. Best-effort instance-id (IMDSv2)
+### 1. Best-effort instance id + region (IMDSv2)
 
-The script fetches the instance id via IMDSv2 (token-based metadata) purely to
-make notifications readable. If IMDS is unreachable it falls back to a placeholder
-id and continues - this lookup never blocks the stop.
+The script fetches the instance id **and region** via IMDSv2 (one token, two
+metadata calls, via the shared `Get-Ec2Identity` helper in
+[`Config.ps1`](../in-guest/Config.ps1)). The instance id is only to make
+notifications readable and falls back to a placeholder if IMDS is unreachable.
+The region is not cosmetic: the S3 sync and SNS publish calls below both pass it
+explicitly as `--region`, because the **SYSTEM account has no default region
+configured anywhere in this pipeline** - without an explicit `--region`, both
+`aws s3 sync` and `aws sns publish` fail client-side with `NoRegionError` every
+single time, silently, since it only surfaces as a WARN in a log nobody reads
+until after the box is off. This lookup never blocks the stop; if region
+discovery fails, the script logs a warning and still attempts both calls
+without `--region` (so they may fail, but the stop itself is unaffected).
 
 ### 2. Optional S3 sync (runs BEFORE power off)
 
 If `S3SyncTarget` is set in [`Config.ps1`](../in-guest/Config.ps1) (e.g.
 `s3://my-bucket/renders/`), the script runs `aws s3 sync OutputDir S3SyncTarget
---only-show-errors` **before** powering off, so finished artifacts are safe even
-if something later goes wrong. Empty (the default) skips the sync. A non-zero exit
-or thrown error is logged as a warning and **does not** block the stop.
+--only-show-errors --region <discovered-region>` **before** powering off, so
+finished artifacts are safe even if something later goes wrong. Empty (the
+default) skips the sync. A non-zero exit or thrown error is logged as a warning
+and **does not** block the stop.
 
 > S3 sync uses the AWS CLI and therefore the instance role's credentials. The
 > default instance role only grants `cloudwatch:PutMetricData`; if you enable S3
@@ -51,16 +62,34 @@ or thrown error is logged as a warning and **does not** block the stop.
 ### 3. Optional SNS notification
 
 If `SnsTopicArn` is set, the script publishes a best-effort "render
-complete/stalled" message before stopping. This is covered in
-[Phase 5 - notifications](07-phase5-notifications.md). Like the sync, a failure
-here is logged and ignored - it never blocks the power-off.
+complete/stalled" message (also with the discovered `--region`) before stopping.
+This is covered in [Phase 5 - notifications](07-phase5-notifications.md). Like
+the sync, a failure here is logged and ignored - it never blocks the power-off.
+Under `DryRun` the message text itself says the stop was **suppressed** (see
+below) rather than claiming the box is stopping - a real notification would
+otherwise be a false alarm to anyone subscribed to the topic.
 
 ### 4. The DryRun switch
 
 `Config.ps1` ships with `DryRun = $true`. In dry-run mode the stop sequence logs
 exactly what it *would* do (including the reason) and **returns without powering
-off**. This lets you watch several real jobs drive the whole pipeline - detection,
-unlock gate, stop decision - with zero risk of an unwanted stop.
+off**. `Watchdog.ps1` then **re-arms and keeps monitoring** for the next queue
+instead of exiting - previously a `DryRun` stop left nothing watching until a
+reboot re-triggered the scheduled task. This lets you watch several real jobs
+drive the whole pipeline - detection, unlock gate, stop decision - **for the
+in-guest path**.
+
+> **`DryRun` does not cover the out-of-band safety nets.** The CloudWatch
+> GPU-idle alarm and the optional max-lifetime Lambda are control-plane
+> resources, entirely independent of `Config.ps1` - they are **not gated by
+> `DryRun`** and will really call `ec2:StopInstances` on the box, e.g. roughly
+> `IDLE_MINUTES` after the render's GPU goes idle, even while you are validating
+> in `DryRun`. If you leave those safety nets active during `DryRun` testing (as
+> intended - see [Phase 4](06-phase4-safety-net.md)), the box can still stop out
+> from under you while you are watching the in-guest logs prove out "zero risk."
+> Pause the idle alarm's actions (`aws cloudwatch disable-alarm-actions`, see
+> [Phase 4](06-phase4-safety-net.md)) or account for the max-lifetime ceiling if
+> you need a genuinely stop-proof validation window.
 
 Once you have watched a couple of jobs complete cleanly in the logs
 (`C:\topaz-autostop\logs\stop.log`), flip `DryRun = $false` in `Config.ps1`, then

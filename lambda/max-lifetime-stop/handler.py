@@ -29,6 +29,7 @@ Environment variables
 """
 
 import logging
+import math
 import os
 from datetime import datetime, timezone
 
@@ -67,6 +68,17 @@ def _get_max_lifetime_hours() -> float:
         logger.warning(
             "MAX_LIFETIME_HOURS=%r is not a number; using default %.1f",
             raw,
+            DEFAULT_MAX_LIFETIME_HOURS,
+        )
+        return DEFAULT_MAX_LIFETIME_HOURS
+    if not math.isfinite(hours):
+        # float("nan")/float("inf") both parse fine but would break the ceiling
+        # check below: `age_hours < nan` is always False (stops immediately on
+        # every invocation) and `age_hours < inf` is always True (cap silently
+        # disabled). Reject both the same way we reject non-positive values.
+        logger.warning(
+            "MAX_LIFETIME_HOURS=%s is not finite; using default %.1f",
+            hours,
             DEFAULT_MAX_LIFETIME_HOURS,
         )
         return DEFAULT_MAX_LIFETIME_HOURS

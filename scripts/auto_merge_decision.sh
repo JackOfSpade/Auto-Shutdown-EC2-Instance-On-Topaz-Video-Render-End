@@ -12,9 +12,16 @@
 # calls that reads clearly in place.
 
 # ci_conclusion_from_json <json> — given the JSON body of
-# `gh api repos/<repo>/actions/workflows/ci.yml/runs?head_sha=<sha>&per_page=1` (or "" / unparseable
-# JSON, e.g. from a failed API call), print the conclusion of the most recent run:
-#   - "success" / "failure" / "in_progress" / ... — a real run's conclusion.
+# `gh api repos/<repo>/actions/workflows/ci.yml/runs?head_sha=<sha>&per_page=10` (or "" / unparseable
+# JSON, e.g. from a failed API call), print:
+#   - "success" — ANY run in the returned page has conclusion "success". A branch with an open PR gets
+#     TWO "CI" workflow runs per commit (the `push` event and the `pull_request` event), completing
+#     independently and in no guaranteed order — per_page=10 (see the workflow's CI-gate comment) pulls
+#     back both, so a completed successful run is found even when a duplicate run for the same sha is
+#     still in_progress or was cancelled and happens to sort first. This stays fail-closed: "success" is
+#     only ever printed when a real completed run of THIS workflow for THIS sha concluded success.
+#   - otherwise, the conclusion of the MOST RECENT run (today's original behavior, unchanged when no run
+#     succeeded) — "failure" / "in_progress" / ... — a real run's conclusion.
 #   - "none"    — valid JSON but no matching run yet (new commit; CI hasn't started/finished).
 #   - "error"   — the API call failed, or returned empty/unparseable/error-shaped JSON.
 # Requires `jq`. NOTE: jq treats a completely empty stdin as "no output, exit 0" (not an error), so an
@@ -25,9 +32,11 @@ ci_conclusion_from_json() {
   # `gh api` call's stdout looks like on an HTTP error) must parse to "error", NOT "none" — otherwise
   # an API failure would be indistinguishable from a legitimate zero-runs response and could satisfy a
   # gate. The `(.workflow_runs | type) != "array"` guard requires workflow_runs to actually be an array
-  # before treating it as a real (possibly empty) result.
+  # before treating it as a real (possibly empty) result. Among the runs, a "success" ANYWHERE wins
+  # (duplicate-run rationale above); otherwise fall back to the first (most recent) run's own
+  # conclusion // status // "unknown" — unchanged from before per_page was widened.
   if [ -n "$1" ] \
-     && out="$(printf '%s' "$1" | jq -r 'if (.workflow_runs | type) != "array" then "error" else (.workflow_runs[0] as $r | if $r == null then "none" else ($r.conclusion // $r.status // "unknown") end) end' 2>/dev/null)" \
+     && out="$(printf '%s' "$1" | jq -r 'if (.workflow_runs | type) != "array" then "error" elif (.workflow_runs | length) == 0 then "none" elif (.workflow_runs | any(.conclusion == "success")) then "success" else (.workflow_runs[0] as $r | ($r.conclusion // $r.status // "unknown")) end' 2>/dev/null)" \
      && [ -n "$out" ]; then
     printf '%s\n' "$out"
   else
@@ -52,7 +61,10 @@ is_ancestor_of() {
 }
 
 # ci_run_id_from_json <json> — the numeric id of the most recent run (for gh api/gh run rerun
-# targeting), or "" if none/unparseable. Companion to ci_conclusion_from_json.
+# targeting), or "" if none/unparseable. Companion to ci_conclusion_from_json. Deliberately keeps
+# FIRST-run semantics (does not search for a success like ci_conclusion_from_json does): this only
+# feeds the retry path below, which runs when NOTHING succeeded, so there is no successful run to find —
+# the most recent run is exactly the one worth re-running.
 ci_run_id_from_json() {
   local out
   if [ -n "$1" ] \
@@ -64,7 +76,9 @@ ci_run_id_from_json() {
 }
 
 # ci_run_attempt_from_json <json> — the run_attempt of the most recent run (GitHub's own retry
-# counter — 1 for a never-retried run), or "" if none/unparseable/missing.
+# counter — 1 for a never-retried run), or "" if none/unparseable/missing. Same first-run semantics as
+# ci_run_id_from_json, for the same reason: it only matters on the retry path, taken when no run
+# succeeded.
 ci_run_attempt_from_json() {
   local out
   if [ -n "$1" ] \

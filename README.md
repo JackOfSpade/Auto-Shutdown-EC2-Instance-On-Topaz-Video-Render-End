@@ -106,7 +106,13 @@ robot.
 │       ├── handler.py
 │       ├── test_handler.py
 │       └── README.md
-├── .github/workflows/ci.yml      <- shellcheck + PSScriptAnalyzer/Pester + ruff/pytest
+├── scripts/
+│   └── auto_merge_decision.sh    <- sourceable CI-gate predicates for auto-merge-claude.yml
+├── tests/
+│   └── test_auto_merge_logic.sh  <- tests for scripts/auto_merge_decision.sh
+├── .github/workflows/
+│   ├── ci.yml                    <- shellcheck/actionlint + PSScriptAnalyzer/Pester + ruff/pytest
+│   └── auto-merge-claude.yml     <- auto-merges CI-green branches into main
 └── docs/                          <- full documentation set (linked below)
 ```
 
@@ -129,7 +135,8 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    ```
    `01` makes a guest shutdown stop (not terminate) the box. `02` grants only
    `cloudwatch:PutMetricData` (optionally `ec2:StopInstances`, tag-scoped, via
-   `INCLUDE_EC2_STOP=1`). See
+   `INCLUDE_EC2_STOP=1` - which also tags the instance `AutoStopEligible=true` so
+   that tag-scoped grant is actually usable). See
    [docs/03-phase1-instance-prep.md](docs/03-phase1-instance-prep.md).
 
 2. **In-guest - install the scripts, then register the SYSTEM tasks.** Edit the
@@ -144,23 +151,38 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
 
 3. **Control plane - the out-of-band idle alarm.**
    ```bash
-   INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> ./control-plane/03-create-idle-alarm.sh
+   INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> [IDLE_MINUTES=30] \
+     ./control-plane/03-create-idle-alarm.sh
    ```
-   Creates the GPU-idle safety net that fires after 30 min of sustained sub-5%
-   GPU. See [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
+   Creates a **per-instance** GPU-idle safety net alarm
+   (`topaz-gpu-idle-autostop-<instance-id>`) that fires after `IDLE_MINUTES`
+   (default 30) of sustained sub-5% GPU. The script also prints
+   `disable-alarm-actions`/`enable-alarm-actions` commands for pausing it during
+   a long pre-render setup. See
+   [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
 4. **Control plane - optional hard cap (skip if you do not want one).**
    ```bash
    INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> MAX_LIFETIME_HOURS=12 \
      ./control-plane/04-deploy-max-lifetime-lambda.sh
    ```
-   See [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
+   Tags the instance `AutoStopEligible=true` (required for the Lambda's
+   tag-scoped stop permission to actually work), then deploys a **per-instance**
+   function (`topaz-max-lifetime-stop-<instance-id>`) and schedule
+   (`topaz-max-lifetime-schedule-<instance-id>`). See
+   [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
 > **Ship in DryRun first.** `Config.ps1` sets `DryRun = $true` by default: the
-> watchdog and stop sequence log every decision but do **not** power the box off.
-> Watch a couple of real jobs complete cleanly, confirm the logs under
+> watchdog and stop sequence log every decision but do **not** power the box off,
+> and the watchdog re-arms afterward to keep monitoring the next queue. Watch a
+> couple of real jobs complete cleanly, confirm the logs under
 > `C:\topaz-autostop\logs`, then flip `DryRun = $false` and re-run
-> `Install.ps1` + `Register-ScheduledTasks.ps1`.
+> `Install.ps1` + `Register-ScheduledTasks.ps1`. **`DryRun` only covers this
+> in-guest path** - the CloudWatch idle alarm and optional max-lifetime Lambda
+> from step 3-4 below are separate control-plane resources and will really stop
+> the box if the GPU goes idle during your test, even while `DryRun` is on. See
+> [docs/05-phase3-stop-sequence.md](docs/05-phase3-stop-sequence.md) and
+> [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
 ## The start model
 
@@ -192,9 +214,17 @@ deploy it. See [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.
 ## Testing & CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push/PR:
-`shellcheck` on `control-plane/*.sh`, PSScriptAnalyzer + Pester on `in-guest/`
-(including the [`in-guest/tests/`](in-guest/tests/) suite for the
-`Resolve-RenderActive` completion-decision helper), and `ruff` + `pytest` on
+`shellcheck` on `control-plane/*.sh`, `scripts/*.sh`, and `tests/*.sh`;
+`actionlint` (pinned Docker tag) on the workflow YAML, which also lints the
+bash embedded directly in workflow `run:` steps; the
+[`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) suite for
+the auto-merge-to-main decision logic in
+[`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh);
+PSScriptAnalyzer + Pester on `in-guest/` (including the
+[`in-guest/tests/`](in-guest/tests/) suite for the `Resolve-RenderActive`
+completion-decision helper; PSScriptAnalyzer fails the build on any
+Error/ParseError, and on a Warning too unless its rule is explicitly
+allowlisted in `ci.yml`); and `ruff` + `pytest` on
 [`lambda/max-lifetime-stop/`](lambda/max-lifetime-stop/). Run the Lambda tests
 locally with:
 
@@ -202,9 +232,17 @@ locally with:
 pip install -r lambda/max-lifetime-stop/requirements-dev.txt && pytest lambda/ -q
 ```
 
+Run the auto-merge decision tests locally with:
+
+```bash
+bash tests/test_auto_merge_logic.sh
+```
+
 The Pester tests need PowerShell 7+ (`pwsh`), which is what CI runs them under;
 see [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) for how to run them
-locally.
+locally, and for what the auto-merge-to-main workflow
+([`.github/workflows/auto-merge-claude.yml`](.github/workflows/auto-merge-claude.yml))
+does.
 
 ## Documentation
 
@@ -219,4 +257,4 @@ locally.
 | [docs/07-phase5-notifications.md](docs/07-phase5-notifications.md) | Optional SNS notify, `sns:Publish` permission. |
 | [docs/08-appendix-a-corrections.md](docs/08-appendix-a-corrections.md) | Eight bugs / wrong claims removed from the prior report. |
 | [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.md) | Decided design boundaries (single-user GUI-only, one Export click, no robot). |
-| [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) | What CI checks, and how to run the Pester and Lambda pytest suites locally. |
+| [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) | What CI checks (including `actionlint`), the auto-merge-to-main workflow and its test suite, and how to run the Pester and Lambda pytest suites locally. |

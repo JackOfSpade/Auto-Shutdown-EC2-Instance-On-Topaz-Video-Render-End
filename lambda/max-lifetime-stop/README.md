@@ -39,9 +39,15 @@ Every invocation returns a small decision dict, e.g.:
 }
 ```
 
-`action` is one of `stopped` | `noop` | `error`; `reason` explains the decision
+`action` is one of `stopped` | `noop`; `reason` explains the decision
 (`over-ceiling`, `under-ceiling`, `already-not-running`, `not-running`,
 `instance-not-found`, `no-launch-time`).
+
+There is no `action="error"` value: if `ec2:StopInstances` itself fails, the
+handler does not return a decision dict at all -- it deliberately re-raises
+the `ClientError` so the Lambda invocation is recorded as **failed** (and can
+be alarmed on / retried), rather than silently reporting a soft "error"
+result. See the `stop_instances` error handling in `handler.py`.
 
 ## Why it exists (OPTIONAL / complementary)
 

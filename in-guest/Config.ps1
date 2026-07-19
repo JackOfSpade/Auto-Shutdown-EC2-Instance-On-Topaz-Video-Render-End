@@ -49,9 +49,15 @@ function Get-TopazAutoStopConfig {
         # Phase 0. Use a LIKE pattern (e.g. 'ffmpeg%') if the name varies.
         WorkerNameLike   = 'ffmpeg.exe'
 
-        # Fragment found in Topaz scratch/temporary files. Files whose name
-        # contains this marker are ignored by the "outputs unlocked?" check,
-        # because Topaz may leave them behind after a successful export.
+        # Fragment found in Topaz scratch/temporary files. A file is treated
+        # as a scratch file (and ignored by the "outputs unlocked?" check,
+        # because Topaz may leave them behind after a successful export) when
+        # its name matches this marker ANCHORED to a following '.', '_', '-',
+        # or the end of the name -- see Test-TopazTempFile below, e.g.
+        # 'clip_temp.mp4' or 'clip_temp_001.mov' match, but a bare substring
+        # match would also (wrongly) catch a real deliverable like
+        # 'Reel_Template_Final.mp4', which merely CONTAINS "_temp" inside
+        # "_Template", and silently skip it from the unlock check.
         TempMarker       = '_temp'
 
         # ------------------------------------------------------------------
@@ -67,8 +73,13 @@ function Get-TopazAutoStopConfig {
         #                   spawns, at the cost of needing a sensible
         #                   GpuBusyPercent. Recommended if the worker process is
         #                   not reliably a child of the GUI on your version.
-        # Every mode gracefully degrades: if a GPU read fails, GPU stops
-        # contributing and the worker signal decides that poll.
+        # Every mode gracefully degrades: both the worker and GPU signals are
+        # three-valued ($true/$false/$null, $null = "could not be read this
+        # poll"). If a signal is $null, it simply stops contributing per
+        # Resolve-RenderActive's truth table below; if NEITHER signal can be
+        # trusted, the overall result is itself $null (unknown) and the
+        # watchdog freezes its idle/stall bookkeeping for that poll rather
+        # than guessing.
         CompletionSignal = 'WorkerOnly'
 
         # GPU utilization (%) at or above which the GPU counts as "actively
@@ -87,10 +98,11 @@ function Get-TopazAutoStopConfig {
         PollSec          = 15
 
         # With a render no longer active for this long (and one having been
-        # seen), the queue is considered complete. Raise this if Topaz's live
-        # preview spawns transient workers, or if inter-clip model loads create
-        # long lulls (45-90s is typical).
-        DebounceSec      = 60
+        # seen), the queue is considered complete. Inter-clip model-load lulls
+        # typically run 45-90s; 120 clears that with margin so a mid-queue lull
+        # is never misread as "done" (a false "complete" here stops the box
+        # mid-queue), at the cost of only ~1 extra idle minute per session.
+        DebounceSec      = 120
 
         # A render is active but the output folder has not grown for this long
         # => treat as a stall (broken job) and stop anyway.
@@ -173,6 +185,18 @@ function Write-TopazLog {
             New-Item -ItemType Directory -Path $cfg.LogDir -Force | Out-Null
         }
         $logFile = Join-Path $cfg.LogDir ("{0}.log" -f $Component)
+
+        # Simple size-based rotation: once the live log exceeds 5MB, roll it
+        # to a single ".log.1" backup (replacing any previous one) instead of
+        # letting it grow unbounded for the life of the instance.
+        if (Test-Path -LiteralPath $logFile) {
+            $existing = Get-Item -LiteralPath $logFile
+            if ($existing.Length -gt 5MB) {
+                $rotatedFile = Join-Path $cfg.LogDir ("{0}.log.1" -f $Component)
+                Move-Item -LiteralPath $logFile -Destination $rotatedFile -Force
+            }
+        }
+
         Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
     }
     catch {
@@ -262,15 +286,49 @@ function Get-GpuUtilizationMax {
         Topaz typically loads a single GPU, so the first GPU can read ~0% during
         an otherwise-busy render. Returns $null on any failure so callers can
         distinguish "idle" (0) from "unknown" ($null).
+
+        Launched via System.Diagnostics.Process (not the '&' call operator)
+        with an explicit 15s WaitForExit timeout: a wedged/hung GPU driver can
+        make a bare '& nvidia-smi' invocation hang forever. Under the metric
+        scheduled task's MultipleInstances=IgnoreNew policy, one hung instance
+        would silently kill the metric feed for good -- and because the idle
+        CloudWatch alarm is configured treatMissingData=notBreaching, the idle
+        alarm would then never fire either, so the safety net dies silently.
+        A bounded wait plus Kill() on timeout guarantees this call returns.
+
+        Standard output is read via ReadToEndAsync() BEFORE WaitForExit is
+        called: a synchronous ReadToEnd() first would block until the child
+        process closes its output (normally at exit), which is exactly the
+        hang this timeout exists to bound around.
     #>
     [CmdletBinding()]
     param()
 
+    $proc = $null
     try {
-        $raw = & nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>&1
-        if ($LASTEXITCODE -ne 0) { return $null }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = 'nvidia-smi'
+        $psi.Arguments              = '--query-gpu=utilization.gpu --format=csv,noheader,nounits'
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.CreateNoWindow         = $true
 
-        $vals = @($raw |
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        $outputTask = $proc.StandardOutput.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit(15000)) {
+            try { $proc.Kill() } catch { }
+            return $null
+        }
+
+        if ($proc.ExitCode -ne 0) { return $null }
+
+        $raw = $outputTask.Result
+
+        $vals = @(($raw -split "`r?`n") |
             ForEach-Object { "$_".Trim() } |
             Where-Object   { $_ -match '^\d+$' } |
             ForEach-Object { [int]$_ })
@@ -281,6 +339,9 @@ function Get-GpuUtilizationMax {
     catch {
         return $null
     }
+    finally {
+        if ($proc) { $proc.Dispose() }
+    }
 }
 
 function Resolve-RenderActive {
@@ -289,7 +350,10 @@ function Resolve-RenderActive {
         Pure decision: is a render "active" given the raw signals? No I/O, so it
         is fully unit-testable.
     .PARAMETER WorkerActive
-        Whether an encoder worker process is currently present.
+        Whether an encoder worker process is currently present: $true, $false,
+        or $null when the worker signal itself is unknown this poll (e.g. the
+        underlying CIM query failed and no adopted orphan worker is alive to
+        confirm activity either way).
     .PARAMETER GpuUtil
         Highest GPU utilization (%), or $null if it could not be read (unknown).
     .PARAMETER Signal
@@ -297,17 +361,34 @@ function Resolve-RenderActive {
     .PARAMETER GpuBusyPercent
         GPU % at or above which the GPU counts as actively rendering.
     .DESCRIPTION
-        Degrades gracefully: when the GPU value is $null (read failed) the GPU
-        stops contributing and the worker signal decides - so a transient
-        nvidia-smi failure can never be misread as "idle".
+        Both signals are three-valued and degrade gracefully: whichever signal
+        is $null (unreadable) simply stops contributing, and the OTHER signal
+        decides. The overall result can itself be $true, $false, or $null (only
+        when the applicable signal(s) are all unreadable) -- callers must treat
+        a $null RESULT as "unknown this poll" and freeze state rather than
+        infer idle or active.
+
+        Truth table:
+          WorkerOnly  - worker $null -> $null; otherwise the worker value.
+          GpuOnly     - GPU read OK -> gpuActive; GPU $null -> the worker value
+                        ($true/$false/$null passthrough).
+          WorkerOrGpu - worker $true OR gpuActive -> $true;
+                        worker $false + GPU read OK -> gpuActive result;
+                        worker $false + GPU $null   -> $false;
+                        worker $null  + GPU read OK -> gpuActive;
+                        worker $null  + GPU $null   -> $null.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][bool]$WorkerActive,
+        [Parameter(Mandatory)][AllowNull()]$WorkerActive,
         [AllowNull()]$GpuUtil,
         [Parameter(Mandatory)][ValidateSet('WorkerOnly', 'GpuOnly', 'WorkerOrGpu')][string]$Signal,
         [Parameter(Mandatory)][int]$GpuBusyPercent
     )
+
+    if (($null -ne $WorkerActive) -and ($WorkerActive -isnot [bool])) {
+        throw "Resolve-RenderActive: WorkerActive must be `$true, `$false, or `$null (got '$WorkerActive')."
+    }
 
     $gpuReadOk = ($null -ne $GpuUtil)
     $gpuActive = ($gpuReadOk -and [int]$GpuUtil -ge $GpuBusyPercent)
@@ -317,11 +398,51 @@ function Resolve-RenderActive {
             if ($gpuReadOk) { return $gpuActive } else { return $WorkerActive }
         }
         'WorkerOrGpu' {
-            return ($WorkerActive -or $gpuActive)
+            # $WorkerActive is truthy only when it is exactly $true ($null and
+            # $false are both falsy in PowerShell's `if`), so this correctly
+            # short-circuits to $true only on a confirmed active worker.
+            if ($WorkerActive) { return $true }
+            if ($gpuActive) { return $true }
+            if ($gpuReadOk) { return $gpuActive }
+            # GPU read failed too: GPU stops contributing. What remains is
+            # $WorkerActive itself, which is either $false or $null here --
+            # exactly the desired passthrough for those two rows.
+            return $WorkerActive
         }
         default {
             # 'WorkerOnly'
             return $WorkerActive
         }
     }
+}
+
+function Test-TopazTempFile {
+    <#
+    .SYNOPSIS
+        Pure decision: does $Name look like a Topaz scratch/temp file (per
+        $TempMarker), as opposed to a real deliverable that merely CONTAINS
+        the marker text as a substring? No I/O, so it is fully unit-testable.
+    .PARAMETER Name
+        The file name (not full path) to test.
+    .PARAMETER TempMarker
+        The configured scratch-file marker fragment (Config.ps1 TempMarker).
+    .DESCRIPTION
+        A plain "-like '*marker*'" substring match is too broad: a real
+        deliverable such as 'Reel_Template_Final.mp4' contains '_temp' as a
+        substring of "_Template" and would be silently skipped by the unlock
+        gate. Anchoring the marker to a following separator ('.', '_', '-') or
+        the end of the name (e.g. 'clip_temp', 'clip_temp.mp4',
+        'clip_temp_001.mov') keeps matching real scratch files while letting
+        'Reel_Template_Final.mp4' and 'temperature.mp4' through as real
+        outputs. PowerShell's -match is case-insensitive by default, so
+        'my_TEMP.mp4' still matches a '_temp' marker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$TempMarker
+    )
+
+    $pattern = [regex]::Escape($TempMarker) + '([._-]|$)'
+    return [bool]($Name -match $pattern)
 }

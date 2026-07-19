@@ -63,9 +63,19 @@ foreach ($name in $scripts) {
             -Message "Source script '$src' not found; cannot install it."
         continue
     }
-    Copy-Item -LiteralPath $src -Destination $cfg.InstallDir -Force
-    Write-TopazLog -Component 'install' -Level 'INFO' `
-        -Message "Copied '$name' -> '$($cfg.InstallDir)'."
+    try {
+        Copy-Item -LiteralPath $src -Destination $cfg.InstallDir -Force -ErrorAction Stop
+        Write-TopazLog -Component 'install' -Level 'INFO' `
+            -Message "Copied '$name' -> '$($cfg.InstallDir)'."
+    }
+    catch {
+        # WHY: without this catch, a failed copy (locked file, permissions,
+        # full disk) still logged 'Copied' - masking a stale/missing installed
+        # script from anyone reading the log. Log the failure and move on to
+        # the next file rather than aborting the whole install.
+        Write-TopazLog -Component 'install' -Level 'ERROR' `
+            -Message "Failed to copy '$name': $($_.Exception.Message)"
+    }
 }
 
 # ---------------------------------------------------------------------------

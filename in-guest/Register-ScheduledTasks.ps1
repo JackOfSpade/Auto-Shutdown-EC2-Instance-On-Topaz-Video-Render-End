@@ -111,11 +111,19 @@ $watchdogAction = New-ScheduledTaskAction `
 
 $watchdogTrigger = New-ScheduledTaskTrigger -AtStartup
 
+# ExecutionTimeLimit=Zero means no time limit (the watchdog runs indefinitely).
+# RestartCount/RestartInterval: the watchdog is the PRIMARY stop path - the
+# CloudWatch idle alarm is only a cost backstop, not a substitute. Without a
+# restart policy a crashed watchdog process stays dead until the next reboot,
+# silently disabling auto-stop for the rest of the render. Task Scheduler will
+# retry a failed run up to 3 times, one minute apart, before giving up.
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit ([TimeSpan]::Zero)   # Zero = no time limit (run indefinitely).
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-PipelineTask `
     -TaskName $cfg.WatchdogTaskName `

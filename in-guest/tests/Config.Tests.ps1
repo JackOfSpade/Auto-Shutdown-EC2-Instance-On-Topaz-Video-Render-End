@@ -182,6 +182,100 @@ Describe 'Test-TopazTempFile' {
     }
 }
 
+Describe 'Test-IsScratchDiskCandidate' {
+
+    # WHAT THIS GUARDS. This predicate decides which disk gets FORMATTED at
+    # every boot. A wrong $true destroys the operating system. It previously
+    # lived inline in Initialize-ScratchDisk.ps1 with no test coverage at all.
+    #
+    # Every rejection below is a scenario that could plausibly occur on an EC2
+    # Windows box, and each must fail CLOSED.
+
+    BeforeAll {
+        function Get-TestDisk {
+            param(
+                [string]$BusType = 'NVMe',
+                $IsBoot = $false,
+                $IsSystem = $false,
+                [string]$SerialNumber = '4EDC_1323_0B3C_92CC',
+                $Size = 450GB
+            )
+            [pscustomobject]@{
+                BusType = $BusType; IsBoot = $IsBoot; IsSystem = $IsSystem
+                SerialNumber = $SerialNumber; Size = $Size
+            }
+        }
+        $script:MinB = [int64]300GB
+        $script:MaxB = [int64]600GB
+    }
+
+    It 'ACCEPTS the real instance-store disk' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeTrue
+    }
+
+    It 'REJECTS the boot disk' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -IsBoot $true) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'REJECTS the system disk' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -IsSystem $true) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'REJECTS an EBS volume, identified by its vol-xxxx serial' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -SerialNumber 'vol0fa15d0249a65882a_00000001') -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'REJECTS a disk with a BLANK serial (unidentifiable provenance)' {
+        # The trap this guards: '' -notmatch '^vol' is $TRUE, so a naive EBS
+        # exclusion silently passes a disk whose origin cannot be established.
+        foreach ($s in @('', '   ', $null)) {
+            Test-IsScratchDiskCandidate -Disk (Get-TestDisk -SerialNumber $s) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+                Should -BeFalse
+        }
+    }
+
+    It 'REJECTS a disk whose IsBoot/IsSystem could not be read ($null)' {
+        # $null must not be read as "false, therefore safe".
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -IsBoot $null) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -IsSystem $null) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'REJECTS disks outside the expected instance-store size range' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -Size 100GB) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -Size 900GB) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'REJECTS any disk carrying a mountable filesystem, however it looks otherwise' {
+        # The decisive data-safety condition: a formatted disk may hold data
+        # somebody wants, so it is never a candidate for reformatting.
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $true |
+            Should -BeFalse
+    }
+
+    It 'REJECTS a non-NVMe disk' {
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk -BusType 'SATA') -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeFalse
+    }
+
+    It 'ACCEPTS a partially provisioned disk (PartitionStyle is deliberately not consulted)' {
+        # A previous boot that initialized the disk but failed before formatting
+        # leaves it GPT with no filesystem. Keying on PartitionStyle -eq 'RAW'
+        # would exclude it forever and brick the scratch drive on every
+        # subsequent boot. It is safe to reclaim precisely because it carries
+        # no mountable volume.
+        Test-IsScratchDiskCandidate -Disk (Get-TestDisk) -MinBytes $script:MinB -MaxBytes $script:MaxB -HasFormattedVolume $false |
+            Should -BeTrue
+    }
+}
+
 Describe 'Write-TopazLog output-stream hygiene' {
 
     # WHAT THIS GUARDS. Write-TopazLog used to emit INFO lines with

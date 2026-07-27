@@ -92,14 +92,36 @@ if ($existing -and $existing.FileSystemType -ne 'Unknown') {
 # these conditions is load-bearing.
 # ---------------------------------------------------------------------------
 
+function Test-DiskHasFormattedVolume {
+    <#
+    .SYNOPSIS
+        Does ANY partition on this disk carry a mountable filesystem? This is
+        the decisive data-safety check behind Test-IsScratchDiskCandidate, so
+        it fails CLOSED: any error is reported as $true ("assume it holds
+        data"), which disqualifies the disk rather than risking its contents.
+    #>
+    param([Parameter(Mandatory)][uint32]$DiskNumber)
+
+    try {
+        $vols = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop |
+            Get-Volume -ErrorAction SilentlyContinue |
+            Where-Object { $_.FileSystemType -and $_.FileSystemType -ne 'Unknown' })
+        return ($vols.Count -gt 0)
+    }
+    catch {
+        # No partitions at all throws here on some builds -- that genuinely
+        # means no filesystem. Distinguish it from a real failure.
+        if ($_.Exception.Message -match 'No MSFT_Partition|ObjectNotFound') { return $false }
+        Write-TopazLog -Component 'scratch' -Level 'WARN' `
+            -Message "Could not enumerate volumes on disk $DiskNumber ($($_.Exception.Message)); treating it as holding data and EXCLUDING it."
+        return $true
+    }
+}
+
 $candidates = @(Get-Disk | Where-Object {
-        $_.BusType        -eq 'NVMe' -and
-        $_.PartitionStyle -eq 'RAW'  -and
-        $_.IsBoot         -eq $false -and
-        $_.IsSystem       -eq $false -and
-        $_.SerialNumber   -notmatch '^vol' -and
-        $_.Size           -gt $cfg.ScratchMinBytes -and
-        $_.Size           -lt $cfg.ScratchMaxBytes
+        Test-IsScratchDiskCandidate -Disk $_ `
+            -MinBytes $cfg.ScratchMinBytes -MaxBytes $cfg.ScratchMaxBytes `
+            -HasFormattedVolume (Test-DiskHasFormattedVolume -DiskNumber $_.Number)
     })
 
 if ($candidates.Count -eq 0) {
@@ -141,6 +163,24 @@ if ($WhatIfOnly) {
 # ---------------------------------------------------------------------------
 
 try {
+    # RECOVER FROM A PARTIAL PROVISION. If a previous boot got part-way -- disk
+    # initialized but New-Partition or Format-Volume then failed -- the disk is
+    # left GPT with no usable filesystem. Initialize-Disk would fail on it
+    # ("The disk has already been initialized"), and before Test-IsScratchDisk-
+    # Candidate stopped keying on PartitionStyle it would never be selected
+    # again either, bricking the scratch drive on every subsequent boot.
+    #
+    # Clear-Disk returns it to RAW. It is safe here ONLY because selection has
+    # already established this disk carries no mountable filesystem; that check
+    # fails closed, so a disk whose volumes could not even be enumerated was
+    # excluded rather than cleared.
+    if ($disk.PartitionStyle -ne 'RAW') {
+        Write-TopazLog -Component 'scratch' -Level 'WARN' `
+            -Message "Disk $($disk.Number) is $($disk.PartitionStyle), not RAW, but carries no mountable filesystem -- treating it as a partially provisioned scratch disk from an earlier failed run and clearing it."
+        Clear-Disk -Number $disk.Number -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+        $disk = Get-Disk -Number $disk.Number -ErrorAction Stop
+    }
+
     Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Stop
 
     $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $driveLetter -ErrorAction Stop

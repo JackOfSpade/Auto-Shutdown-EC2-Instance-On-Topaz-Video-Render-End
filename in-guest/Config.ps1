@@ -1071,6 +1071,90 @@ function Invoke-TopazAwsCli {
     }
 }
 
+function Test-IsScratchDiskCandidate {
+    <#
+    .SYNOPSIS
+        Pure: is this disk the EC2 instance-store scratch disk, and therefore
+        safe to destroy and reformat? No I/O, so it is fully unit-testable --
+        which matters more here than anywhere else in this codebase, because
+        the consequence of a wrong $true is formatting the operating system.
+    .DESCRIPTION
+        EVERY condition below is load-bearing. A disk qualifies only if all of
+        them hold:
+
+          BusType is NVMe          - both EBS and instance store present as
+                                     NVMe on Nitro instances, so this alone
+                                     excludes nothing; it is a sanity floor.
+          IsBoot is $false         - the OS disk fails this.
+          IsSystem is $false       - the OS disk fails this too.
+          Serial does not start    - every EBS volume's serial IS its vol-xxxx
+            with 'vol'               id. The instance store's is not. NOTE the
+                                     explicit null/empty rejection below: a
+                                     BLANK serial does not start with 'vol'
+                                     either, so a naive -notmatch would let an
+                                     unidentifiable disk through. Unknown
+                                     provenance is treated as disqualifying,
+                                     not as passing.
+          Size within bounds       - guards against a future instance type
+                                     whose instance store is a different size,
+                                     where "the only RAW disk" might be
+                                     something else entirely.
+          No formatted volume      - the decisive data-safety check. A disk
+                                     carrying any filesystem might hold data
+                                     somebody wants. Only a disk with nothing
+                                     mountable on it is a candidate.
+
+        The PartitionStyle is deliberately NOT part of this predicate. A
+        RAW disk is the normal case, but a PARTIALLY provisioned one (Initialize
+        -Disk succeeded, then New-Partition or Format-Volume failed) is left
+        GPT with no usable filesystem, and would otherwise never match again --
+        bricking the scratch drive permanently on every subsequent boot. The
+        "no formatted volume" condition is what makes it safe to reclaim such a
+        disk regardless of its partition style.
+    .PARAMETER Disk
+        A Get-Disk object: needs .BusType, .IsBoot, .IsSystem, .SerialNumber, .Size.
+    .PARAMETER MinBytes
+        Lower size bound (Config's ScratchMinBytes).
+    .PARAMETER MaxBytes
+        Upper size bound (Config's ScratchMaxBytes).
+    .PARAMETER HasFormattedVolume
+        Whether ANY partition on this disk carries a mountable filesystem. The
+        caller resolves this (it needs I/O); passing it in keeps this function
+        pure.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Disk,
+        [Parameter(Mandatory)][int64]$MinBytes,
+        [Parameter(Mandatory)][int64]$MaxBytes,
+        [Parameter(Mandatory)][bool]$HasFormattedVolume
+    )
+
+    if ($Disk.BusType -ne 'NVMe') { return $false }
+
+    # -eq $true, not truthiness: a $null IsBoot/IsSystem (property absent or
+    # unreadable) must NOT be read as "false, therefore safe".
+    if ($Disk.IsBoot -eq $true)   { return $false }
+    if ($Disk.IsSystem -eq $true) { return $false }
+    if ($null -eq $Disk.IsBoot)   { return $false }
+    if ($null -eq $Disk.IsSystem) { return $false }
+
+    # A blank serial is unidentifiable provenance, and '' -notmatch '^vol' is
+    # $true -- so without this the EBS exclusion silently passes it.
+    if ([string]::IsNullOrWhiteSpace($Disk.SerialNumber)) { return $false }
+    if ($Disk.SerialNumber -match '^vol')                 { return $false }
+
+    if ($null -eq $Disk.Size)      { return $false }
+    if ([int64]$Disk.Size -le $MinBytes) { return $false }
+    if ([int64]$Disk.Size -ge $MaxBytes) { return $false }
+
+    if ($HasFormattedVolume) { return $false }
+
+    return $true
+}
+
 function Invoke-TopazRenderUpload {
     <#
     .SYNOPSIS

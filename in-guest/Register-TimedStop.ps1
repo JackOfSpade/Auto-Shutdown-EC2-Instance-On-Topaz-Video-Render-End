@@ -25,13 +25,26 @@
     the moment the instance role is granted ec2:StopInstances this task starts
     doing the right thing with no change to any of these scripts.
 
-    *** THIS TASK IS BLIND TO RENDER STATE. *** It does not consult
-    Get-TopazWorkers, GPU utilization, the output directory, or anything else
-    the watchdog uses. When the clock runs out it stops the instance, and if a
-    render is still going that render dies with it. Every safeguard in
-    Watchdog.ps1 -- the debounce, the stall detector, the unlock gate, the
-    re-verify -- is bypassed by design, because a backstop that can be talked
-    out of firing is not a backstop.
+    *** THIS TASK IS BLIND TO RENDER PROGRESS. *** It does not consult
+    Get-TopazWorkers, GPU utilization, or anything else the watchdog uses to
+    decide whether a render is still going. When the clock runs out it stops
+    the instance, and if a render is still running that render dies with it.
+    The debounce, stall detector, unlock gate and re-verify are all bypassed by
+    design, because a backstop that can be talked out of firing is not a
+    backstop.
+
+    ONE GUARD IS NOT BYPASSED, DELIBERATELY. Stop-Sequence.ps1's ephemeral
+    upload interlock still applies: if OutputDir sits on the instance-store
+    scratch volume and the finished renders in it have not been uploaded and
+    verified, the stop is REFUSED even here. Erasing a completed render to save
+    a few dollars of instance time is not a trade this project makes, so the
+    cost cap yields to it.
+
+    That means the cap is not absolute, and this task is therefore registered
+    with a REPEATING trigger rather than as a one-shot: a refused stop is
+    retried on RetryIntervalMinutes until it succeeds. A one-shot task that
+    fired once, got refused, and never tried again would be a cost cap that
+    silently did not cap anything.
 
     That is not theoretical: on this deployment a 4-hour timed stop was once
     armed against a render that was still running four hours later, and was
@@ -74,6 +87,12 @@
 param(
     [ValidateRange(1, 168)]
     [double]$Hours = 4,
+
+    # How often to retry after a REFUSED stop (see the interlock note in
+    # .DESCRIPTION). Once a stop actually succeeds the instance is gone and the
+    # repetition dies with it, so this only ever runs on the refusal path.
+    [ValidateRange(5, 720)]
+    [int]$RetryIntervalMinutes = 15,
 
     [switch]$Cancel
 )
@@ -134,7 +153,16 @@ $action = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
     -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`" -Reason maxlifetime -IgnoreDryRun" -f $stopScript)
 
+# Repeating, not one-shot. See .DESCRIPTION: the ephemeral upload interlock can
+# REFUSE this stop, and a one-shot task would then never try again -- a cost cap
+# that silently stopped capping. A repetition cannot be literally infinite, so
+# ~10000 days stands in for "until it succeeds"; the successful stop ends the
+# instance and the repetition with it.
 $trigger = New-ScheduledTaskTrigger -Once -At $fireAt
+$retryTrigger = New-ScheduledTaskTrigger -Once -At $fireAt `
+    -RepetitionInterval (New-TimeSpan -Minutes $RetryIntervalMinutes) `
+    -RepetitionDuration (New-TimeSpan -Days 10000)
+$trigger.Repetition = $retryTrigger.Repetition
 
 $principalObj = New-ScheduledTaskPrincipal `
     -UserId 'SYSTEM' `
@@ -189,6 +217,8 @@ try {
     Write-Output "  ----------------"
     Write-Output "  Task        : $taskName"
     Write-Output "  Fires at    : $($fireAt.ToString('yyyy-MM-dd HH:mm:ss')) (local)  -- in $Hours hour(s)"
+    Write-Output "  Retries     : every $RetryIntervalMinutes min if the stop is REFUSED"
+    Write-Output "                (the upload interlock can refuse it; see stop.log)"
     Write-Output "  Action      : Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun"
     Write-Output "  StopStrategy: $($cfg.StopStrategy)  (plan: $((Resolve-StopPlan -Strategy $cfg.StopStrategy) -join ' -> '))"
     Write-Output ""

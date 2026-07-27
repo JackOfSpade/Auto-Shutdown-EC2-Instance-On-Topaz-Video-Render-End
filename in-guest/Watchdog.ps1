@@ -693,6 +693,62 @@ function Get-NextWatchdogState {
     }
 }
 
+function Resolve-RefusalStallSec {
+    <#
+    .SYNOPSIS
+        Pure: what the stall clock should be reset to after Stop-Sequence.ps1
+        REFUSED to stop, given why the stop was attempted. No I/O.
+    .DESCRIPTION
+        THE REASON THIS IS NOT JUST "0".
+
+        After a refusal the watchdog re-arms and retries, and how quickly the
+        retry actually comes depends entirely on which branch of the state
+        machine governs the next poll:
+
+          reason='completed' - the worker has EXITED. The next poll reads
+              Active=$false, so the idle branch governs and the retry arrives
+              after DebounceSec. Resetting the stall clock to 0 is correct and
+              irrelevant, because the stall clock is not what gates the retry.
+
+          reason='stalled'   - the worker is HUNG, not gone. Stop-Sequence.ps1
+              never touches Topaz processes, so that worker is still there on
+              the very next poll: Active reads $true, the ACTIVE branch
+              governs, and the retry is gated by the stall clock climbing all
+              the way back to StallLimitSec. Resetting to 0 would therefore
+              cost a FULL StallSec (1800s = 30 min) before the next attempt --
+              not the DebounceSec the re-arm intends, and precisely the window
+              in which the out-of-band CloudWatch idle alarm can stop the box
+              and erase the un-uploaded render. That yields ONE retry where
+              several were intended.
+
+        So for 'stalled' the clock is carried back to DebounceSec short of the
+        limit, making the next attempt due after DebounceSec of continued
+        no-progress. If the worker recovers and makes progress in the
+        meantime, the normal progress path resets the clock to 0 on its own,
+        so this cannot manufacture a false stall.
+    .PARAMETER Reason
+        'completed' | 'stalled' | 'maxlifetime'.
+    .PARAMETER StallLimitSec
+        Config's StallSec.
+    .PARAMETER DebounceSec
+        Config's DebounceSec -- the retry cadence the re-arm is aiming for.
+    .OUTPUTS
+        [int] the value to assign to the stall clock.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][int]$StallLimitSec,
+        [Parameter(Mandatory)][int]$DebounceSec
+    )
+
+    if ($Reason -ne 'stalled') { return 0 }
+
+    $carried = $StallLimitSec - $DebounceSec
+    if ($carried -lt 0) { return 0 }
+    return [int]$carried
+}
+
 function Resolve-StopDecision {
     <#
     .SYNOPSIS
@@ -993,11 +1049,22 @@ if ($MyInvocation.InvocationName -ne '.') {
             # than reset: a render demonstrably happened, and forcing it to
             # re-earn ArmSec would mean the retry never fires at all once the
             # worker has exited.
+            # Do NOT name a cause here. Stop-Sequence.ps1 returns $false for
+            # three distinct reasons -- ephemeral OutputDir with no
+            # UploadTarget, an upload that failed or could not be verified, and
+            # every action in the stop plan failing (e.g. ec2:StopInstances
+            # denied). Only stop.log knows which. Asserting "the upload failed"
+            # would send an operator hunting through rclone while the actual
+            # fault was an IAM permission.
+            $stallSec = Resolve-RefusalStallSec -Reason $reason `
+                -StallLimitSec $cfg.StallSec -DebounceSec $cfg.DebounceSec
+
+            $retryInSec = if ($reason -eq 'stalled') { $cfg.StallSec - $stallSec } else { $cfg.DebounceSec }
+
             Write-TopazLog -Component 'watchdog' -Level 'WARN' `
-                -Message "Stop-Sequence REFUSED to stop (reason=$reason) -- most likely the render upload failed or could not be verified. The instance stays UP so the render is not lost. Re-arming to retry in ~$($cfg.DebounceSec)s."
+                -Message "Stop-Sequence REFUSED to stop (reason=$reason). See stop.log for which guard fired: no UploadTarget on ephemeral storage, a failed/unverified upload, or every stop action failing. The instance stays UP so nothing is lost. Re-arming to retry in ~${retryInSec}s."
 
             $idleSec     = 0
-            $stallSec    = 0
             $sawActivity = $true
             $activeSec   = $cfg.ArmSec
             $lastBytes   = Get-OutputBytes

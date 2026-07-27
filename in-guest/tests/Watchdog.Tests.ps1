@@ -752,6 +752,59 @@ Describe 'Test-FileUnlocked' {
     }
 }
 
+Describe 'Resolve-RefusalStallSec (retry cadence after a refused stop)' {
+
+    # WHAT THIS GUARDS. When Stop-Sequence.ps1 refuses to stop (e.g. the render
+    # upload failed and OutputDir is on the ephemeral scratch volume), the
+    # watchdog re-arms and retries rather than exiting. How fast the retry
+    # actually arrives depends on which state-machine branch governs the next
+    # poll, and that differs by reason:
+    #
+    #   'completed' - the worker EXITED, so the next poll is Active=$false and
+    #                 the idle/DebounceSec branch drives the retry. The stall
+    #                 clock is irrelevant; 0 is fine.
+    #   'stalled'   - the worker is HUNG, not gone. Stop-Sequence never touches
+    #                 Topaz processes, so it is still there next poll, Active
+    #                 reads $true, and the ACTIVE branch governs -- the retry is
+    #                 gated by the stall clock reaching StallLimitSec again.
+    #
+    # The original implementation reset the clock to 0 unconditionally. On the
+    # 'stalled' path that cost a full StallSec (1800s = 30 min) before the next
+    # attempt -- exactly the window in which the out-of-band CloudWatch idle
+    # alarm can stop the box and erase the un-uploaded render. The retry
+    # mechanism built to survive that alarm would have got ONE attempt.
+
+    It 'returns 0 for a completed-reason refusal (idle branch drives the retry)' {
+        Resolve-RefusalStallSec -Reason 'completed' -StallLimitSec 1800 -DebounceSec 300 |
+            Should -Be 0
+    }
+
+    It 'carries the stall clock to within DebounceSec of the limit for a stalled refusal' {
+        # 1800 - 300 = 1500, so the next 'stalled' verdict is due after a
+        # further 300s of no progress, matching the intended retry cadence.
+        Resolve-RefusalStallSec -Reason 'stalled' -StallLimitSec 1800 -DebounceSec 300 |
+            Should -Be 1500
+    }
+
+    It 'gives the stalled path the SAME retry cadence as the completed path' {
+        $stallStart = Resolve-RefusalStallSec -Reason 'stalled' -StallLimitSec 1800 -DebounceSec 300
+        # Seconds of continued no-progress before 'stalled' fires again:
+        (1800 - $stallStart) | Should -Be 300
+    }
+
+    It 'never returns a negative clock when DebounceSec exceeds StallLimitSec' {
+        # A misconfiguration, but it must not produce a negative stall clock
+        # that would then take even longer to climb back to the limit.
+        Resolve-RefusalStallSec -Reason 'stalled' -StallLimitSec 100 -DebounceSec 300 |
+            Should -Be 0
+    }
+
+    It 'treats maxlifetime like completed (its worker state is not a stall)' {
+        Resolve-RefusalStallSec -Reason 'maxlifetime' -StallLimitSec 1800 -DebounceSec 300 |
+            Should -Be 0
+    }
+}
+
 Describe 'Arm debounce (transient preview workers must not arm the watchdog)' {
 
     # WHAT THIS GUARDS -- a real near-miss, 2026-07-27 05:49.

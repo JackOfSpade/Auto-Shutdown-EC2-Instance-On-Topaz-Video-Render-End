@@ -200,6 +200,22 @@ for the full environment-variable contract and a local smoke test.
 This whole stage is **optional**. If you do not want a hard wall-clock ceiling,
 skip it - delete the function and schedule to remove it later.
 
+### In-guest alternative: `Register-TimedStop.ps1`
+
+For a deployment where the control plane cannot be reached to deploy the
+Lambda above, [`Register-TimedStop.ps1`](../in-guest/Register-TimedStop.ps1)
+is an in-guest, one-shot wall-clock backstop that does a similar job locally:
+it registers a SYSTEM scheduled task that fires `Stop-Sequence.ps1 -Reason
+maxlifetime -IgnoreDryRun` a fixed number of hours from now (default **4**),
+**bypassing `DryRun`** on purpose - a backstop that respected `DryRun` would
+not be one - and then following the same `StopStrategy` plan as every other
+stop. It is **blind to render state**: none of the watchdog's debounce,
+stall, or unlock-gate logic applies, so if a render is still running when it
+fires, that render is killed along with the instance. Cancel it
+(`.\Register-TimedStop.ps1 -Cancel`) once the real watchdog is armed and
+verified - see its own header comment for the full reasoning, including a
+real near-miss recorded on this deployment.
+
 ## Safety-net operational windows
 
 Both out-of-band safety nets watch **wall-clock/GPU state**, not "is a render
@@ -218,9 +234,9 @@ trip the idle alarm if you are not deliberate about them:
   sync. A large sync of big output files can push the *cumulative* idle time
   (debounce + unlock wait + sync) past `IDLE_MINUTES`, and the idle alarm does
   not know a sync is in flight: its `ec2:stop` action would abruptly stop the
-  instance mid-sync, ahead of `Stop-Sequence.ps1`'s own graceful
-  `Stop-Computer -Force`. Size `IDLE_MINUTES` generously (covering debounce +
-  unlock wait + your largest expected sync) whenever `S3SyncTarget` is set.
+  instance mid-sync, ahead of `Stop-Sequence.ps1`'s own graceful `StopStrategy`
+  plan. Size `IDLE_MINUTES` generously (covering debounce + unlock wait + your
+  largest expected sync) whenever `S3SyncTarget` is set.
 
 ## The three layers together
 

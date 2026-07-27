@@ -10,19 +10,35 @@ comment at the exact spot the wrong version would have gone.
 
 ## 1. "The box needs `ec2:StopInstances` (and credentials) to stop itself."
 
-**Wrong.** The primary stop is a plain **guest-OS shutdown**
-(`Stop-Computer -Force`). Because `InstanceInitiatedShutdownBehavior=stop` is set
-at the AWS control plane ([`01-set-shutdown-behavior.sh`](../control-plane/01-set-shutdown-behavior.sh)),
-that shutdown **stops** the instance with **no AWS API call and no credentials on
-the box**. The instance role grants only `cloudwatch:PutMetricData`;
-`ec2:StopInstances` is *optional*, tag-scoped, and off by default.
+**Wrong, as originally designed.** The primary stop was a plain **guest-OS
+shutdown** (`Stop-Computer -Force`). Because
+`InstanceInitiatedShutdownBehavior=stop` is set at the AWS control plane
+([`01-set-shutdown-behavior.sh`](../control-plane/01-set-shutdown-behavior.sh)),
+that shutdown **stops** the instance with **no AWS API call and no credentials
+on the box**. The instance role granted only `cloudwatch:PutMetricData`;
+`ec2:StopInstances` was *optional*, tag-scoped, and off by default.
+
+> **Update: this reasoning is retained, but the design has since evolved.**
+> `Config.ps1`'s `StopStrategy` now defaults to `'Auto'`, which tries
+> `ec2:StopInstances` **first** and falls back to the credential-free guest
+> shutdown above only if that call is denied or does not take effect - because
+> a guest shutdown only ends billing when `InstanceInitiatedShutdownBehavior`
+> happens to be `stop`, and that fact cannot be verified from inside the guest
+> without an extra permission. This box therefore does now hold a
+> narrowly-scoped, tag-conditioned `ec2:StopInstances` grant that the original
+> design deliberately avoided - an honest trade-off, not a silent regression
+> of the correction above. The guest-shutdown leg is unconditionally retained
+> as the fallback. See [docs/01-architecture.md](01-architecture.md) and
+> [Phase 3](05-phase3-stop-sequence.md) for the full reasoning.
 
 ## 2. "Detect completion with a fixed timer / sleep."
 
 **Wrong.** Completion is **event-driven**. The watchdog decides "done" from the
-**lifecycle of Topaz's child `ffmpeg` worker** plus a **file-unlock gate** on the
-output directory - never a wall-clock countdown. A fixed timer would stop too
-early on a long job or waste money on a short one. See
+**lifecycle of Topaz's encoder-worker descendants** (`neuroserver.exe`/
+`ffmpeg.exe`, matched by ancestry, not direct parentage - see
+[Phase 2](04-phase2-watchdog.md)) plus a **file-unlock gate** on the output
+directory - never a wall-clock countdown. A fixed timer would stop too early
+on a long job or waste money on a short one. See
 [`Watchdog.ps1`](../in-guest/Watchdog.ps1) and [Phase 2](04-phase2-watchdog.md).
 
 ## 3. "Key the idle alarm on `CPUUtilization`."
@@ -58,7 +74,7 @@ so a render can stall the moment the operator disconnects. The display protocol 
 **Amazon DCV**, which keeps the GPU session intact across disconnect. Verified in
 [Phase 0](02-phase0-confirmations.md).
 
-## 7. "GUI up with no `ffmpeg` worker means the queue is complete - stop the box."
+## 7. "GUI up with no active worker means the queue is complete - stop the box."
 
 **Wrong.** "GUI up, no worker" is **also the normal pre-render state** (opening a
 project, adding clips, configuring the export). Treating it as "complete" would
@@ -71,8 +87,9 @@ least one active render (worker and/or GPU, per `CompletionSignal`). See
 
 **Wrong.** The Topaz EULA **bans the CLI under a Personal License**. Nothing in
 this pipeline invokes the Topaz CLI. The watchdog **observes only** - the GUI
-process, its `ffmpeg` children, and the output folder on disk - and never calls
-Topaz. This keeps the deployment single-user and GUI-only. See the license note in
+process, its encoder-worker descendants (`neuroserver.exe`/`ffmpeg.exe`,
+matched by ancestry), and the output folder on disk - and never calls Topaz.
+This keeps the deployment single-user and GUI-only. See the license note in
 the [README](../README.md) and the boundaries in
 [Appendix B](09-appendix-b-boundaries.md).
 

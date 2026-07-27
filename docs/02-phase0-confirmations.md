@@ -46,16 +46,24 @@ one-to-one to the `OPERATOR SETTINGS` block in
 
 | Observe | Why | Config key | Default |
 |---------|-----|-----------|---------|
-| The **Topaz GUI process name** | The watchdog matches it with a CIM `LIKE` pattern; the `ffmpeg` workers are found as *children* of this process. | `TopazNameLike` | `'Topaz Video%'` (matches both `Topaz Video.exe` and `Topaz Video AI.exe`) |
-| The **output directory** Topaz writes finished exports into | "No byte-count change here while a render is active" is the stall signal; the file-unlock gate scans this folder. | `OutputDir` | `'D:\Exports'` |
+| The **Topaz GUI process name** | The watchdog matches it with a CIM `LIKE` pattern; the encoder worker process(es) are found as *descendants* of this process, at any depth (not necessarily direct children). | `TopazNameLike` | `'Topaz Video%'` (matches both `Topaz Video.exe` and `Topaz Video AI.exe`) |
+| The **output directory** Topaz writes finished exports into | "No progress here while a render is active" (byte count AND worker disk I/O both unchanged) is the stall signal; the file-unlock gate scans this folder. | `OutputDir` | `'C:\Users\Administrator\Downloads'` |
 | The **scratch / temp file naming** Topaz leaves behind | Files whose name matches this marker (anchored to a following separator or the end of the name - not a bare substring) are excluded from the unlock check, so leftover scratch files never block the stop. | `TempMarker` | `'_temp'` |
 
 Concretely, while an export runs, check:
 
-- **Process tree:** confirm the GUI spawns `ffmpeg.exe` children during encode.
-  In PowerShell: `Get-CimInstance Win32_Process -Filter "Name = 'ffmpeg.exe'"`
-  and confirm the `ParentProcessId` is the Topaz GUI PID. This parent/child
-  relationship is the core signal (see [Phase 2](04-phase2-watchdog.md)).
+- **Process tree:** confirm which worker process(es) Topaz spawns to encode a
+  queued job, and their **full ancestry** back to the GUI - do not assume the
+  encoder is a *direct* child. On this deployment the observed chain is three
+  levels deep, `Topaz Video.exe` -> `neuroserver.exe` -> `ffmpeg.exe`, i.e.
+  `ffmpeg` is a **grandchild** of the GUI (see
+  [docs/12-empirical-findings.md](12-empirical-findings.md)). In PowerShell:
+  `Get-CimInstance Win32_Process -Filter "Name = 'ffmpeg.exe'"` and walk
+  `ParentProcessId` up - it will likely **not** be the GUI's own PID. The
+  watchdog matches worker processes by **ancestry** (any descendant of a live
+  Topaz GUI PID, to unlimited depth), not direct parentage, so record every
+  worker process name in the chain for `WorkerNamesLike` (see
+  [Phase 2](04-phase2-watchdog.md)).
 - **Output growth:** watch the output folder's byte total climb while encoding.
 - **Scratch files:** note any partial/temporary files created during the render
   and whether their names contain `_temp` (or something else - update

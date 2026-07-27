@@ -1,13 +1,19 @@
 # Auto-Shutdown EC2 Instance on Topaz Video Render End
 
 Run Topaz Video AI on a rented GPU EC2 box and pay only for the render. An
-on-box **watchdog** observes the Topaz GUI and its child `ffmpeg` encode
-workers; the moment the render queue drains (or provably stalls) and every
-output file is unlocked, it shuts the guest OS down. Because the instance's
-`InstanceInitiatedShutdownBehavior` is set to `stop`, that guest shutdown
-**stops** the instance with **no AWS API call and no credentials on the box**.
-An independent CloudWatch GPU-idle alarm, and an optional max-lifetime Lambda,
-sit out-of-band as safety nets that never share fate with the guest.
+on-box **watchdog** observes the Topaz GUI and its encode-worker descendants -
+`neuroserver.exe` and, once it spawns one, `ffmpeg.exe` (a **grandchild** of
+the GUI, matched by ancestry, not just direct parentage); the moment the
+render queue drains (or provably stalls) and every output file is unlocked,
+it stops the instance. The default `StopStrategy` (`'Auto'`) calls
+`ec2:StopInstances` against itself first - the only action that **provably**
+ends billing - and falls back to a guest-OS shutdown (`Stop-Computer -Force`)
+if that call is denied or does not take effect; the guest-shutdown fallback
+only stops (rather than terminates) the instance when
+`InstanceInitiatedShutdownBehavior=stop`, a fact this box cannot verify about
+itself, which is exactly why the API leg exists. An independent CloudWatch
+GPU-idle alarm, and an optional max-lifetime Lambda, sit out-of-band as safety
+nets that never share fate with the guest.
 
 The operator's only manual act is to load the project and click **Export once**,
 then disconnect. Everything after that click is automated. There is no GUI
@@ -19,24 +25,25 @@ robot.
                  EC2 GPU instance  -  Windows Server, Amazon DCV display
   +-------------------------------------------------------------------------+
   |                                                                         |
-  |   Topaz Video AI (GUI)  --spawns-->  ffmpeg.exe  (encode worker)        |
-  |        |                                  |                             |
-  |        | observed via CIM                 | writes finished files       |
-  |        v   (Win32_Process)                v                             |
+  |   Topaz Video AI (GUI) --spawns--> neuroserver.exe --spawns--> ffmpeg.exe |
+  |        |                           (per-queue-item      (GRANDCHILD of   |
+  |        | observed via CIM           worker, --once)      the GUI; encode |
+  |        v   (Win32_Process, matched by ANCESTRY -- see docs/12)  phase)   |
   |   +---------------+   queue done /    +----------------+                 |
-  |   | Watchdog.ps1  |   stalled  AND    |  D:\Exports     |                |
+  |   | Watchdog.ps1  |   stalled  AND    |  OutputDir      |                |
   |   | (SYSTEM task) |   files unlocked  |  (output dir)   |                |
   |   +-------+-------+                   +----------------+                 |
   |           | hands off (-Reason completed|stalled)                       |
   |           v                                                             |
   |   +--------------------+                                                 |
-  |   | Stop-Sequence.ps1  |  optional S3 sync + SNS, then Stop-Computer     |
-  |   +---------+----------+                                                 |
-  |             | guest OS shutdown                                         |
+  |   | Stop-Sequence.ps1  |  optional S3 sync + SNS, then the StopStrategy  |
+  |   +---------+----------+  plan: Ec2ApiStop, falling back to             |
+  |             |             GuestShutdown ('Auto' is the default)         |
   +-------------+---------------------------------------------------------- +
                 v
-   InstanceInitiatedShutdownBehavior = stop   -->   INSTANCE STOPS
-        PRIMARY STOP: no AWS API call, no credentials on the box
+   ec2:StopInstances (provably ends billing)   -->   INSTANCE STOPS
+   falls back to Stop-Computer -Force, which only STOPS (never terminates)
+   the instance when InstanceInitiatedShutdownBehavior = stop
 
 
   OUT-OF-BAND FALLBACK  (separate control plane; never shares fate w/ guest)
@@ -55,11 +62,20 @@ robot.
 
 ## Design principles
 
-- **The primary stop needs no AWS credentials on the box.** The stop is a plain
-  guest-OS shutdown. `InstanceInitiatedShutdownBehavior=stop` (set once, at the
-  AWS control plane) is what turns that shutdown into an instance *stop* rather
-  than a terminate. Nothing on the instance calls `ec2:StopInstances` and no
-  keys are stored to do so.
+- **A guest shutdown needs no AWS credentials on the box - and is retained as
+  the fallback leg.** `InstanceInitiatedShutdownBehavior=stop` (set once, at
+  the AWS control plane) is what turns a plain guest-OS shutdown into an
+  instance *stop* rather than a terminate, and that guest-shutdown path never
+  needed a credential. But a guest shutdown only ends billing when that
+  attribute happens to be `stop` - a fact the box cannot verify about itself
+  without an extra permission. So the default `StopStrategy` (`'Auto'`) tries
+  `ec2:StopInstances` FIRST, because that is the only action that *provably*
+  ends billing, and only falls back to the credential-free guest shutdown if
+  the API call is denied or does not take effect. This box therefore now
+  holds a narrowly-scoped, tag-conditioned `ec2:StopInstances` grant (still
+  optional and off by default at the control-plane level) that the original
+  zero-credential design deliberately avoided - an explicit trade-off, not a
+  silent one. See [docs/01-architecture.md](docs/01-architecture.md).
 - **The fallback is out-of-band.** The CloudWatch GPU-idle alarm lives entirely
   in the AWS control plane and acts through the built-in
   `arn:aws:automate:<region>:ec2:stop` action. It cannot be taken down by the
@@ -68,10 +84,15 @@ robot.
   (`Start-Job` / `Stop-EC2Instance`): such a job lives inside the very session
   being torn down and could never reliably fire.
 - **Completion is event-driven, never a fixed timer.** The watchdog decides
-  "done" from the **lifecycle of Topaz's child `ffmpeg` worker** plus a
+  "done" from the **lifecycle of Topaz's encoder-worker descendants**
+  (`neuroserver.exe`/`ffmpeg.exe`, matched by ancestry - `ffmpeg` is actually a
+  *grandchild* of the GUI, see
+  [docs/12-empirical-findings.md](docs/12-empirical-findings.md)) plus a
   **file-unlock gate** on the output directory - not from a wall-clock sleep. A
-  debounce absorbs transient live-preview `ffmpeg` children; a stall detector
-  catches a worker that is alive but no longer producing output.
+  debounce absorbs transient live-preview workers; a stall detector catches a
+  worker that is alive but making no progress, on either the output folder's
+  byte total or the workers' own cumulative disk I/O (the folder size alone is
+  not reliable - see docs/12).
 - **The display protocol is Amazon DCV, not RDP.** An RDP disconnect tears down
   the console session and rebinds the display, which can drop the NVIDIA WDDM
   driver and interrupt GPU work. DCV keeps the GPU session intact across
@@ -84,16 +105,24 @@ robot.
 ├── README.md                     <- you are here
 ├── in-guest/                     <- runs on the Windows EC2 box (PowerShell 5.1)
 │   ├── Config.ps1                <- single source of truth (paths, tuning, task names,
-│   │                                 CompletionSignal: WorkerOnly/GpuOnly/WorkerOrGpu)
-│   ├── Watchdog.ps1              <- detects render complete/stalled, gates on file unlock
-│   ├── Stop-Sequence.ps1         <- optional S3 sync + SNS, then Stop-Computer -Force
+│   │                                 CompletionSignal: WorkerOnly/GpuOnly/WorkerOrGpu,
+│   │                                 StopStrategy: Ec2ApiStop/GuestShutdown/Auto)
+│   ├── Watchdog.ps1              <- detects render complete/stalled (worker ancestry +
+│   │                                 GPU signal; progress = output bytes OR worker I/O),
+│   │                                 gates on file unlock
+│   ├── Stop-Sequence.ps1         <- optional S3 sync + SNS, then the StopStrategy plan
+│   │                                 (Ec2ApiStop, falling back to GuestShutdown)
 │   ├── Push-GpuMetric.ps1        <- publishes GPU% to CloudWatch every minute
 │   ├── Install.ps1               <- copies scripts into C:\topaz-autostop
 │   ├── Register-ScheduledTasks.ps1  <- registers the two SYSTEM scheduled tasks
+│   ├── Register-TimedStop.ps1    <- optional one-shot wall-clock cost backstop
+│   ├── Test-Deployment.ps1       <- preflight GO/NO-GO doctor (run before arming)
 │   └── tests/                    <- Pester unit tests (Config.ps1 + Watchdog.ps1 pure helpers)
 ├── control-plane/                <- runs from an admin workstation (AWS CLI v2)
+│   ├── 00-verify-prerequisites.sh    <- read-only prerequisite verifier
 │   ├── 01-set-shutdown-behavior.sh   <- set InstanceInitiatedShutdownBehavior=stop
-│   ├── 02-create-iam-role.sh         <- least-privilege instance role (PutMetricData)
+│   ├── 02-create-iam-role.sh         <- least-privilege instance role (PutMetricData,
+│   │                                     optionally tag-scoped ec2:StopInstances)
 │   ├── 03-create-idle-alarm.sh       <- out-of-band GPU-idle CloudWatch alarm
 │   ├── 04-deploy-max-lifetime-lambda.sh  <- optional hard-cap Lambda + schedule
 │   ├── lib/                       <- sourceable idempotency/validation helpers
@@ -183,15 +212,25 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    (`topaz-max-lifetime-schedule-<instance-id>`). See
    [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
-> **Ship in DryRun first.** `Config.ps1` sets `DryRun = $true` by default: the
-> watchdog and stop sequence log every decision but do **not** power the box off,
-> and the watchdog re-arms afterward to keep monitoring the next queue. Watch a
-> couple of real jobs complete cleanly, confirm the logs under
-> `C:\topaz-autostop\logs`, then flip `DryRun = $false` and re-run
-> `Install.ps1` + `Register-ScheduledTasks.ps1`. **`DryRun` only covers this
-> in-guest path** - the CloudWatch idle alarm and optional max-lifetime Lambda
-> from step 3-4 below are separate control-plane resources and will really stop
-> the box if the GPU goes idle during your test, even while `DryRun` is on. See
+> **Ship in DryRun first.** On a new deployment, set `DryRun = $true` in
+> `Config.ps1` before arming automation: the watchdog and stop sequence then
+> log every decision (including the resolved `StopStrategy` plan) but do
+> **not** power the box off, and the watchdog re-arms afterward to keep
+> monitoring the next queue. Run
+> [`Test-Deployment.ps1`](in-guest/Test-Deployment.ps1) for a GO/NO-GO
+> preflight check, watch a couple of real jobs complete cleanly, confirm the
+> logs under `C:\topaz-autostop\logs`, then flip `DryRun = $false` and re-run
+> `Install.ps1` + `Register-ScheduledTasks.ps1`. **This checked-in
+> `Config.ps1` already ships with `DryRun = $false`**, because this specific
+> instance has already been through that verification loop and had both
+> `StopStrategy` legs confirmed - see
+> [docs/11-deploying-on-this-instance.md](docs/11-deploying-on-this-instance.md)
+> for the evidence; treat that value as this box's own already-verified
+> state, not a default a new deployment should copy blindly. **`DryRun` only
+> covers the in-guest stop path** - the CloudWatch idle alarm and optional
+> max-lifetime Lambda from step 3-4 below are separate control-plane resources
+> and will really stop the box if the GPU goes idle during your test, even
+> while `DryRun` is on. See
 > [docs/05-phase3-stop-sequence.md](docs/05-phase3-stop-sequence.md) and
 > [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
@@ -214,8 +253,9 @@ within a defensible reading of that license:
 
 - **Single-user, GUI-only.** One operator, driving the Topaz GUI by hand.
 - **No CLI, ever.** Nothing in this repo invokes the Topaz CLI. The watchdog
-  detects completion by *observing* the GUI process and its `ffmpeg` children
-  and the output folder on disk - never by calling Topaz.
+  detects completion by *observing* the GUI process and its encoder-worker
+  descendants (`neuroserver.exe`/`ffmpeg.exe`, matched by ancestry) and the
+  output folder on disk - never by calling Topaz.
 
 Running Topaz on a cloud/virtualized instance is **the operator's own informed
 license decision.** This project does not grant any right to do so and does not
@@ -279,3 +319,5 @@ does.
 | [docs/08-appendix-a-corrections.md](docs/08-appendix-a-corrections.md) | Eight bugs / wrong claims removed from the prior report. |
 | [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.md) | Decided design boundaries (single-user GUI-only, one Export click, no robot). |
 | [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) | What CI checks (including `actionlint`), the auto-merge-to-main workflow and its test suite, and how to run the Pester and Lambda pytest suites locally. |
+| [docs/11-deploying-on-this-instance.md](docs/11-deploying-on-this-instance.md) | Instance-specific runbook: read-only prerequisite verification, fixing an IAM role-name mismatch and confirming shutdown behavior from an admin workstation, and safely arming `DryRun`. |
+| [docs/12-empirical-findings.md](docs/12-empirical-findings.md) | Live-measured process topology, `neuroserver`/`ffmpeg` invocation arguments, and the NTFS directory-length-vs-`WriteTransferCount` evidence behind `Config.ps1`'s worker/stall/completion settings. |

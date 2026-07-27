@@ -17,7 +17,8 @@ stay within a defensible reading of the license:
 - **No CLI, ever.** The Topaz EULA bans the CLI under a Personal License, and it
   names cloud / virtualization environments among its restrictions. Nothing in
   this repo calls the Topaz CLI; the watchdog detects completion purely by
-  *observing* the GUI process, its `ffmpeg` children, and the output folder.
+  *observing* the GUI process, its encoder-worker descendants
+  (`neuroserver.exe`/`ffmpeg.exe`, matched by ancestry), and the output folder.
 
 Running Topaz on a cloud/virtualized EC2 instance is **the operator's own informed
 license decision.** This project does not grant any right to do so and is not

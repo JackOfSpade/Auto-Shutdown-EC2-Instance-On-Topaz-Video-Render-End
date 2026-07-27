@@ -66,7 +66,20 @@ $scripts = @(
     'Config.ps1',
     'Watchdog.ps1',
     'Stop-Sequence.ps1',
-    'Push-GpuMetric.ps1'
+    'Push-GpuMetric.ps1',
+    # Runs at every boot: the instance-store scratch drive comes back RAW after
+    # each stop, and renders have nowhere to go until it is re-created.
+    'Initialize-ScratchDisk.ps1'
+)
+
+# Operator tools: useful to have alongside the pipeline so InstallDir is
+# self-contained (they dot-source Config.ps1 from their own directory), but
+# the pipeline runs fine without them. A missing one is therefore a WARNING,
+# not the hard install failure that a missing $scripts entry is.
+$optionalScripts = @(
+    'Register-TimedStop.ps1',
+    'Test-Deployment.ps1',
+    'Set-GoogleDriveAuth.ps1'
 )
 
 # Tracked separately from $warningCount below: a missing source or failed
@@ -108,6 +121,26 @@ foreach ($name in $scripts) {
 # still install nvidia-smi/aws later, before relying on the idle alarm), so
 # they must never turn an otherwise-clean install into a reported failure.
 $warningCount = 0
+
+foreach ($name in $optionalScripts) {
+    $src = Join-Path $PSScriptRoot $name
+    if (-not (Test-Path -LiteralPath $src)) {
+        Write-TopazLog -Component 'install' -Level 'WARN' `
+            -Message "Optional operator tool '$name' not found in '$PSScriptRoot'; skipping it."
+        $warningCount++
+        continue
+    }
+    try {
+        Copy-Item -LiteralPath $src -Destination $cfg.InstallDir -Force -ErrorAction Stop
+        Write-TopazLog -Component 'install' -Level 'INFO' `
+            -Message "Copied optional tool '$name' -> '$($cfg.InstallDir)'."
+    }
+    catch {
+        Write-TopazLog -Component 'install' -Level 'WARN' `
+            -Message "Failed to copy optional tool '$name': $($_.Exception.Message)"
+        $warningCount++
+    }
+}
 
 foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
     if (Get-Command $tool -ErrorAction SilentlyContinue) {

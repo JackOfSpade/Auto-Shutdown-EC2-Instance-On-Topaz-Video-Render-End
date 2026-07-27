@@ -182,6 +182,68 @@ Describe 'Test-TopazTempFile' {
     }
 }
 
+Describe 'Write-TopazLog output-stream hygiene' {
+
+    # WHAT THIS GUARDS. Write-TopazLog used to emit INFO lines with
+    # Write-Output. In PowerShell a function returns EVERYTHING written to the
+    # output stream, so any function that logged and then returned a value
+    # actually returned @('<log line>', $value) -- an array, not the value.
+    #
+    # That silently defeated the ephemeral-upload interlock in
+    # Stop-Sequence.ps1. The guard there is:
+    #
+    #     if ($cfg.OutputIsEphemeral -and ($uploadOk -eq $false)) { <refuse to stop> }
+    #
+    # With a polluted return, `$uploadOk -eq $false` evaluates as an ARRAY
+    # FILTER rather than a comparison: it yields @($false), which PowerShell
+    # unwraps to $false in a boolean context, so the branch never fired. A
+    # FAILED upload therefore read as success, and the instance would have
+    # stopped -- erasing the instance-store scratch volume and permanently
+    # destroying the render the upload had just failed to save.
+    #
+    # These tests fail if anyone routes Write-TopazLog back to the output
+    # stream. Do not "fix" them by changing the assertions.
+
+    It 'does not contaminate the return value of a function that logs then returns $false' {
+        function Get-TestFalseAfterLog {
+            Write-TopazLog -Component 'test' -Level 'INFO' -Message 'progress line'
+            return $false
+        }
+
+        $result = Get-TestFalseAfterLog
+
+        @($result).Count | Should -Be 1
+        $result | Should -BeOfType [bool]
+    }
+
+    It 'keeps "-eq $false" working as a COMPARISON, which is what the interlock relies on' {
+        function Get-TestFalseAfterLog2 {
+            Write-TopazLog -Component 'test' -Level 'INFO' -Message 'progress line'
+            return $false
+        }
+
+        $result = Get-TestFalseAfterLog2
+
+        # Both spellings appear in the stop path; both must detect the failure.
+        [bool]($result -eq $false) | Should -BeTrue
+        [bool](-not $result)       | Should -BeTrue
+    }
+
+    It 'does not contaminate a $true return either' {
+        function Get-TestTrueAfterLog {
+            Write-TopazLog -Component 'test' -Level 'INFO' -Message 'progress line'
+            Write-TopazLog -Component 'test' -Level 'INFO' -Message 'second line'
+            return $true
+        }
+
+        $result = Get-TestTrueAfterLog
+
+        @($result).Count | Should -Be 1
+        $result | Should -BeOfType [bool]
+        $result | Should -BeTrue
+    }
+}
+
 Describe 'Assert-ValidCompletionSignal' {
 
     It 'does not throw for WorkerOnly' {
@@ -209,8 +271,31 @@ Describe 'Assert-ValidCompletionSignal' {
 Describe 'Get-TopazAutoStopConfig' {
 
     It 'loads successfully with the default CompletionSignal (WorkerOnly)' {
+        # WorkerOnly is the default on THIS deployment for a measured reason
+        # (see Config.ps1's own comment): Amazon DCV encodes the remote display
+        # on the same GPU, running 14-49% with no render in progress. Under
+        # 'WorkerOrGpu' that alone was enough to log
+        # "Render active (worker=False gpu=21%)" and set SawActivity, which
+        # defeats the guard that stops a queue being completed before any
+        # render has begun -- i.e. it could power the box off under an operator
+        # who was merely setting up over DCV.
+        #
+        # This assertion is deliberately pinned to the shipped value: if
+        # someone flips the default back to a GPU-inclusive signal, they should
+        # have to come here and justify it against that measurement.
         { Get-TopazAutoStopConfig } | Should -Not -Throw
         (Get-TopazAutoStopConfig).CompletionSignal | Should -Be 'WorkerOnly'
+    }
+
+    It 'loads successfully with the default StopStrategy (Auto)' {
+        (Get-TopazAutoStopConfig).StopStrategy | Should -Be 'Auto'
+    }
+
+    It 'defaults WorkerNamesLike to the neuroserver.exe + ffmpeg.exe ARRAY (grandchild-aware ancestry match)' {
+        # A single string ('ffmpeg.exe') cannot describe the real Topaz
+        # process tree (GUI -> neuroserver.exe -> ffmpeg.exe) -- see
+        # WorkerNamesLike's own comment in Config.ps1.
+        (Get-TopazAutoStopConfig).WorkerNamesLike | Should -Be @('neuroserver.exe', 'ffmpeg.exe')
     }
 }
 
@@ -420,5 +505,106 @@ Describe 'Get-TopazStopNotification' {
             $result.Subject  | Should -Not -Match 'DRY\s?RUN'
             $result.Message  | Should -Not -Match 'DRY\s?RUN'
         }
+    }
+}
+
+Describe 'Assert-ValidStopStrategy' {
+
+    It 'does not throw for Ec2ApiStop' {
+        { Assert-ValidStopStrategy -Strategy 'Ec2ApiStop' } | Should -Not -Throw
+    }
+
+    It 'does not throw for GuestShutdown' {
+        { Assert-ValidStopStrategy -Strategy 'GuestShutdown' } | Should -Not -Throw
+    }
+
+    It 'does not throw for Auto' {
+        { Assert-ValidStopStrategy -Strategy 'Auto' } | Should -Not -Throw
+    }
+
+    It 'throws an actionable error naming the bad value for a typo''d StopStrategy' {
+        { Assert-ValidStopStrategy -Strategy 'Ec2ApiStp' } | Should -Throw '*Ec2ApiStp*'
+    }
+
+    It 'names all three valid values in the error message' {
+        { Assert-ValidStopStrategy -Strategy 'bogus' } |
+            Should -Throw '*Ec2ApiStop*GuestShutdown*Auto*'
+    }
+}
+
+Describe 'Resolve-StopPlan' {
+    # 'Auto' must try Ec2ApiStop FIRST: it is the only action that PROVABLY
+    # ends billing. A guest shutdown ends billing only when
+    # InstanceInitiatedShutdownBehavior happens to be 'stop' -- ordering the
+    # cheap-but-unreliable action first would, on a box where that is not
+    # true, either destroy the box (if it were 'terminate') or quietly keep
+    # billing it forever. See Resolve-StopPlan's own comment in Config.ps1.
+
+    It "returns exactly @('Ec2ApiStop', 'GuestShutdown') IN THAT ORDER for 'Auto'" {
+        $result = Resolve-StopPlan -Strategy 'Auto'
+        @($result).Count | Should -Be 2
+        $result | Should -Be @('Ec2ApiStop', 'GuestShutdown')
+    }
+
+    # These single-strategy cases guard against PowerShell's own scalar
+    # collapse: a function that `return`s a one-element array hands the
+    # caller a bare STRING instead unless the return uses the leading unary
+    # comma (see Resolve-StopPlan's own comment) -- Stop-Sequence.ps1's `foreach
+    # ($action in $plan)` would still "work" against a bare string (iterating
+    # its characters would not even throw), silently skipping the configured
+    # stop action entirely. Asserting -is [array] here is what would catch a
+    # regression that drops the comma.
+
+    It "returns a single-element ARRAY (not a collapsed scalar) for 'Ec2ApiStop'" {
+        $result = Resolve-StopPlan -Strategy 'Ec2ApiStop'
+        $result -is [array] | Should -Be $true
+        @($result).Count | Should -Be 1
+        $result[0] | Should -Be 'Ec2ApiStop'
+    }
+
+    It "returns a single-element ARRAY (not a collapsed scalar) for 'GuestShutdown'" {
+        $result = Resolve-StopPlan -Strategy 'GuestShutdown'
+        $result -is [array] | Should -Be $true
+        @($result).Count | Should -Be 1
+        $result[0] | Should -Be 'GuestShutdown'
+    }
+}
+
+Describe 'Build-WorkerWqlFilter' {
+
+    It 'OR-joins multiple patterns into a single WQL filter fragment' {
+        Build-WorkerWqlFilter -Patterns @('neuroserver.exe', 'ffmpeg.exe') |
+            Should -Be "Name LIKE 'neuroserver.exe' OR Name LIKE 'ffmpeg.exe'"
+    }
+
+    It 'builds a filter with no OR for a single pattern' {
+        Build-WorkerWqlFilter -Patterns @('neuroserver.exe') | Should -Be "Name LIKE 'neuroserver.exe'"
+    }
+
+    It "escapes an embedded single quote by DOUBLING it (WQL's own escaping rule)" {
+        # Without this, a pattern containing an apostrophe would terminate the
+        # WQL string literal early and produce a malformed query -- which
+        # Get-CimInstance surfaces as a thrown exception, i.e. the worker
+        # signal reads "unknown" on EVERY poll and the watchdog freezes
+        # forever. See Build-WorkerWqlFilter's own comment in Config.ps1.
+        Build-WorkerWqlFilter -Patterns @("weird'name.exe") | Should -Be "Name LIKE 'weird''name.exe'"
+    }
+
+    It 'drops whitespace-only entries but still builds a filter from the remaining usable patterns' {
+        # Deliberately whitespace ('   ', a tab), not a literal '' -- a
+        # genuinely EMPTY string element trips PowerShell's own Mandatory
+        # parameter binding for -Patterns (a ParameterBindingValidationException
+        # thrown before Build-WorkerWqlFilter's body ever runs, since the
+        # parameter has no [AllowEmptyString()]), which is a DIFFERENT thing
+        # from the whitespace-filtering this function's own body performs.
+        Build-WorkerWqlFilter -Patterns @('ffmpeg.exe', '   ', "`t") | Should -Be "Name LIKE 'ffmpeg.exe'"
+    }
+
+    It 'throws when every supplied pattern is whitespace-only (an empty filter would match EVERY process on the box)' {
+        { Build-WorkerWqlFilter -Patterns @('   ', "`t") } | Should -Throw '*no non-empty*'
+    }
+
+    It 'throws when Patterns is an empty array' {
+        { Build-WorkerWqlFilter -Patterns @() } | Should -Throw '*no non-empty*'
     }
 }

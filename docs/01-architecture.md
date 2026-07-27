@@ -8,24 +8,25 @@
                  EC2 GPU instance  -  Windows Server, Amazon DCV display
   +-------------------------------------------------------------------------+
   |                                                                         |
-  |   Topaz Video AI (GUI)  --spawns-->  ffmpeg.exe  (encode worker)        |
-  |        |                                  |                             |
-  |        | observed via CIM                 | writes finished files       |
-  |        v   (Win32_Process)                v                             |
+  |   Topaz Video AI (GUI) --spawns--> neuroserver.exe --spawns--> ffmpeg.exe |
+  |        |                           (per-queue-item      (GRANDCHILD of   |
+  |        | observed via CIM           worker, --once)      the GUI; encode |
+  |        v   (Win32_Process, matched by ANCESTRY -- see docs/12)  phase)   |
   |   +---------------+   queue done /    +----------------+                 |
-  |   | Watchdog.ps1  |   stalled  AND    |  D:\Exports     |                |
+  |   | Watchdog.ps1  |   stalled  AND    |  OutputDir      |                |
   |   | (SYSTEM task) |   files unlocked  |  (output dir)   |                |
   |   +-------+-------+                   +----------------+                 |
   |           | hands off (-Reason completed|stalled)                       |
   |           v                                                             |
   |   +--------------------+                                                 |
-  |   | Stop-Sequence.ps1  |  optional S3 sync + SNS, then Stop-Computer     |
-  |   +---------+----------+                                                 |
-  |             | guest OS shutdown                                         |
+  |   | Stop-Sequence.ps1  |  optional S3 sync + SNS, then the StopStrategy  |
+  |   +---------+----------+  plan: Ec2ApiStop, falling back to             |
+  |             |             GuestShutdown ('Auto' is the default)         |
   +-------------+---------------------------------------------------------- +
                 v
-   InstanceInitiatedShutdownBehavior = stop   -->   INSTANCE STOPS
-        PRIMARY STOP: no AWS API call, no credentials on the box
+   ec2:StopInstances (provably ends billing)   -->   INSTANCE STOPS
+   falls back to Stop-Computer -Force, which only STOPS (never terminates)
+   the instance when InstanceInitiatedShutdownBehavior = stop
 
 
   OUT-OF-BAND FALLBACK  (separate control plane; never shares fate w/ guest)
@@ -45,7 +46,9 @@
 There are three independent ways the box can stop, ranked by how normal they are:
 
 1. **Primary (in-guest, event-driven):** `Watchdog.ps1` -> `Stop-Sequence.ps1`
-   -> guest shutdown -> instance stop. This is what fires on every clean job.
+   -> the `StopStrategy` plan (`ec2:StopInstances` first, guest shutdown as
+   fallback, under the default `'Auto'`) -> instance stop. This is what fires
+   on every clean job.
 2. **Fallback (out-of-band, GPU-idle):** the CloudWatch alarm on the custom GPU
    metric stops the box after 30 minutes of sustained sub-5% GPU. This fires
    only when the primary path failed to.
@@ -59,28 +62,58 @@ alarm (never idle) is still caught by the wall-clock cap.
 
 ## Design principles (expanded)
 
-### 1. The primary stop needs no AWS credentials on the box
+### 1. The stop tries the API first, and keeps the credential-free guest shutdown as its fallback
 
-The instance stops itself by **shutting down its own OS** - a `Stop-Computer
--Force` from `Stop-Sequence.ps1`, equivalent to `shutdown /s /t 0`. What makes
-that a *stop* instead of a *terminate* is a one-time control-plane setting:
+`Stop-Sequence.ps1` follows an ordered `StopStrategy` plan
+(`Resolve-StopPlan` in [`Config.ps1`](../in-guest/Config.ps1)) rather than a
+single fixed action:
 
-```
-aws ec2 modify-instance-attribute --instance-initiated-shutdown-behavior stop
-```
+- **`Ec2ApiStop`** - call `ec2:StopInstances` against itself. The **only**
+  action that *provably* ends billing.
+- **`GuestShutdown`** - `Stop-Computer -Force` (equivalent to
+  `shutdown /s /t 0`). Needs **no AWS credentials on the box** at all - what
+  makes it a *stop* instead of a *terminate* is a one-time control-plane
+  setting, `InstanceInitiatedShutdownBehavior=stop`:
 
-(set by [`control-plane/01-set-shutdown-behavior.sh`](../control-plane/01-set-shutdown-behavior.sh)).
+  ```
+  aws ec2 modify-instance-attribute --instance-initiated-shutdown-behavior stop
+  ```
+
+  (set by [`control-plane/01-set-shutdown-behavior.sh`](../control-plane/01-set-shutdown-behavior.sh)).
+- **`'Auto'`** (the default) - tries `Ec2ApiStop` first and falls back to
+  `GuestShutdown` if the API call is denied or does not take effect within
+  `StopVerifySec`.
+
+**Why the API leg was added, honestly.** The original design of this project
+was exactly "no AWS credentials on the box, ever": a guest shutdown alone,
+relying entirely on `InstanceInitiatedShutdownBehavior=stop`. That reasoning
+still holds, and the guest-shutdown leg is **retained**, unconditionally, as
+the fallback - it is what fires whenever the API call is denied. But a guest
+shutdown only ends billing when that attribute *happens* to be `stop`, and
+that fact **cannot be verified from inside the guest** without an extra
+permission (`ec2:DescribeInstanceAttribute`) that the original zero-credential
+design also declined to grant. Rather than ship an auto-stop pipeline that can
+silently fail to stop billing with no way to detect it, this box now also
+carries a narrowly-scoped, tag-conditioned `ec2:StopInstances` grant
+(optional, `INCLUDE_EC2_STOP=1` at the control-plane level - see
+[Phase 1](03-phase1-instance-prep.md)) and attempts it first, precisely
+because it is the one action whose success is unambiguous.
 
 Consequences:
 
-- No `ec2:StopInstances` permission is required on the box for the normal path.
-- No AWS access keys are stored on the instance. The instance role
-  ([`02-create-iam-role.sh`](../control-plane/02-create-iam-role.sh)) grants only
-  `cloudwatch:PutMetricData` for the metric publisher; the `ec2:StopInstances`
-  grant is optional (`INCLUDE_EC2_STOP=1`) and tag-scoped, provided only for
-  operators who want a belt-and-suspenders API stop path.
-- The only AWS calls the box makes at stop time are the *optional* best-effort
-  S3 sync and SNS publish, and a failure in either never blocks the power-off.
+- The instance role ([`02-create-iam-role.sh`](../control-plane/02-create-iam-role.sh))
+  still grants only `cloudwatch:PutMetricData` by default; the
+  `ec2:StopInstances` grant remains *optional* (`INCLUDE_EC2_STOP=1`) and
+  tag-scoped (`AutoStopEligible=true`) - a deliberate trade-off, not silent
+  scope creep. An operator who wants the original zero-credential posture can
+  set `StopStrategy='GuestShutdown'` in `Config.ps1` and skip the grant
+  entirely.
+- The only OTHER AWS calls the box makes at stop time are the *optional*
+  best-effort S3 sync and SNS publish, and a failure in either never blocks
+  the power-off.
+- See [docs/11-deploying-on-this-instance.md](11-deploying-on-this-instance.md)
+  for how both legs were verified on this specific instance, and
+  [Phase 3](05-phase3-stop-sequence.md) for the full ordering logic.
 
 ### 2. The fallback is out-of-band
 
@@ -102,16 +135,25 @@ fire. Any reliable fallback **must** live outside the guest. See
 The watchdog never says "sleep N minutes, then assume done." It decides from
 observable state:
 
-- **Child-`ffmpeg` lifecycle.** Topaz spawns `ffmpeg.exe` children to encode a
-  queued job. The watchdog matches `ffmpeg` processes whose `ParentProcessId`
-  is a live Topaz GUI PID - and keeps counting a worker whose GUI parent
-  crashed or was closed until the worker itself exits, so a dead GUI is never
-  misread as "queue complete" mid-encode. "Queue complete" = no active render
-  for `DebounceSec` (the debounce absorbs transient live-preview children and
-  ordinary inter-clip lulls).
-- **Stall detection.** If a render is active but the output folder's byte total
-  has not *changed* (grown or shrunk) for `StallSec`, the job is treated as
-  stalled and the box stops anyway.
+- **Worker-descendant lifecycle.** Topaz spawns `neuroserver.exe` (a
+  per-queue-item worker) as a child of the GUI, and that process in turn
+  spawns `ffmpeg.exe` as **its own** child - so `ffmpeg` is a *grandchild* of
+  the GUI, never a direct child (see
+  [docs/12-empirical-findings.md](12-empirical-findings.md)). The watchdog
+  therefore matches worker processes by **ancestry** (any descendant of a live
+  Topaz GUI PID, to unlimited depth), not by direct parentage, and keeps
+  counting a worker whose GUI parent crashed or was closed until the worker
+  itself exits, so a dead GUI is never misread as "queue complete" mid-encode.
+  "Queue complete" = no active render for `DebounceSec` (the debounce absorbs
+  transient live-preview children and ordinary inter-clip lulls).
+- **Stall detection.** Progress is the *union* of two signals: the output
+  folder's byte total, and the matched workers' own cumulative disk I/O
+  counters. The byte-total signal alone is unreliable on NTFS - a file's
+  directory-entry length can sit frozen for many minutes while a writer holds
+  it open, measured at 466 s straight on this deployment (see
+  [docs/12-empirical-findings.md](12-empirical-findings.md)) - so only when
+  *neither* signal has changed for `StallSec` is the job treated as stalled
+  and the box stopped anyway.
 - **File-unlock gate.** Before handing off to the stop step, the watchdog waits
   (up to `UnlockTimeoutMin`) for every output file - other than a `_temp`
   scratch file, anchored so a real deliverable merely containing that text is
@@ -141,7 +183,7 @@ automated.
 |---------|-----------|-------|
 | Turn guest shutdown into an instance stop | `InstanceInitiatedShutdownBehavior=stop` | Control plane (once) |
 | Detect render complete / stalled | `Watchdog.ps1` (SYSTEM task) | In-guest |
-| Perform the stop | `Stop-Sequence.ps1` -> `Stop-Computer -Force` | In-guest |
+| Perform the stop | `Stop-Sequence.ps1` -> `StopStrategy` plan (`ec2:StopInstances`, falling back to `Stop-Computer -Force`) | In-guest |
 | Publish GPU utilization | `Push-GpuMetric.ps1` (SYSTEM task) | In-guest |
 | Idle safety net | `topaz-gpu-idle-autostop-<instance-id>` alarm (per-instance) | Control plane |
 | Wall-clock cap | `topaz-max-lifetime-stop-<instance-id>` Lambda (per-instance) | Control plane (optional) |

@@ -48,6 +48,100 @@ function Assert-ValidCompletionSignal {
     }
 }
 
+function Assert-ValidStopStrategy {
+    <#
+    .SYNOPSIS
+        Pure: throws a clear, actionable error if $Strategy is not one of the
+        three StopStrategy values Resolve-StopPlan accepts.
+    .DESCRIPTION
+        Mirrors Assert-ValidCompletionSignal. A typo'd StopStrategy would
+        otherwise surface only at the very end of a render, inside
+        Stop-Sequence.ps1, at the exact moment the pipeline is supposed to
+        save money -- and would silently produce an EMPTY stop plan, meaning
+        the box runs forever. Validate at config load instead, so the failure
+        is loud and immediate.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Strategy)
+
+    $validStrategies = @('Ec2ApiStop', 'GuestShutdown', 'Auto')
+    if ($validStrategies -notcontains $Strategy) {
+        throw "Get-TopazAutoStopConfig: StopStrategy '$Strategy' is invalid. Valid values are: $($validStrategies -join ', ')."
+    }
+}
+
+function Resolve-StopPlan {
+    <#
+    .SYNOPSIS
+        Pure: the ORDERED list of stop actions to attempt for a given
+        StopStrategy. No I/O, so it is fully unit-testable.
+    .PARAMETER Strategy
+        'Ec2ApiStop' | 'GuestShutdown' | 'Auto'.
+    .DESCRIPTION
+        'Auto' puts Ec2ApiStop FIRST and GuestShutdown second, deliberately.
+        Only the API call provably ends billing; a guest shutdown ends billing
+        only when InstanceInitiatedShutdownBehavior happens to be 'stop'.
+        Ordering the cheap-but-unreliable action first would, on a box where
+        that attribute is 'terminate' or where the guest shutdown simply does
+        not stop the instance, either destroy the box or quietly keep billing
+        it. Trying the authoritative action first and degrading to the
+        best-effort one is the safe direction.
+    .OUTPUTS
+        A string array of action names, in the order they should be attempted.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Ec2ApiStop', 'GuestShutdown', 'Auto')][string]$Strategy
+    )
+
+    # The leading unary comma is required, not decorative -- see
+    # Build-AwsCliArgs: a single-element array returned from a PowerShell
+    # function collapses to a bare string, and callers here iterate the
+    # result with foreach and index into it.
+    switch ($Strategy) {
+        'Ec2ApiStop'    { return , @('Ec2ApiStop') }
+        'GuestShutdown' { return , @('GuestShutdown') }
+        default         { return , @('Ec2ApiStop', 'GuestShutdown') }
+    }
+}
+
+function Build-WorkerWqlFilter {
+    <#
+    .SYNOPSIS
+        Pure: build the WQL filter that selects every configured worker
+        process name, from the WorkerNamesLike array. No I/O.
+    .PARAMETER Patterns
+        One or more WQL LIKE patterns, e.g. @('neuroserver.exe','ffmpeg%').
+    .DESCRIPTION
+        The worker setting became an ARRAY (a single name cannot describe the
+        real Topaz process tree -- see Config's WorkerNamesLike comment), so
+        the single interpolated "Name LIKE '<x>'" filter the watchdog used to
+        build no longer suffices. Patterns are OR-joined.
+
+        Single quotes inside a pattern are doubled, which is WQL's own
+        escaping rule. Without that, a pattern containing an apostrophe would
+        terminate the string literal early and produce a malformed query --
+        which Get-CimInstance surfaces as a thrown exception, i.e. the worker
+        signal reads "unknown" on EVERY poll and the watchdog freezes forever.
+    .OUTPUTS
+        A WQL fragment, e.g. "Name LIKE 'neuroserver.exe' OR Name LIKE 'ffmpeg%'".
+        Throws if no usable pattern is supplied -- an empty filter would match
+        EVERY process on the box and make the watchdog think a render is
+        permanently active.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Patterns
+    )
+
+    $usable = @($Patterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($usable.Count -eq 0) {
+        throw "Build-WorkerWqlFilter: no non-empty worker name pattern supplied. Set WorkerNamesLike in Config.ps1."
+    }
+
+    return (($usable | ForEach-Object { "Name LIKE '$($_ -replace "'", "''")'" }) -join ' OR ')
+}
+
 function Get-TopazAutoStopConfig {
     [CmdletBinding()]
     param()
@@ -58,18 +152,68 @@ function Get-TopazAutoStopConfig {
         # ------------------------------------------------------------------
 
         # Folder that Topaz writes finished exports into. The watchdog treats
-        # "no growth here" (while a render is active) as a stall.
-        OutputDir        = 'D:\Exports'
+        # "no progress" (while a render is active) as a stall -- but see
+        # Get-WorkerIoBytes in Watchdog.ps1: growth of THIS folder is only a
+        # secondary progress signal, because NTFS does not refresh a file's
+        # directory-entry length while a writer holds the handle open.
+        # Renders land on the INSTANCE-STORE scratch drive, not on C:. It is
+        # free (included in the instance price), much faster than gp3 EBS, and
+        # ~419 GB -- enough for the ~105 GB peak a 10-minute 4K DNxHR HQX
+        # export needs once Topaz's final mux pass writes its full second copy.
+        #
+        # THE TRADE: this volume is ERASED on every instance stop. That is only
+        # safe because OutputIsEphemeral below makes Stop-Sequence.ps1 refuse to
+        # stop until the upload has been verified. Never point OutputDir at an
+        # ephemeral volume without that interlock armed.
+        OutputDir        = 'D:\Renders'
+
+        # Marks OutputDir as living on storage that does not survive a stop.
+        # When $true, a failed/absent upload BLOCKS the stop instead of being
+        # best-effort: losing the box's uptime is recoverable, losing a
+        # multi-hour render is not.
+        OutputIsEphemeral = $true
+
+        # Scratch-drive provisioning, consumed by Initialize-ScratchDisk.ps1.
+        # The size bounds are a safety guard on disk SELECTION, not a
+        # requirement -- see that script's .NOTES for the full filter.
+        ScratchDriveLetter = 'D'
+        ScratchVolumeLabel = 'RenderScratch'
+        ScratchMinBytes    = 300GB
+        ScratchMaxBytes    = 600GB
+
+        # NOTE ON SOURCE FOOTAGE. The upload is scoped to OutputDir alone, so
+        # anything the operator leaves elsewhere on the scratch volume -- at
+        # D:\ root, say -- is simply never uploaded. That is the whole reason
+        # renders go in a SUBDIRECTORY rather than at the root: it separates
+        # "things to upload" from "things that are only here to be read"
+        # without needing to guess which files are outputs.
+        #
+        # The entire volume is still erased on every stop, source footage
+        # included. That is accepted and deliberate.
 
         # WMI/CIM LIKE pattern that matches the Topaz GUI process name.
         # Covers both 'Topaz Video.exe' and 'Topaz Video AI.exe' (rebrand-safe).
         TopazNameLike    = 'Topaz Video%'
 
-        # WMI/CIM LIKE pattern that matches the encoder WORKER process Topaz
-        # spawns per export job. Historically 'ffmpeg.exe'. Kept configurable
-        # because the exact worker name is version-dependent; confirm it in
-        # Phase 0. Use a LIKE pattern (e.g. 'ffmpeg%') if the name varies.
-        WorkerNameLike   = 'ffmpeg.exe'
+        # WMI/CIM LIKE pattern(s) matching the WORKER process(es) Topaz spawns
+        # to service an export job. An ARRAY, because a single name is not
+        # enough on current Topaz builds: the observed topology is
+        #
+        #     Topaz Video.exe  ->  neuroserver.exe  ->  ffmpeg.exe
+        #
+        # i.e. ffmpeg is a GRANDCHILD of the GUI, not a child, and it does not
+        # even exist for the first several minutes of a job while neuroserver
+        # runs its analysis pass. neuroserver.exe is the load-bearing signal:
+        # it is spawned with --once, so exactly one process lives for exactly
+        # one queue item, spanning both the analysis and the encode. ffmpeg is
+        # kept as a second, corroborating signal. Matching is by ANCESTRY (any
+        # descendant of a live GUI), not by direct parentage -- see
+        # Resolve-ProcessDescendants in Watchdog.ps1.
+        #
+        # Each entry is a WQL LIKE pattern, so '%' wildcards are allowed
+        # (e.g. 'ffmpeg%'). See docs/12-empirical-findings.md for the measured
+        # process tree this default is derived from.
+        WorkerNamesLike  = @('neuroserver.exe', 'ffmpeg.exe')
 
         # Fragment found in Topaz scratch/temporary files. A file is treated
         # as a scratch file (and ignored by the "outputs unlocked?" check,
@@ -95,6 +239,13 @@ function Get-TopazAutoStopConfig {
         #                   spawns, at the cost of needing a sensible
         #                   GpuBusyPercent. Recommended if the worker process is
         #                   not reliably a child of the GUI on your version.
+        # DEFAULT IS 'WorkerOrGpu' here deliberately. The two signals fail in
+        # different directions, and the asymmetry of the consequences decides
+        # it: a false "idle" powers the box off MID-RENDER and destroys hours
+        # of GPU time, while a false "busy" merely leaves the box up a little
+        # longer (and the out-of-band CloudWatch idle alarm exists precisely
+        # to catch that). Requiring BOTH signals to go quiet before calling a
+        # queue complete is therefore the correct bias.
         # Every mode gracefully degrades: both the worker and GPU signals are
         # three-valued ($true/$false/$null, $null = "could not be read this
         # poll"). If a signal is $null, it simply stops contributing per
@@ -102,6 +253,25 @@ function Get-TopazAutoStopConfig {
         # trusted, the overall result is itself $null (unknown) and the
         # watchdog freezes its idle/stall bookkeeping for that poll rather
         # than guessing.
+        # MEASURED 2026-07-27, and the reason this is 'WorkerOnly' rather than
+        # 'WorkerOrGpu': on this box Amazon DCV encodes the remote display on
+        # the SAME GPU, and while an operator is connected that alone runs at
+        # 14-49% -- far above GpuBusyPercent. The watchdog logged
+        # "Render active (worker=False gpu=21%)" with no render running at all.
+        #
+        # That is not merely noisy, it is harmful: the GPU signal sets the
+        # internal SawActivity flag, which defeats the deliberate guard that
+        # stops the watchdog from ever completing a queue before a render has
+        # actually begun. The failure mode is an operator connecting over DCV,
+        # spending twenty minutes setting a project up, pausing for five, and
+        # having the box powered off underneath them.
+        #
+        # The GPU signal only existed as a hedge against unreliable worker
+        # detection. Worker detection is now by ANCESTRY and has been validated
+        # end-to-end across two complete queue items (analysis phase, encode
+        # phase, and the standalone mux pass), so the hedge is all cost and no
+        # benefit here. Switch back to 'WorkerOrGpu' only on a box where the
+        # GPU is NOT shared with the remote-display encoder.
         CompletionSignal = 'WorkerOnly'
 
         # GPU utilization (%) at or above which the GPU counts as "actively
@@ -119,16 +289,43 @@ function Get-TopazAutoStopConfig {
         # How often the watchdog polls process + folder state (seconds).
         PollSec          = 15
 
-        # With a render no longer active for this long (and one having been
-        # seen), the queue is considered complete. Inter-clip model-load lulls
-        # typically run 45-90s; 120 clears that with margin so a mid-queue lull
-        # is never misread as "done" (a false "complete" here stops the box
-        # mid-queue), at the cost of only ~1 extra idle minute per session.
-        DebounceSec      = 120
+        # A worker must be CONTINUOUSLY present for this long before the
+        # watchdog accepts that a render has actually begun (before it sets
+        # SawActivity and therefore becomes willing to ever declare the queue
+        # complete).
+        #
+        # MEASURED 2026-07-27. Topaz spawns short-lived ffmpeg/ffprobe helpers
+        # for previews and thumbnails whenever the operator interacts with the
+        # GUI. One of those armed the watchdog at 05:49:11 and was gone by
+        # 05:49:43 -- under 32 seconds -- after which the box sat idle, ran the
+        # 300s debounce down, and came within ~90 seconds of stopping an
+        # instance on which no render had ever run.
+        #
+        # The existing DebounceSec protects the far side of the render (do not
+        # call it finished too early). This protects the near side (do not
+        # call it started at all). A real job's neuroserver.exe lives for
+        # minutes to hours, so 90s separates the two cases with enormous
+        # margin while costing a genuine render nothing -- SawActivity simply
+        # arms 90 seconds in, long before any queue could drain.
+        ArmSec           = 90
 
-        # A render is active but the output folder has not grown for this long
-        # => treat as a stall (broken job) and stop anyway.
-        StallSec         = 900
+        # With a render no longer active for this long (and one having been
+        # seen), the queue is considered complete. This is the gap between two
+        # queue items: the GUI finishes one export, tears down its neuroserver
+        # worker, and only then spawns the next one. A false "complete" here
+        # powers the box off MID-QUEUE, so the value is deliberately generous:
+        # 300s buys five idle minutes at the end of a session and costs
+        # essentially nothing, versus losing an entire unrendered queue.
+        DebounceSec      = 300
+
+        # A render is active but has made NO measurable progress for this long
+        # => treat as a stall (broken job) and stop anyway. Progress is the
+        # union of two signals (see Get-NextWatchdogState): the worker
+        # processes' cumulative disk I/O counters, and the output folder byte
+        # total. 1800s is intentionally generous because a healthy job can
+        # legitimately spend many minutes in neuroserver's analysis pass
+        # before the encoder starts producing output.
+        StallSec         = 1800
 
         # After "done", the watchdog waits up to this many minutes for every
         # output file to become unlocked before it hands off to the stop step.
@@ -177,14 +374,96 @@ function Get-TopazAutoStopConfig {
         # `aws s3 sync` against OutputDir BEFORE powering off. Empty = skip.
         S3SyncTarget     = ''
 
+        # ------------------------------------------------------------------
+        # UPLOAD BEFORE STOP  (rclone -> Google Drive)
+        # ------------------------------------------------------------------
+
+        # rclone destination for finished renders. Empty = no upload step.
+        # When OutputIsEphemeral is $true this is effectively MANDATORY: it is
+        # the only thing that gets a render off a volume that is about to be
+        # erased.
+        #
+        # 'gdrive:temp' is an EXISTING folder at the root of the operator's
+        # My Drive. rclone would happily create a missing destination folder,
+        # which is exactly how a typo silently ends up delivering renders to a
+        # folder nobody is watching -- so if this is ever changed, confirm the
+        # new path with `rclone lsd gdrive: --config <RcloneConfigPath>` first.
+        UploadTarget     = 'gdrive:temp'
+
+        # Full path to rclone.exe. Resolved explicitly rather than via PATH
+        # because the stop runs as SYSTEM, whose PATH and profile differ from
+        # the interactive operator's.
+        RclonePath       = 'C:\Program Files\rclone\rclone.exe'
+
+        # rclone's config holds the Google OAuth refresh token. SYSTEM's
+        # %APPDATA% is C:\Windows\System32\config\systemprofile\..., which is
+        # NOT where an interactive `rclone config` writes. Pointing both at one
+        # explicit path is what stops "works when I run it, fails from the
+        # scheduled task".
+        RcloneConfigPath = 'C:\topaz-autostop\rclone.conf'
+
+        # Bound on the whole upload. A 10-minute 4K DNxHR HQX render is ~52 GB;
+        # at ~100 Mbps to Drive that is ~70 minutes, so this is deliberately
+        # generous. On timeout the upload counts as FAILED, which (with
+        # OutputIsEphemeral) blocks the stop rather than discarding the render.
+        UploadTimeoutSec = 14400
+
         # If set to an SNS topic ARN, Stop-Sequence.ps1 publishes a best-effort
         # "render complete / stalled" notification before stopping. Empty = skip.
         SnsTopicArn      = ''
 
+        # ------------------------------------------------------------------
+        # HOW THE STOP IS PERFORMED
+        # ------------------------------------------------------------------
+
+        # The original design of this project assumed a plain guest shutdown
+        # would stop the instance, because InstanceInitiatedShutdownBehavior
+        # was set to 'stop' at the control plane. That assumption does NOT
+        # hold everywhere, and where it fails it fails EXPENSIVELY: the guest
+        # powers off, the operator sees a dark box, and AWS keeps billing the
+        # still-'running' instance. On this deployment a normal Windows
+        # shutdown was observed NOT to stop the instance.
+        #
+        # So the stop method is explicit and ordered:
+        #   'Ec2ApiStop'    - call ec2:StopInstances against ourselves. This is
+        #                     the only method that PROVABLY ends billing. It
+        #                     requires the instance role to grant
+        #                     ec2:StopInstances on this instance.
+        #   'GuestShutdown' - Stop-Computer -Force. Ends billing ONLY if
+        #                     InstanceInitiatedShutdownBehavior=stop.
+        #   'Auto'          - try Ec2ApiStop first; fall back to GuestShutdown
+        #                     if the API call is denied or fails. DEFAULT.
+        #
+        # See Resolve-StopPlan below for the pure ordering logic, and
+        # docs/11-deploying-on-this-instance.md for how to grant the
+        # permission this needs.
+        StopStrategy     = 'Auto'
+
+        # After issuing an Ec2ApiStop, how long to keep the process alive
+        # waiting for the hypervisor to actually tear us down before
+        # concluding the call did not take effect and escalating to the next
+        # action in the plan.
+        #
+        # MEASURED 2026-07-27: this was 90s and that was TOO SHORT. An accepted
+        # ec2:StopInstances does not kill the instance immediately -- AWS first
+        # asks the guest OS to shut down gracefully and only forces it after
+        # several minutes. A Windows Server guest with the Topaz GUI open takes
+        # longer than 90s to get there, so the watchdog wrongly concluded the
+        # API stop had failed and escalated to Stop-Computer -Force. The box
+        # stopped either way, but the log recorded a false diagnosis
+        # ("Still running 90s after an accepted ec2:StopInstances") that would
+        # send the next person debugging a perfectly healthy IAM grant.
+        # 300s comfortably covers AWS's graceful-shutdown window.
+        StopVerifySec    = 300
+
         # Safety switch: when $true, the watchdog + stop sequence log the
-        # decision but DO NOT actually power the instance off. Flip to $false
-        # once you have watched a couple of real jobs complete cleanly.
-        DryRun           = $true
+        # decision but DO NOT actually stop the instance. Flip to $false
+        # once you have watched a couple of real jobs complete cleanly AND
+        # you have confirmed a real stop path exists (see Test-Deployment.ps1
+        # -- if neither ec2:StopInstances is granted nor
+        # InstanceInitiatedShutdownBehavior is 'stop', arming this changes
+        # nothing except that you stop getting told about it).
+        DryRun           = $false
 
         # ------------------------------------------------------------------
         # SCHEDULED TASK NAMES (used by Register-ScheduledTasks.ps1)
@@ -192,9 +471,28 @@ function Get-TopazAutoStopConfig {
 
         WatchdogTaskName = 'TopazAutoStop-Watchdog'
         MetricTaskName   = 'TopazAutoStop-GpuMetric'
+
+        # Boot task that re-creates the instance-store scratch drive. It must
+        # exist for OutputDir to exist at all, since that volume is wiped on
+        # every stop.
+        ScratchTaskName  = 'TopazAutoStop-ScratchInit'
+
+        # One-shot wall-clock hard stop registered by Register-TimedStop.ps1.
+        # This is the in-guest equivalent of the optional max-lifetime Lambda,
+        # for deployments where the control plane cannot be reached to deploy
+        # that Lambda. It is a COST BACKSTOP, not a substitute for the
+        # watchdog: it fires on a timer regardless of whether a render is
+        # still running.
+        TimedStopTaskName = 'TopazAutoStop-TimedStop'
     }
 
     Assert-ValidCompletionSignal -Signal $config.CompletionSignal
+    Assert-ValidStopStrategy -Strategy $config.StopStrategy
+
+    # Fail loudly at config load rather than deep in the poll loop: an empty
+    # worker pattern list would make Build-WorkerWqlFilter throw on every
+    # single poll, freezing the watchdog for the life of the instance.
+    [void](Build-WorkerWqlFilter -Patterns $config.WorkerNamesLike)
 
     return $config
 }
@@ -221,10 +519,27 @@ function Write-TopazLog {
     $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $line = "[$stamp] [$Level] $Message"
 
+    # INFO goes to the INFORMATION stream, never the output stream.
+    #
+    # This is not a style preference, it is a correctness requirement. In
+    # PowerShell a function returns everything written to the output stream, so
+    # a function that both logs and returns a value used to return
+    # @('<log line>', '<log line>', $true) instead of $true. Callers that
+    # discarded the result with [void] never noticed -- but the moment one
+    # depended on it, the comparison silently broke:
+    #
+    #     $ok = Invoke-TopazRenderUpload ...   # -> @('...INFO...', $false)
+    #     if ($ok -eq $false) { ... }          # -> @($false) -> FALSY -> never fires
+    #
+    # That defeated the ephemeral-upload interlock in Stop-Sequence.ps1: a
+    # failed upload would have been read as success and the instance stopped,
+    # erasing the render it had failed to save. Write-Information still
+    # displays (InformationAction Continue) and still reaches the log file
+    # below, but it cannot contaminate a return value.
     switch ($Level) {
-        'WARN'  { Write-Warning $Message }
-        'ERROR' { Write-Error   $Message }
-        default { Write-Output  $line }
+        'WARN'  { Write-Warning     $Message }
+        'ERROR' { Write-Error       $Message }
+        default { Write-Information $line -InformationAction Continue }
     }
 
     try {
@@ -679,6 +994,11 @@ function Invoke-TopazAwsCli {
         its own comment for why a naive '"' -> '""' doubling scheme, tried
         here previously, is NOT that convention and corrupts any argument
         that is both quoted and ends in a backslash).
+    .PARAMETER FileName
+        The executable to run. Defaults to 'aws' (resolved via PATH), which is
+        what every original caller wants. Pass a full path to run a different
+        bounded CLI -- rclone, for instance -- and reuse the deadlock-avoidance
+        and timeout handling above rather than reimplementing it.
     .PARAMETER Arguments
         The aws CLI argument list, e.g. @('s3','sync',...,'--region','us-east-1').
     .PARAMETER TimeoutSec
@@ -701,7 +1021,8 @@ function Invoke-TopazAwsCli {
         [Parameter(Mandatory)][string]$Component,
         [Parameter(Mandatory)][string]$SuccessMessage,
         [Parameter(Mandatory)][string]$FailureVerb,
-        [string]$FailureContext = ''
+        [string]$FailureContext = '',
+        [string]$FileName = 'aws'
     )
 
     $proc = $null
@@ -709,7 +1030,7 @@ function Invoke-TopazAwsCli {
         $escapedArgs = $Arguments | ForEach-Object { ConvertTo-TopazCliArgument -Value $_ }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName               = 'aws'
+        $psi.FileName               = $FileName
         $psi.Arguments              = [string]::Join(' ', $escapedArgs)
         $psi.UseShellExecute        = $false
         $psi.RedirectStandardOutput = $true
@@ -748,6 +1069,130 @@ function Invoke-TopazAwsCli {
     finally {
         if ($proc) { $proc.Dispose() }
     }
+}
+
+function Invoke-TopazRenderUpload {
+    <#
+    .SYNOPSIS
+        Uploads everything in OutputDir to UploadTarget via rclone, VERIFIES
+        it landed, and returns $true only if both steps succeeded.
+    .DESCRIPTION
+        This is the function the ephemeral interlock in Stop-Sequence.ps1
+        depends on, so its return value carries real weight: $true is taken as
+        permission to erase the scratch volume by stopping the instance.
+        It must therefore be conservative -- ANY doubt returns $false, and a
+        false negative merely costs some instance uptime while a false
+        positive destroys the render.
+
+        rclone drives the Google Drive REST API directly (no browser, no
+        desktop sync client), uses resumable chunked uploads so a network blip
+        resumes rather than restarting a 52 GB transfer, and validates Drive's
+        returned MD5 against the local file so a silently corrupted upload
+        fails loudly instead of passing.
+
+        Two steps, deliberately:
+          1. `rclone copy`  - transfers, and fails nonzero on any error.
+          2. `rclone check --one-way` - independently re-compares source
+             against destination afterwards. Belt and braces: step 1 already
+             verifies hashes, but the cost of being wrong here is a lost
+             multi-hour render, which is worth one extra pass.
+
+        `copy` (not `move` or `sync`) is intentional: the scratch volume is
+        wiped by the stop anyway, so spending instance time deleting the
+        source afterwards would be pure waste. It also means re-running this
+        after a partial failure is cheap -- rclone skips files already present
+        at the destination.
+    .PARAMETER Config
+        The Get-TopazAutoStopConfig object.
+    .PARAMETER Reason
+        'completed' | 'stalled' | 'maxlifetime' -- logged for context only.
+    .OUTPUTS
+        [bool] $true only if the upload transferred AND verified.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$Reason = 'completed'
+    )
+
+    $cfg = $Config
+
+    if (-not (Test-Path -LiteralPath $cfg.RclonePath)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "rclone not found at '$($cfg.RclonePath)'. Cannot upload."
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $cfg.RcloneConfigPath)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "rclone config not found at '$($cfg.RcloneConfigPath)'. The Google Drive remote has not been authorised -- run Set-GoogleDriveAuth.ps1. Cannot upload."
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $cfg.OutputDir)) {
+        # On an ephemeral OutputDir this usually means the scratch drive never
+        # got provisioned this boot, which is itself a fault worth blocking on:
+        # if the directory is missing, renders went somewhere unexpected.
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "OutputDir '$($cfg.OutputDir)' does not exist. Cannot upload (did Initialize-ScratchDisk.ps1 run at boot?)."
+        return $false
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message "OutputDir '$($cfg.OutputDir)' is empty; nothing to upload. Safe to proceed."
+        return $true
+    }
+
+    $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+    Write-TopazLog -Component 'stop' -Level 'INFO' `
+        -Message "Uploading $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GB, from '$($cfg.OutputDir)' to '$($cfg.UploadTarget)' (reason=$Reason). This MUST finish before the instance may stop."
+
+    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
+
+    # --drive-chunk-size trades memory for throughput on large files; 4
+    # transfers x 128M is ~512 MB of buffers, trivial on a 64 GB box and much
+    # faster than the 8 MiB default for multi-GB renders.
+    $common = @(
+        '--config', $cfg.RcloneConfigPath,
+        '--log-file', $rcloneLog,
+        '--log-level', 'INFO'
+    )
+
+    $copyArgs = @('copy', $cfg.OutputDir, $cfg.UploadTarget) + $common + @(
+        '--transfers', '4',
+        '--drive-chunk-size', '128M',
+        '--retries', '3',
+        '--low-level-retries', '10',
+        '--stats', '1m'
+    )
+
+    $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
+        -TimeoutSec $cfg.UploadTimeoutSec `
+        -Component 'stop' `
+        -SuccessMessage "rclone copy completed. See '$rcloneLog' for transfer detail." `
+        -FailureVerb 'rclone upload' `
+        -FailureContext "target=$($cfg.UploadTarget). The instance will NOT be stopped while renders remain unuploaded on ephemeral storage."
+
+    if (-not $copied) { return $false }
+
+    # Independent verification pass. --one-way so pre-existing extra files at
+    # the destination (previous sessions' renders) are not treated as errors.
+    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way')
+
+    $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
+        -TimeoutSec $cfg.UploadTimeoutSec `
+        -Component 'stop' `
+        -SuccessMessage "rclone check VERIFIED every file in '$($cfg.OutputDir)' is present and intact at '$($cfg.UploadTarget)'." `
+        -FailureVerb 'rclone verify' `
+        -FailureContext 'the upload could not be verified, so the renders are NOT safe to erase.'
+
+    if (-not $verified) { return $false }
+
+    Write-TopazLog -Component 'stop' -Level 'INFO' `
+        -Message "Upload verified: $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GB now safely in '$($cfg.UploadTarget)'. Safe to stop."
+    return $true
 }
 
 function Get-TopazStopNotification {

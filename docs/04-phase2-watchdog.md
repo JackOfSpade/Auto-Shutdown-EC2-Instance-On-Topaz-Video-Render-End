@@ -15,8 +15,10 @@ registers the two SYSTEM scheduled tasks that point at those installed copies.
 ```
 
 `Install.ps1` creates `InstallDir` + `LogDir`, copies `Config.ps1`,
-`Watchdog.ps1`, `Stop-Sequence.ps1`, and `Push-GpuMetric.ps1`, warns if
-`nvidia-smi`/`aws` are missing, and then tells you to run
+`Watchdog.ps1`, `Stop-Sequence.ps1`, and `Push-GpuMetric.ps1` (plus, best-effort,
+the optional operator tools `Register-TimedStop.ps1` and `Test-Deployment.ps1`
+when present - a missing one of those is only a warning, not an install
+failure), warns if `nvidia-smi`/`aws` are missing, and then tells you to run
 `Register-ScheduledTasks.ps1` from an elevated shell. It does **not** register
 tasks itself - that needs elevation. A directory-creation or script-copy
 failure is a hard install failure, not a warning: `Install.ps1` logs it as an
@@ -28,27 +30,46 @@ and registering a task that points at a nonexistent file.
 ## How the watchdog decides "done"
 
 [`Watchdog.ps1`](../in-guest/Watchdog.ps1) never drives Topaz and never calls its
-CLI. It only **observes**: via CIM (`Win32_Process`) the Topaz GUI process and its
-child encoder worker, optionally GPU utilization, and the byte size of the output
-folder. Whether a render counts as "active" on any given poll is controlled by
-`CompletionSignal` (below). All tuning comes from
+CLI. It only **observes**: via CIM (`Win32_Process`) the Topaz GUI process and
+its encoder-worker descendants (matched by ancestry, not direct parentage),
+optionally GPU utilization, and the output folder's byte size **and** the
+workers' own cumulative disk I/O. Whether a render counts as "active" on any
+given poll is controlled by `CompletionSignal` (below). All tuning comes from
 [`Config.ps1`](../in-guest/Config.ps1).
 
-### The child-worker-of-Topaz signal
+### The worker-ancestry signal
 
-Topaz encodes a queued job by spawning an encoder **child** process. The watchdog:
+Topaz encodes a queued job through a chain of processes, not a single child:
+on this deployment the observed chain is `Topaz Video.exe` -> `neuroserver.exe`
+-> `ffmpeg.exe`, i.e. `ffmpeg` is a **grandchild** of the GUI, not a direct
+child (see [docs/12-empirical-findings.md](12-empirical-findings.md)). A
+one-level "is this process's `ParentProcessId` the GUI's PID?" test therefore
+misses `ffmpeg` entirely - which is exactly what the original, direct-child
+implementation did, and why it never saw an active render at all. The
+watchdog instead matches by **ancestry**:
 
 1. Finds live Topaz GUI PIDs with `Name LIKE 'Topaz Video%'` (`TopazNameLike`).
-2. Finds processes matching `WorkerNameLike` (a CIM `LIKE` pattern, default
-   `'ffmpeg.exe'`) whose `ParentProcessId` is one of those Topaz PIDs. Only those
-   parented-by-Topaz workers count - a stray process of the same name elsewhere on
-   the box is ignored.
+2. Snapshots every process's `ProcessId`/`ParentProcessId` on the box and walks
+   the tree breadth-first from those GUI PIDs, to unlimited depth
+   (`Resolve-ProcessDescendants`, a pure, unit-tested function), producing the
+   full set of PIDs descended from a live Topaz GUI - children, grandchildren,
+   and deeper.
+3. Finds processes matching any pattern in `WorkerNamesLike` (an **array** of
+   CIM `LIKE` patterns, default `@('neuroserver.exe', 'ffmpeg.exe')`) and keeps
+   only those whose PID is in that descendant set (or is a previously-adopted
+   orphan - see below). A stray process of the same name elsewhere on the box,
+   not descended from Topaz, is ignored.
 
-`WorkerNameLike` is configurable because the exact worker process name is
-version-dependent; confirm the real name during
-[Phase 0](02-phase0-confirmations.md) and use a `LIKE` pattern such as `'ffmpeg%'`
-if it varies. A "real render worker exists" is therefore a precise, event-driven
-signal, not a guess.
+`WorkerNamesLike` is an **array**, not a single string, because one process
+name cannot describe the real topology: `neuroserver.exe` is the load-bearing
+entry - it spans a queued item's entire lifetime, including the several-minute
+analysis phase before `ffmpeg` even exists (see
+[docs/12-empirical-findings.md](12-empirical-findings.md)) - and `ffmpeg.exe`
+is kept as a second, corroborating signal for the encode sub-phase. Confirm
+the real chain during [Phase 0](02-phase0-confirmations.md) - it is version
+dependent - and add every worker name in it (`LIKE` patterns such as
+`'ffmpeg%'` are fine) to `WorkerNamesLike`. A "real render worker exists" is
+therefore a precise, event-driven signal, not a guess.
 
 **Orphan-worker tracking.** Windows does not kill children when a parent process
 dies: if the Topaz GUI crashes or is closed mid-export, its worker keeps encoding
@@ -77,9 +98,30 @@ The worker-presence check above feeds into `CompletionSignal`, which decides wha
 
 | Value | Meaning |
 |-------|---------|
-| `WorkerOnly` (**default**) | Only the presence of the child encoder worker counts. This is the original, most specific behaviour - existing deployments see no change in default behavior. |
+| `WorkerOnly` (**default**) | Only the presence of a matched encoder-worker descendant counts. See the DCV warning below for why this is the default on a box whose GPU is shared with the remote-display encoder. |
 | `GpuOnly` | Only GPU utilization `>= GpuBusyPercent` counts. |
-| `WorkerOrGpu` | Active if **either** a worker is present **or** the GPU is busy. Most robust if the worker process is not reliably a child of the GUI on your Topaz version. |
+| `WorkerOrGpu` | Active if **either** a worker descendant is present **or** the GPU is busy. Safer on a box with a *dedicated* render GPU, where a false "busy" merely leaves the box up a little longer while a false "idle" would power it off mid-render. **Do not use it where DCV shares the GPU** - see below. |
+
+> **Why `WorkerOnly` is the default: the DCV GPU-sharing trap.** Amazon DCV
+> encodes the remote display on the same GPU the renders use. Measured on the
+> reference deployment, an operator merely being *connected* - no render at all
+> - drove the GPU to **14-55%**, far above `GpuBusyPercent = 15`. Under
+> `WorkerOrGpu` the watchdog logged `Render active (worker=False gpu=21%)` with
+> nothing rendering.
+>
+> That is worse than cosmetic. The GPU signal sets the internal `SawActivity`
+> flag, which is the very thing that stops the watchdog completing a queue
+> before a render has begun. Once set, a quiet spell of `DebounceSec` is enough
+> to declare the queue "complete" - so an operator connecting over DCV, loading
+> a project for twenty minutes and then pausing could have the box powered off
+> underneath them, having never rendered anything.
+>
+> The GPU signal only ever existed as a hedge against unreliable worker
+> detection. Now that matching is by ancestry and validated end-to-end (see
+> [docs/12](12-empirical-findings.md)), that hedge is all cost on a DCV box.
+> The failure direction of `WorkerOnly` is also the safe one: if worker
+> detection ever broke, the box would fail to stop (costing money) rather than
+> stop wrongly (costing a render or a working session).
 
 An unrecognized `CompletionSignal` value fails loudly at config load time -
 `Get-TopazAutoStopConfig` throws naming the bad value and the three valid
@@ -111,32 +153,42 @@ behaviour. See [Testing & CI](10-testing-and-ci.md).
 
 ### The state machine
 
-The main loop polls every `PollSec` (default **15 s**) and tracks four things:
+The main loop polls every `PollSec` (default **15 s**) and tracks five things:
 `idleSec` (time with no active render), `stallSec` (time a render is active but
-output is not growing), `sawActivity` (have we *ever* seen an active render), and
-`lastBytes` (last output-folder size). "Active" on each poll is whatever
-`CompletionSignal` says it is (worker presence by default) - and it can itself be
-`$null` ("unknown this poll").
+making no progress), `sawActivity` (have we *ever* seen an active render),
+`lastBytes` (last output-folder size), and `lastIoBytes` (last cumulative
+worker disk I/O total). "Active" on each poll is whatever `CompletionSignal`
+says it is (worker-or-GPU by default) - and it can itself be `$null` ("unknown
+this poll").
 
 - **Signal unreadable (`$null`)** -> neither idle nor active can be trusted this
   poll. The watchdog logs a warning and **freezes** `idleSec`, `stallSec`,
-  `sawActivity`, and `lastBytes` exactly as they were, then waits for the next
-  poll. This matters because a transient CIM outage used to be indistinguishable
-  from "no worker" - which could false-complete a queue mid-encode (nudging
-  `idleSec` toward the debounce) or false-stall a healthy one (nudging
-  `stallSec`), on a poll that told us nothing either way.
-- **Active + output changed (grew OR shrank)** -> healthy; reset `stallSec`. A
-  genuinely stalled worker writes nothing at all, so *any* byte delta is proof of
-  life. Comparing for growth only had a high-water-mark bug: Topaz can delete a
-  large `_temp` scratch file between jobs, shrinking the output folder, and a
-  healthy next job growing back up from that lower base could sit under the old
-  high-water mark for the whole `StallSec` window and get killed as "stalled"
-  mid-render.
-- **Active + output NOT growing (bytes unchanged)** -> accrue `stallSec`. If it
-  reaches `StallSec` (default **900 s / 15 min**), declare the job **stalled**
-  and break.
+  `sawActivity`, `lastBytes`, and `lastIoBytes` exactly as they were, then waits
+  for the next poll. This matters because a transient CIM outage used to be
+  indistinguishable from "no worker" - which could false-complete a queue
+  mid-encode (nudging `idleSec` toward the debounce) or false-stall a healthy
+  one (nudging `stallSec`), on a poll that told us nothing either way.
+- **Active + progress on EITHER signal** -> healthy; reset `stallSec`. Progress
+  is the *union* of two things:
+  - the output folder's byte total **changing** (grew OR shrank - a genuinely
+    stalled worker writes nothing at all, so *any* byte delta is proof of
+    life; comparing for growth only had a high-water-mark bug, since Topaz can
+    delete a large `_temp` scratch file between jobs and a healthy next job
+    growing back up from that lower base could otherwise sit under the old
+    high-water mark for the whole `StallSec` window), **or**
+  - the matched workers' own cumulative `ReadTransferCount`/`WriteTransferCount`
+    moving. This second signal was added because, on NTFS, a file's
+    directory-entry length does **not** refresh while a writer holds the
+    handle open - measured frozen for 466 s straight on this deployment while
+    `ffmpeg` wrote 260+ MiB of real output (see
+    [docs/12-empirical-findings.md](12-empirical-findings.md)). The
+    folder-byte check is kept as a second, corroborating signal, never the
+    sole one.
+- **Active + NEITHER signal progressed** -> accrue `stallSec`. If it reaches
+  `StallSec` (default **1800 s / 30 min**), declare the job **stalled** and
+  break.
 - **Not active, and we have seen activity before** -> accrue `idleSec`. If it
-  reaches `DebounceSec` (default **120 s**), declare the queue **complete** and
+  reaches `DebounceSec` (default **300 s**), declare the queue **complete** and
   break.
 - **Not active, and we have NEVER seen activity** -> this is the normal
   *pre-render* state (opening a project, adding clips, configuring the export).
@@ -160,16 +212,18 @@ re-checking it would just loop forever instead of ever stopping.
 
 `DebounceSec` exists because Topaz's **live preview** can spawn short-lived
 worker children that are not the queued export, and because real multi-clip
-queues have inter-clip lulls (the next job loading its model) between jobs.
-Requiring the *absence* of activity for a continuous `DebounceSec` window absorbs
-both, so a preview flicker or a mid-queue lull is never mistaken for "queue
-drained." **Tuning note:** typical inter-clip lulls run **45-90 s**; the default
-of **120 s** clears that with margin - at the cost of only about one extra idle
-minute per session - because a false "complete" here stops the box mid-queue. Set
-it comfortably longer than the longest preview-worker or inter-clip lull you
-observed in [Phase 0](02-phase0-confirmations.md). This applies under any
-`CompletionSignal` mode - it debounces transitions of "active", not specifically
-the worker signal.
+queues have inter-clip lulls between jobs: the GUI tears down one queue item's
+`neuroserver` worker and only spawns the next item's afterward. Requiring the
+*absence* of activity for a continuous `DebounceSec` window absorbs both, so a
+preview flicker or a mid-queue lull is never mistaken for "queue drained."
+**Tuning note:** the default is now **300 s (5 min)**, deliberately generous -
+a false "complete" here stops the box mid-queue and destroys an entire
+unrendered remainder, a far worse outcome than the five extra idle minutes it
+costs at the genuine end of a session. Set it comfortably longer than the
+longest preview-worker or inter-clip lull you observed in
+[Phase 0](02-phase0-confirmations.md). This applies under any
+`CompletionSignal` mode - it debounces transitions of "active", not
+specifically the worker signal.
 
 ### The file-unlock gate
 
@@ -212,15 +266,23 @@ registers both tasks under the **SYSTEM** account (`ServiceAccount` logon,
 
 The two tasks:
 
-- **`TopazAutoStop-Watchdog`** - trigger `-AtStartup`, `ExecutionTimeLimit` set to
-  zero (no time limit, runs indefinitely), `-StartWhenAvailable`, and a
+- **`TopazAutoStop-Watchdog`** - **two** triggers: `-AtStartup` (the normal
+  path) and a **15-minute repeating sweep** (a `-Once` trigger with a
+  `RepetitionInterval` of 15 minutes over an effectively-infinite duration),
+  plus `ExecutionTimeLimit` set to zero (no time limit, runs indefinitely),
+  `-StartWhenAvailable`, `-MultipleInstances IgnoreNew`, and a
   restart-on-failure policy (`RestartCount 3`, one minute apart). It starts at
   boot and waits for the Topaz GUI before arming. The restart policy exists
   because the watchdog is the **primary** stop path - the CloudWatch idle alarm
   is a cost backstop, not a substitute - so a crashed watchdog process should not
-  stay dead silently for the rest of the render. (See the limitation note below:
-  a restart loses in-memory state, which is exactly what the idle alarm then
-  backstops.)
+  stay dead silently for the rest of the render; the 15-minute sweep is a
+  **self-healing** layer on top of that restart policy, reviving the watchdog
+  within 15 minutes if it ever exhausts `RestartCount`'s retries and stays
+  dead. `MultipleInstances IgnoreNew` is what makes the sweep safe: it is a
+  no-op whenever the watchdog is already running, instead of stacking a second
+  copy that would independently decide to stop the box. (See the limitation
+  note below: a restart loses in-memory state, which is exactly what the idle
+  alarm then backstops.)
 - **`TopazAutoStop-GpuMetric`** - a `-Once` trigger with a 1-minute repetition for
   an effectively-infinite duration (~10000 days), so it runs
   `Push-GpuMetric.ps1` once per minute forever; `-MultipleInstances IgnoreNew`
@@ -246,7 +308,7 @@ Get-ScheduledTaskInfo -TaskName 'TopazAutoStop-Watchdog'   # last-run details
 ## Limitation: a watchdog restart mid-render loses in-memory state
 
 `$script:KnownWorkers` (orphan-worker tracking) and the loop variables
-`$sawActivity` / `$idleSec` / `$stallSec` / `$lastBytes` live only in the running
+`$sawActivity` / `$idleSec` / `$stallSec` / `$lastBytes` / `$lastIoBytes` live only in the running
 `Watchdog.ps1` process - deliberately **not** persisted to disk. If the watchdog
 process itself is restarted mid-render (e.g. by the `RestartCount 3` policy
 above, after a crash), it comes back up with a clean slate: it no longer knows an

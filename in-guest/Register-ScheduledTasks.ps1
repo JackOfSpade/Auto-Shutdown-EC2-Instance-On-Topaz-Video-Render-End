@@ -47,6 +47,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $watchdogScript = Join-Path $cfg.InstallDir 'Watchdog.ps1'
 $metricScript   = Join-Path $cfg.InstallDir 'Push-GpuMetric.ps1'
+$scratchScript  = Join-Path $cfg.InstallDir 'Initialize-ScratchDisk.ps1'
 
 # A missing installed script here means the task we are about to register
 # would point at a nonexistent file -- silently falling through to "Both
@@ -56,6 +57,7 @@ $metricScript   = Join-Path $cfg.InstallDir 'Push-GpuMetric.ps1'
 $missingScripts = @()
 if (-not (Test-Path -LiteralPath $watchdogScript)) { $missingScripts += $watchdogScript }
 if (-not (Test-Path -LiteralPath $metricScript)) { $missingScripts += $metricScript }
+if (-not (Test-Path -LiteralPath $scratchScript)) { $missingScripts += $scratchScript }
 if ($missingScripts.Count -gt 0) {
     $missingList = $missingScripts -join ', '
     Write-TopazLog -Component 'register' -Level 'ERROR' `
@@ -94,9 +96,20 @@ function Register-PipelineTask {
     try {
         $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($existing) {
+            # Stop the task FIRST. Unregister-ScheduledTask removes the task
+            # definition but does NOT kill a process the task already started:
+            # that process keeps running, orphaned, no longer governed by the
+            # task's MultipleInstances policy. For the watchdog that is
+            # actively dangerous -- the orphan and the freshly-registered
+            # instance would BOTH be monitoring the same render, and both would
+            # independently invoke Stop-Sequence.ps1 when they decided the
+            # queue was done. Stopping before unregistering keeps this script's
+            # advertised idempotency honest.
+            try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { }
+
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
             Write-TopazLog -Component 'register' -Level 'INFO' `
-                -Message "Removed existing task '$TaskName' before re-registering."
+                -Message "Stopped and removed existing task '$TaskName' before re-registering."
         }
 
         Register-ScheduledTask `
@@ -141,18 +154,52 @@ $watchdogAction = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
     -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`"" -f $watchdogScript)
 
-$watchdogTrigger = New-ScheduledTaskTrigger -AtStartup
+# TWO triggers, deliberately.
+#
+#   1. AtStartup      - the normal path: the watchdog is up from boot.
+#   2. Every 15 min   - a SELF-HEALING sweep. Task Scheduler's RestartCount
+#                       only retries a limited number of times (3, below) and
+#                       then gives up for good. A watchdog that dies after
+#                       exhausting those retries would stay dead until the next
+#                       reboot, silently disabling the only thing that stops
+#                       this instance -- i.e. the box quietly bills forever,
+#                       which is the exact failure this project exists to
+#                       prevent. Paired with MultipleInstances=IgnoreNew below,
+#                       this repeating trigger is a no-op whenever the watchdog
+#                       is already running, and revives it within 15 minutes if
+#                       it is not.
+#
+# A repetition needs BOTH an interval and a duration, and the duration cannot
+# be literally infinite, so ~10000 days stands in for "forever" (same trick as
+# the metric task below).
+$watchdogStartupTrigger = New-ScheduledTaskTrigger -AtStartup
+
+$watchdogSweepTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date)
+$watchdogSweepRepetition = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 15) `
+    -RepetitionDuration (New-TimeSpan -Days 10000)
+$watchdogSweepTrigger.Repetition = $watchdogSweepRepetition.Repetition
+
+$watchdogTrigger = @($watchdogStartupTrigger, $watchdogSweepTrigger)
 
 # ExecutionTimeLimit=Zero means no time limit (the watchdog runs indefinitely).
 # RestartCount/RestartInterval: the watchdog is the PRIMARY stop path - the
 # CloudWatch idle alarm is only a cost backstop, not a substitute. Without a
 # restart policy a crashed watchdog process stays dead until the next reboot,
 # silently disabling auto-stop for the rest of the render. Task Scheduler will
-# retry a failed run up to 3 times, one minute apart, before giving up.
+# retry a failed run up to 3 times, one minute apart, before giving up -- after
+# which the 15-minute sweep trigger above takes over as the longer-term
+# recovery path.
+#
+# MultipleInstances=IgnoreNew is what makes that sweep safe: if the watchdog is
+# already running, the sweep's attempt to start a second copy is discarded.
+# Without it, every sweep would stack another watchdog process on top of the
+# last, and each one would independently decide to stop the box.
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
@@ -164,6 +211,43 @@ $watchdogRegistered = Register-PipelineTask `
     -Settings $watchdogSettings `
     -Principal $principalObj `
     -Description 'Topaz auto-stop watchdog: stops the instance when the render queue finishes or stalls.'
+
+# ---------------------------------------------------------------------------
+# 1b. Scratch-disk task - prepares the instance-store render drive at boot.
+#
+#     The instance store is wiped and returns as a RAW, unpartitioned disk on
+#     EVERY start, so this cannot be a one-off install step. If it does not
+#     run, OutputDir does not exist, Topaz has nowhere to export to, and the
+#     stop sequence refuses to stop (correctly) because it cannot upload
+#     renders it cannot find.
+#
+#     Registered with a boot trigger only -- unlike the watchdog it has no
+#     recurring sweep, because Initialize-ScratchDisk.ps1 is a no-op once the
+#     volume exists and re-running it buys nothing.
+# ---------------------------------------------------------------------------
+
+$scratchAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`"" -f $scratchScript)
+
+$scratchTrigger = New-ScheduledTaskTrigger -AtStartup
+
+$scratchSettings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+    -RestartCount 2 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+$scratchRegistered = Register-PipelineTask `
+    -TaskName $cfg.ScratchTaskName `
+    -Action $scratchAction `
+    -Trigger $scratchTrigger `
+    -Settings $scratchSettings `
+    -Principal $principalObj `
+    -Description 'Topaz auto-stop scratch disk: formats the instance-store NVMe and creates the render output directory at boot.'
 
 # ---------------------------------------------------------------------------
 # 2. GPU metric task - runs every minute forever.
@@ -212,15 +296,16 @@ $metricRegistered = Register-PipelineTask `
 # failed rather than claiming success regardless of outcome.
 # ---------------------------------------------------------------------------
 
-if ($watchdogRegistered -and $metricRegistered) {
+if ($watchdogRegistered -and $metricRegistered -and $scratchRegistered) {
     Write-TopazLog -Component 'register' -Level 'INFO' `
-        -Message "Both tasks registered. Verify with:  Get-ScheduledTask -TaskName '$($cfg.WatchdogTaskName)','$($cfg.MetricTaskName)'  (and Get-ScheduledTaskInfo for last-run details)."
+        -Message "All three tasks registered. Verify with:  Get-ScheduledTask -TaskName 'TopazAutoStop-*'  (and Get-ScheduledTaskInfo for last-run details)."
     exit 0
 }
 
 $failedTasks = @()
 if (-not $watchdogRegistered) { $failedTasks += $cfg.WatchdogTaskName }
 if (-not $metricRegistered) { $failedTasks += $cfg.MetricTaskName }
+if (-not $scratchRegistered) { $failedTasks += $cfg.ScratchTaskName }
 
 Write-TopazLog -Component 'register' -Level 'ERROR' `
     -Message "Registration failed for: $($failedTasks -join ', '). See the ERROR line(s) above for details. The pipeline is NOT fully live."

@@ -7,16 +7,35 @@ once the render queue is complete or stalled, with `-Reason completed` or
 `-Reason stalled`. It runs the optional best-effort artifact/notification steps
 and then powers the guest off.
 
-## The stop needs no API call and no credentials
+## The stop follows an ordered plan: API first, guest shutdown as fallback
 
-The actual stop is a **guest-OS shutdown** - `Stop-Computer -Force`, equivalent
-to `shutdown /s /t 0`. Because
-`InstanceInitiatedShutdownBehavior=stop` was set in
-[Phase 1](03-phase1-instance-prep.md), that shutdown **stops** the EC2 instance.
+The actual stop is not a single fixed action - `Stop-Sequence.ps1` follows the
+configured `StopStrategy` (`Config.ps1`; `Resolve-StopPlan` is the pure
+function that turns it into an ordered action list):
 
-There is **no `ec2:StopInstances` call and no AWS credential** involved in the
-stop itself. The box stops itself simply by turning its own OS off. This is the
-central design property of the whole pipeline (see [Architecture](01-architecture.md)).
+- **`Ec2ApiStop`** - call `ec2:StopInstances` against this instance. The
+  **only** action that *provably* ends billing.
+- **`GuestShutdown`** - `Stop-Computer -Force`, equivalent to
+  `shutdown /s /t 0`. Needs **no `ec2:StopInstances` call and no AWS
+  credential** - it stops the box simply by turning its own OS off, and it
+  **stops** (rather than terminates) the EC2 instance only because
+  `InstanceInitiatedShutdownBehavior=stop` was set in
+  [Phase 1](03-phase1-instance-prep.md).
+- **`'Auto'`** (the default) - tries `Ec2ApiStop` first and, if that call is
+  denied or does not take effect within `StopVerifySec` (default **90 s**),
+  falls back to `GuestShutdown`.
+
+**Why the API leg goes first.** A guest shutdown only ends billing when
+`InstanceInitiatedShutdownBehavior` happens to be `stop` - a fact this box
+cannot verify about itself without an extra permission
+(`ec2:DescribeInstanceAttribute`). Ordering the credential-free-but-unverified
+action first would, on a box where that attribute is `terminate` (or the
+guest shutdown simply does not stop the instance for some other reason),
+either destroy the box or quietly keep billing it. Trying the action that is
+provably correct first, and degrading to the best-effort one, is the safer
+direction - this is the central design property of the whole pipeline (see
+[Architecture](01-architecture.md), which also explains the credential
+trade-off this addition made explicit).
 
 ## Order of operations
 
@@ -26,7 +45,9 @@ central design property of the whole pipeline (see [Architecture](01-architectur
 2. (optional)    aws s3 sync OutputDir -> S3SyncTarget --region <region> -- BEFORE power off
 3. (optional)    aws sns publish "render complete/stalled" --region <region>
 4. DryRun?  -> log the decision and RETURN (no power off; Watchdog.ps1 re-arms)
-5. else     -> Stop-Computer -Force   (guest shutdown => instance STOP)
+5. else     -> follow the StopStrategy plan in order (default 'Auto':
+                ec2:StopInstances, then Stop-Computer -Force) until one
+                action succeeds or the plan is exhausted
 ```
 
 ### 1. Best-effort instance id + region (IMDSv2)
@@ -74,13 +95,18 @@ otherwise be a false alarm to anyone subscribed to the topic.
 
 ### 4. The DryRun switch
 
-`Config.ps1` ships with `DryRun = $true`. In dry-run mode the stop sequence logs
-exactly what it *would* do (including the reason) and **returns without powering
-off**. `Watchdog.ps1` then **re-arms and keeps monitoring** for the next queue
+Start a new deployment with `DryRun = $true` in `Config.ps1`. In dry-run mode
+the stop sequence logs exactly what it *would* do (including the reason and
+the resolved `StopStrategy` plan) and **returns without powering off**.
+`Watchdog.ps1` then **re-arms and keeps monitoring** for the next queue
 instead of exiting - previously a `DryRun` stop left nothing watching until a
 reboot re-triggered the scheduled task. This lets you watch several real jobs
 drive the whole pipeline - detection, unlock gate, stop decision - **for the
-in-guest path**.
+in-guest path**. (This checked-in `Config.ps1` currently ships with
+`DryRun = $false`, because this specific, already-verified instance has been
+through this exact loop and armed - see
+[docs/11-deploying-on-this-instance.md](11-deploying-on-this-instance.md) -
+not because a new deployment should skip it.)
 
 > **`DryRun` does not cover the out-of-band safety nets.** The CloudWatch
 > GPU-idle alarm and the optional max-lifetime Lambda are control-plane
@@ -107,8 +133,8 @@ and powers off immediately. That is safe in this pipeline specifically because t
 watchdog has **already proven** the two things `-Force` would otherwise risk:
 
 - **The encode workers have exited.** The stop only happens after the queue
-  drained (no child `ffmpeg` for `DebounceSec`) or a stall was declared. We are not
-  force-killing an active encoder.
+  drained (no active worker descendant for `DebounceSec`) or a stall was
+  declared. We are not force-killing an active encoder.
 - **The output files are unlocked.** The file-unlock gate confirmed nothing holds
   a write handle on any non-`_temp` output file before handing off. There is no
   half-written file for `-Force` to truncate.

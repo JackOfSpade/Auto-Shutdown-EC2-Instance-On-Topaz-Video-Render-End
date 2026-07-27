@@ -78,8 +78,16 @@ function Get-TopazPids {
         avoid mis-attributing orphaned workers.
     #>
     try {
+        # -OperationTimeoutSec bounds the call the same way Get-GpuUtilizationMax
+        # and Invoke-TopazAwsCli bound their child processes. A wedged WMI/CIM
+        # provider would otherwise hang this call forever inside a SYSTEM task,
+        # and the watchdog would simply stop polling -- no error, no log line,
+        # and nothing left to ever stop the instance. On timeout this throws,
+        # which the catch below turns into $null ("unknown"), and the state
+        # machine then freezes its bookkeeping for that poll rather than
+        # guessing. Degrading to "unknown" is safe; hanging silently is not.
         $procs = Get-CimInstance -ClassName Win32_Process `
-            -Filter "Name LIKE '$($cfg.TopazNameLike)'" -ErrorAction Stop
+            -Filter "Name LIKE '$($cfg.TopazNameLike)'" -OperationTimeoutSec 30 -ErrorAction Stop
         # The leading unary comma is required, not decorative: PowerShell's
         # pipeline/return semantics collapse a returned array to a SCALAR when
         # it has exactly one element, and to $null when it has ZERO elements
@@ -97,14 +105,94 @@ function Get-TopazPids {
     }
 }
 
+function Resolve-ProcessDescendants {
+    <#
+    .SYNOPSIS
+        Pure: every PID that descends from any of $RootPids, to unlimited
+        depth. No CIM calls of its own, so it is fully unit-testable.
+    .DESCRIPTION
+        THE REASON THIS EXISTS. The watchdog used to attribute a worker to
+        Topaz by testing the worker's ParentProcessId against the GUI's PID
+        -- a ONE-LEVEL check. On current Topaz builds the real process tree is
+
+            Topaz Video.exe  ->  neuroserver.exe  ->  ffmpeg.exe
+
+        so ffmpeg.exe is a GRANDCHILD and a one-level test never matches it.
+        With the old default (worker = 'ffmpeg.exe', signal = WorkerOnly) the
+        watchdog therefore observed "no worker" for the entire life of every
+        render, never set SawActivity, and consequently never fired at all --
+        an auto-stop pipeline that silently did nothing. Matching by ANCESTRY
+        fixes that, and keeps working if Topaz nests its workers deeper still.
+
+        Walks breadth-first from the roots over a parent->children index. The
+        $seen guard is load-bearing rather than an optimisation: Windows
+        recycles PIDs, so a stale ParentProcessId can point at a
+        later-created process and produce a CYCLE in the apparent tree, which
+        would otherwise spin this loop forever inside a SYSTEM task.
+
+        The roots themselves are NOT included in the result -- callers are
+        looking for worker processes spawned BY the GUI, never the GUI itself.
+    .PARAMETER AllProcesses
+        A snapshot of every process on the box; each item needs .ProcessId and
+        .ParentProcessId.
+    .PARAMETER RootPids
+        $null = the root PID query failed (unknown); @() = it succeeded and
+        found none running; array = the live root PIDs.
+    .OUTPUTS
+        $null if $RootPids is $null (ancestry is unknowable this poll),
+        otherwise an array (possibly empty) of descendant PIDs.
+    #>
+    param(
+        [AllowEmptyCollection()][array]$AllProcesses,
+        [AllowNull()]$RootPids
+    )
+
+    # Ancestry is only meaningful relative to a known root set. Preserve the
+    # caller's null-vs-empty distinction rather than collapsing "unknown" into
+    # "no descendants" -- see Resolve-WorkerAttribution's own contract.
+    if ($null -eq $RootPids) { return $null }
+
+    $childrenByParent = @{}
+    foreach ($p in $AllProcesses) {
+        $parentId = [int]$p.ParentProcessId
+        if (-not $childrenByParent.ContainsKey($parentId)) {
+            $childrenByParent[$parentId] = New-Object System.Collections.Generic.List[int]
+        }
+        [void]$childrenByParent[$parentId].Add([int]$p.ProcessId)
+    }
+
+    $seen  = @{}
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    foreach ($r in $RootPids) { $queue.Enqueue([int]$r) }
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if (-not $childrenByParent.ContainsKey($current)) { continue }
+
+        foreach ($child in $childrenByParent[$current]) {
+            # A PID already seen has already been enqueued; re-enqueueing it
+            # is how a PID-reuse cycle would become an infinite loop.
+            if ($seen.ContainsKey($child)) { continue }
+            $seen[$child] = $true
+            $queue.Enqueue($child)
+        }
+    }
+
+    # Leading unary comma: see Get-TopazPids -- without it a zero- or
+    # one-element result collapses to $null / a bare scalar through the
+    # return chain, destroying the null-vs-empty distinction above.
+    return , @($seen.Keys)
+}
+
 function Resolve-WorkerAttribution {
     <#
     .SYNOPSIS
         Pure matching/adoption/pruning: which of this poll's worker processes
-        count as an active render worker, given the current Topaz GUI PIDs.
+        count as an active render worker, given the PIDs that descend from a
+        live Topaz GUI.
     .DESCRIPTION
         Extracted from Get-TopazWorkers so the attribution logic (adoption of
-        a live GUI's children, orphan survival, and pruning of exited
+        a live GUI's descendants, orphan survival, and pruning of exited
         workers) is independently unit-testable, with no CIM calls of its
         own.
 
@@ -114,16 +202,17 @@ function Resolve-WorkerAttribution {
         $script:KnownWorkers table across polls for orphan survival to work.
 
         A worker process counts as an active render worker if:
-          (a) its ParentProcessId is one of the CURRENT live Topaz GUI PIDs
+          (a) its PID is a DESCENDANT of a live Topaz GUI PID at any depth
               (also records it in $KnownWorkers), OR
           (b) its PID+CreationDate is already in $KnownWorkers (an orphan
               keeps counting after its parent GUI is gone).
-        If $TopazPids is $null (the PID query itself failed), parent
-        attribution is skipped (unknowable) and only KnownWorkers matches are
-        counted.
-    .PARAMETER TopazPids
-        $null = the Topaz GUI PID query failed (unknown); @() = it succeeded
-        and found none running; array = the live GUI PIDs.
+        If $DescendantPids is $null (the ancestry query itself failed),
+        descendant attribution is skipped (unknowable) and only KnownWorkers
+        matches are counted.
+    .PARAMETER DescendantPids
+        $null = ancestry could not be resolved (unknown); @() = it resolved
+        and the GUI has no descendants; array = the descendant PIDs.
+        See Resolve-ProcessDescendants.
     .PARAMETER Workers
         This poll's worker processes (already CIM-queried by the caller);
         each needs .ProcessId, .ParentProcessId, .CreationDate.
@@ -131,13 +220,14 @@ function Resolve-WorkerAttribution {
         The running table of previously-adopted "<PID>|<CreationDate.Ticks>"
         keys, mutated in place (see above).
     .OUTPUTS
-        $null  - $TopazPids was $null AND no known orphan is alive to confirm
-                 activity either way (genuinely unknown -- NOT "no worker").
-        @()    - $Workers had nothing that matched, and TopazPids was known.
+        $null  - $DescendantPids was $null AND no known orphan is alive to
+                 confirm activity either way (genuinely unknown -- NOT "no
+                 worker").
+        @()    - $Workers had nothing that matched, and ancestry was known.
         array  - the matched worker(s).
     #>
     param(
-        [AllowNull()]$TopazPids,
+        [AllowNull()]$DescendantPids,
         [AllowEmptyCollection()][array]$Workers,
         [Parameter(Mandatory)][hashtable]$KnownWorkers
     )
@@ -149,15 +239,16 @@ function Resolve-WorkerAttribution {
         $key = "$($w.ProcessId)|$($w.CreationDate.Ticks)"
         $seenKeys[$key] = $true
 
-        if (($null -ne $TopazPids) -and ($TopazPids -contains $w.ParentProcessId)) {
-            # A current child of a live Topaz GUI PID: adopt it as known.
+        if (($null -ne $DescendantPids) -and ($DescendantPids -contains $w.ProcessId)) {
+            # Descends from a live Topaz GUI PID (child, grandchild, deeper):
+            # adopt it as known.
             $KnownWorkers[$key] = $true
             $matched.Add($w)
         }
         elseif ($KnownWorkers.ContainsKey($key)) {
-            # Not (currently provably) a child of a live GUI, but this exact
-            # process (same PID + CreationDate) was adopted earlier: it is an
-            # orphan that is still encoding after its parent GUI exited.
+            # Not (currently provably) descended from a live GUI, but this
+            # exact process (same PID + CreationDate) was adopted earlier: it
+            # is an orphan that is still encoding after its parent GUI exited.
             $matched.Add($w)
         }
     }
@@ -171,8 +262,8 @@ function Resolve-WorkerAttribution {
         }
     }
 
-    if (($null -eq $TopazPids) -and ($matched.Count -eq 0)) {
-        # PID query failed AND no known orphan is alive to confirm activity
+    if (($null -eq $DescendantPids) -and ($matched.Count -eq 0)) {
+        # Ancestry unknown AND no known orphan is alive to confirm activity
         # either way: we genuinely cannot tell. Unknown, not "no worker".
         return $null
     }
@@ -192,20 +283,49 @@ function Get-TopazWorkers {
     .SYNOPSIS
         Encoder worker processes that count as an active render worker.
     .DESCRIPTION
-        Runs the WorkerNameLike CIM query UNCONDITIONALLY -- even when the
+        Runs the WorkerNamesLike CIM query UNCONDITIONALLY -- even when the
         Topaz GUI PID list is empty or itself unreadable -- because an
         orphaned worker (see $script:KnownWorkers above) can still be
-        encoding after its parent GUI process has exited or crashed. The
-        actual matching/adoption/pruning logic lives in the pure
-        Resolve-WorkerAttribution above so it is independently unit-testable.
+        encoding after its parent GUI process has exited or crashed.
+
+        Attribution is by ANCESTRY, not direct parentage: Topaz spawns
+        neuroserver.exe as a child of the GUI and ffmpeg.exe as a child of
+        THAT, so a one-level parent test misses the encoder entirely. The
+        cheap ProcessId/ParentProcessId snapshot below is what lets
+        Resolve-ProcessDescendants walk the whole subtree. Both that and the
+        matching/adoption/pruning logic are pure functions above, so they are
+        independently unit-testable.
     .OUTPUTS
         See Resolve-WorkerAttribution.
     #>
     $topazPids = Get-TopazPids   # $null = PID query failed (unknown), @() = none running
 
+    # Ancestry snapshot. Only two properties are selected because this query
+    # covers EVERY process on the box and runs on every poll; pulling full
+    # Win32_Process instances here would be needlessly expensive.
     try {
+        $allProcesses = @(Get-CimInstance -ClassName Win32_Process `
+            -Property ProcessId, ParentProcessId -OperationTimeoutSec 30 -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId)
+    }
+    catch {
+        Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+            -Message "Get-TopazWorkers process-tree query failed: $($_.Exception.Message)"
+        $allProcesses = @()
+        # Ancestry is now unknowable this poll. Force the $null contract
+        # rather than silently attributing nothing: with an empty process
+        # table Resolve-ProcessDescendants would return @() ("the GUI has no
+        # descendants"), which reads as a CONFIRMED idle box and could
+        # complete the queue mid-render.
+        $topazPids = $null
+    }
+
+    $descendantPids = Resolve-ProcessDescendants -AllProcesses $allProcesses -RootPids $topazPids
+
+    try {
+        $workerFilter = Build-WorkerWqlFilter -Patterns $cfg.WorkerNamesLike
         $workers = @(Get-CimInstance -ClassName Win32_Process `
-            -Filter "Name LIKE '$($cfg.WorkerNameLike)'" -ErrorAction Stop)
+            -Filter $workerFilter -OperationTimeoutSec 30 -ErrorAction Stop)
     }
     catch {
         Write-TopazLog -Component 'watchdog' -Level 'WARN' `
@@ -213,7 +333,54 @@ function Get-TopazWorkers {
         return $null
     }
 
-    return Resolve-WorkerAttribution -TopazPids $topazPids -Workers $workers -KnownWorkers $script:KnownWorkers
+    return Resolve-WorkerAttribution -DescendantPids $descendantPids -Workers $workers -KnownWorkers $script:KnownWorkers
+}
+
+function Get-WorkerIoBytes {
+    <#
+    .SYNOPSIS
+        Pure: total cumulative bytes read+written by the supplied worker
+        processes, or $null when the worker set itself is unknown. No I/O of
+        its own, so it is fully unit-testable.
+    .DESCRIPTION
+        THE REASON THIS EXISTS. The stall detector originally asked "has the
+        output FOLDER grown?", summing Get-ChildItem lengths. On NTFS that is
+        not a reliable progress signal: while a writer holds a file handle
+        open, the directory entry's length is only refreshed on an occasional
+        metadata flush, not on every write. Measured on this deployment during
+        a demonstrably healthy render, the reported length of the output file
+        sat frozen for 476 seconds between two updates, and stayed at its
+        initial value for 699 seconds from the start of the job -- roughly
+        78% of the 900s stall budget that was the default, burned by a job
+        doing nothing wrong.
+
+        A process's ReadTransferCount/WriteTransferCount are kernel-maintained
+        counters. They advance on every single write regardless of file-handle
+        or metadata-flush behaviour, which makes them the signal the stall
+        detector actually wants. The folder-size check is retained alongside
+        this one (see Get-NextWatchdogState) purely as a second opinion.
+
+        Counters are cumulative PER PROCESS, so the sum can DROP when one
+        worker exits and another starts (Topaz runs one neuroserver per queue
+        item). Callers must therefore treat ANY delta -- up or down -- as
+        proof of life, exactly as they already do for the folder byte count.
+    .PARAMETER Workers
+        The matched worker processes, or $null if the worker signal was
+        unreadable this poll. Each item is expected to expose
+        .ReadTransferCount / .WriteTransferCount; missing values contribute 0.
+    .OUTPUTS
+        [int64] total, or $null when $Workers is $null.
+    #>
+    param([AllowNull()]$Workers)
+
+    if ($null -eq $Workers) { return $null }
+
+    $total = [int64]0
+    foreach ($w in $Workers) {
+        if ($null -ne $w.ReadTransferCount)  { $total += [int64]$w.ReadTransferCount }
+        if ($null -ne $w.WriteTransferCount) { $total += [int64]$w.WriteTransferCount }
+    }
+    return $total
 }
 
 function Get-OutputBytes {
@@ -286,12 +453,20 @@ function Test-RenderActive {
         PSReference-of-PSReference and rejects via its own type validation.
         That was an unconditional terminating error on every single poll.
     .OUTPUTS
-        [pscustomobject]@{ Active = <bool|$null>; WorkerActive = <bool|$null>; GpuValue = <double|$null> }
+        [pscustomobject]@{ Active = <bool|$null>; WorkerActive = <bool|$null>;
+        GpuValue = <double|$null>; IoBytes = <int64|$null> }
+
+        IoBytes is the workers' cumulative read+write byte total this poll, or
+        $null when the worker signal was unreadable. It is carried here rather
+        than re-queried by the caller so that it describes EXACTLY the same
+        worker set the Active decision was made from -- re-querying would race
+        against a worker exiting between the two calls.
     #>
     param()
 
     $workers = Get-TopazWorkers
     $workerActive = if ($null -eq $workers) { $null } else { $workers.Count -gt 0 }
+    $ioBytes = Get-WorkerIoBytes -Workers $workers
 
     # Only pay the nvidia-smi cost when the GPU signal is actually used.
     $gpu = $null
@@ -307,6 +482,7 @@ function Test-RenderActive {
         Active       = $active
         WorkerActive = $workerActive
         GpuValue     = $gpu
+        IoBytes      = $ioBytes
     }
 }
 
@@ -339,6 +515,22 @@ function Get-NextWatchdogState {
         Active is $true (mirrors the original loop, which never bothered
         measuring output size on an inactive/unknown poll) -- pass $null
         otherwise.
+    .PARAMETER LastIoBytes
+        The worker I/O byte total as of the last poll, or $null if it was
+        never established.
+    .PARAMETER CurrentIoBytes
+        The freshly-measured worker I/O byte total (see Get-WorkerIoBytes), or
+        $null if the worker signal was unreadable this poll.
+
+        PROGRESS IS THE UNION OF THE TWO SIGNALS. A render counts as making
+        progress if the output folder changed size OR the workers' cumulative
+        I/O counters moved. The folder-size signal alone is not trustworthy on
+        NTFS -- an open writer's directory entry was measured frozen for 476
+        consecutive seconds mid-render on this deployment -- so relying on it
+        alone lets a healthy job accrue stall time until it is killed. The I/O
+        counters move on every write and carry the signal in practice; the
+        folder size is kept as corroboration for the case where a worker is
+        replaced between polls and its counters reset.
     .PARAMETER PollSec
         Seconds between polls (the increment added to Idle/StallSec).
     .PARAMETER DebounceSec
@@ -355,9 +547,13 @@ function Get-NextWatchdogState {
         [Parameter(Mandatory)][int]$IdleSec,
         [Parameter(Mandatory)][int]$StallSec,
         [Parameter(Mandatory)][bool]$SawActivity,
+        [int]$ActiveSec = 0,
+        [int]$ArmSec = 0,
         [Parameter(Mandatory)][int64]$LastBytes,
         [AllowNull()]$Active,
         [AllowNull()]$CurrentBytes,
+        [AllowNull()]$LastIoBytes,
+        [AllowNull()]$CurrentIoBytes,
         [Parameter(Mandatory)][int]$PollSec,
         [Parameter(Mandatory)][int]$DebounceSec,
         [Parameter(Mandatory)][int]$StallLimitSec
@@ -375,38 +571,75 @@ function Get-NextWatchdogState {
             IdleSec      = $IdleSec
             StallSec     = $StallSec
             SawActivity  = $SawActivity
+            # Frozen along with everything else: an unreadable poll is not
+            # evidence the worker went away, so it must not reset the arm
+            # counter and force a genuine render to re-earn its 90 seconds.
+            ActiveSec    = $ActiveSec
             LastBytes    = $LastBytes
+            LastIoBytes  = $LastIoBytes
             BytesChanged = $false
             Verdict      = 'continue'
         }
     }
 
     if ($Active) {
-        # A render is active: not idle. Record that a render actually began so
-        # the completion path below may arm.
-        $newIdleSec     = 0
-        $newSawActivity = $true
+        # A render is active: not idle.
+        $newIdleSec   = 0
+        $newActiveSec = $ActiveSec + $PollSec
 
-        if ($CurrentBytes -ne $LastBytes) {
-            # Output changed (grew OR shrank) -> healthy, reset stall
-            # tracking. A genuinely stalled worker writes nothing at all, so
-            # ANY delta means it is alive. Comparing for growth-only left a
-            # high-water-mark bug: when Topaz deletes a large _temp scratch
-            # file the output folder can SHRINK, and a healthy next job
-            # growing back up from that lower base could then sit under the
-            # old high-water mark for the whole StallSec window and get
-            # killed as "stalled" mid-render.
+        # ARM DEBOUNCE. SawActivity is what makes the watchdog willing to ever
+        # declare a queue complete, so setting it on a single active poll is
+        # too eager: Topaz spawns short-lived ffmpeg/ffprobe helpers for
+        # previews and thumbnails, and one of those (measured at under 32
+        # seconds) once armed the watchdog on a box where no render had run,
+        # very nearly stopping it. Requiring ArmSec of CONTINUOUS activity
+        # first distinguishes a real job -- whose neuroserver.exe lives for
+        # minutes to hours -- from GUI noise.
+        #
+        # Once armed it STAYS armed ($SawActivity -or ...): a real render that
+        # later pauses between queue items must not disarm itself, or the
+        # completion path could never fire.
+        $newSawActivity = $SawActivity -or ($newActiveSec -ge $ArmSec)
+
+        # Output changed (grew OR shrank) -> healthy. A genuinely stalled
+        # worker writes nothing at all, so ANY delta means it is alive.
+        # Comparing for growth-only left a high-water-mark bug: when Topaz
+        # deletes a large _temp scratch file the output folder can SHRINK,
+        # and a healthy next job growing back up from that lower base could
+        # then sit under the old high-water mark for the whole StallSec
+        # window and get killed as "stalled" mid-render.
+        $bytesProgressed = ($CurrentBytes -ne $LastBytes)
+
+        # The workers' cumulative I/O counters moved -> also healthy, and far
+        # more reliable than the byte count above (see the CurrentIoBytes
+        # parameter notes). Both sides must be known for a delta to mean
+        # anything: an unreadable counter is not evidence of a stall.
+        # The counters are per-process and reset when Topaz swaps in a fresh
+        # worker for the next queue item, so -ne (not -gt) is deliberate --
+        # any movement, in either direction, proves something is alive.
+        $ioProgressed = ($null -ne $CurrentIoBytes) -and
+                        ($null -ne $LastIoBytes) -and
+                        ($CurrentIoBytes -ne $LastIoBytes)
+
+        # Carry the I/O reading forward whenever we actually got one, so a
+        # single unreadable poll does not erase the baseline and manufacture
+        # a false delta on the next one.
+        $newIoBytes = if ($null -ne $CurrentIoBytes) { $CurrentIoBytes } else { $LastIoBytes }
+
+        if ($bytesProgressed -or $ioProgressed) {
             return [pscustomobject]@{
                 IdleSec      = $newIdleSec
                 StallSec     = 0
                 SawActivity  = $newSawActivity
+                ActiveSec    = $newActiveSec
                 LastBytes    = $CurrentBytes
+                LastIoBytes  = $newIoBytes
                 BytesChanged = $true
                 Verdict      = 'continue'
             }
         }
 
-        # Active but byte count unchanged -> accrue stall time.
+        # Active but NEITHER progress signal moved -> accrue stall time.
         $newStallSec = $StallSec + $PollSec
         $verdict = if ($newStallSec -ge $StallLimitSec) { 'stalled' } else { 'continue' }
 
@@ -414,7 +647,9 @@ function Get-NextWatchdogState {
             IdleSec      = $newIdleSec
             StallSec     = $newStallSec
             SawActivity  = $newSawActivity
+            ActiveSec    = $newActiveSec
             LastBytes    = $LastBytes
+            LastIoBytes  = $newIoBytes
             BytesChanged = $false
             Verdict      = $verdict
         }
@@ -433,7 +668,12 @@ function Get-NextWatchdogState {
             IdleSec      = $newIdleSec
             StallSec     = $newStallSec
             SawActivity  = $SawActivity
+            # The worker is gone, so any partial arm progress is discarded. A
+            # burst of short-lived preview helpers must never accumulate
+            # towards ArmSec across the gaps between them.
+            ActiveSec    = 0
             LastBytes    = $LastBytes
+            LastIoBytes  = $LastIoBytes
             BytesChanged = $false
             Verdict      = 'continue'
         }
@@ -445,7 +685,9 @@ function Get-NextWatchdogState {
         IdleSec      = $newIdleSec
         StallSec     = $newStallSec
         SawActivity  = $SawActivity
+        ActiveSec    = 0
         LastBytes    = $LastBytes
+        LastIoBytes  = $LastIoBytes
         BytesChanged = $false
         Verdict      = $verdict
     }
@@ -529,7 +771,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
 
     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
-        -Message "Topaz GUI detected. Monitoring render queue (poll=$($cfg.PollSec)s, debounce=$($cfg.DebounceSec)s, stall=$($cfg.StallSec)s, worker LIKE '$($cfg.WorkerNameLike)')."
+        -Message "Topaz GUI detected. Monitoring render queue (poll=$($cfg.PollSec)s, debounce=$($cfg.DebounceSec)s, stall=$($cfg.StallSec)s, workers matching [$($cfg.WorkerNamesLike -join ', ')] by ancestry)."
 
     # ---------------------------------------------------------------------------
     # 2-4. Monitor the queue, gate on unlocked outputs, then stop -- wrapped in an
@@ -541,9 +783,11 @@ if ($MyInvocation.InvocationName -ne '.') {
     # ---------------------------------------------------------------------------
 
     $idleSec     = 0            # seconds with no active render
-    $stallSec    = 0            # seconds a render is active but output not growing
-    $sawActivity = $false       # have we ever observed an active render?
+    $stallSec    = 0            # seconds a render is active but making no progress
+    $sawActivity = $false       # have we ever observed a SUSTAINED active render?
+    $activeSec   = 0            # consecutive seconds active, for the arm debounce
     $lastBytes   = Get-OutputBytes
+    $lastIoBytes = $null        # workers' cumulative I/O total; $null until first read
 
     :outer while ($true) {
 
@@ -562,8 +806,10 @@ if ($MyInvocation.InvocationName -ne '.') {
             $active       = $result.Active
             $workerActive = $result.WorkerActive
             $gpuValue     = $result.GpuValue
+            $ioBytes      = $result.IoBytes
             $gpuText    = if ($null -eq $gpuValue) { 'n/a' } else { "$gpuValue%" }
             $workerText = if ($null -eq $workerActive) { 'unknown' } else { $workerActive }
+            $ioText     = if ($null -eq $ioBytes) { 'n/a' } else { $ioBytes }
 
             # Only measure output size when it will actually be consulted (Active
             # $true) -- mirrors the original loop, which never bothered on an
@@ -571,7 +817,9 @@ if ($MyInvocation.InvocationName -ne '.') {
             $currentBytes = if ($active -eq $true) { Get-OutputBytes } else { $null }
 
             $state = Get-NextWatchdogState -IdleSec $idleSec -StallSec $stallSec -SawActivity $sawActivity `
-                -LastBytes $lastBytes -Active $active -CurrentBytes $currentBytes -PollSec $cfg.PollSec `
+                -ActiveSec $activeSec -ArmSec $cfg.ArmSec `
+                -LastBytes $lastBytes -Active $active -CurrentBytes $currentBytes `
+                -LastIoBytes $lastIoBytes -CurrentIoBytes $ioBytes -PollSec $cfg.PollSec `
                 -DebounceSec $cfg.DebounceSec -StallLimitSec $cfg.StallSec
 
             if ($null -eq $active) {
@@ -588,14 +836,17 @@ if ($MyInvocation.InvocationName -ne '.') {
             $idleSec     = $state.IdleSec
             $stallSec    = $state.StallSec
             $sawActivity = $state.SawActivity
+            $activeSec   = $state.ActiveSec
             $lastBytes   = $state.LastBytes
+            $lastIoBytes = $state.LastIoBytes
 
             if ($active) {
                 if (-not $state.BytesChanged) {
                     # Active but byte count unchanged -> accruing stall time (a
                     # healthy byte-delta reset logs nothing, same as before).
+                    $armText = if ($sawActivity) { 'armed' } else { "arming ${activeSec}s/$($cfg.ArmSec)s" }
                     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
-                        -Message "Render active (worker=$workerText gpu=$gpuText) but output not growing (stall=${stallSec}s / $($cfg.StallSec)s, bytes=$currentBytes)."
+                        -Message "Render active (worker=$workerText gpu=$gpuText, $armText) but NO progress on either signal (stall=${stallSec}s / $($cfg.StallSec)s, outputBytes=$currentBytes, workerIoBytes=$ioText)."
 
                     if ($state.Verdict -eq 'stalled') {
                         Write-TopazLog -Component 'watchdog' -Level 'WARN' `
@@ -613,7 +864,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     # configuring the export). Do NOT treat that as a completed queue,
                     # or we would stop the instance before any render begins.
                     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
-                        -Message "Topaz GUI up but no render has started yet (idle=${idleSec}s, worker=$workerText gpu=$gpuText). Waiting for the first render before arming completion."
+                        -Message "Topaz GUI up but no render has started yet (idle=${idleSec}s, worker=$workerText gpu=$gpuText). Waiting for $($cfg.ArmSec)s of sustained worker activity before arming completion."
                 }
                 else {
                     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
@@ -703,7 +954,15 @@ if ($MyInvocation.InvocationName -ne '.') {
                 $idleSec     = 0
                 $stallSec    = 0
                 $sawActivity = $true
+                # A render was just re-verified as genuinely active, so it has
+                # already earned its arm; start the counter at ArmSec rather
+                # than 0 so a mid-queue lull cannot un-arm it.
+                $activeSec   = $cfg.ArmSec
                 $lastBytes   = Get-OutputBytes
+                # Drop the I/O baseline: it belongs to the worker set from
+                # before this gap. Re-baselining on the next poll avoids
+                # comparing against counters from a process that has exited.
+                $lastIoBytes = $null
                 continue outer
             }
         }
@@ -728,7 +987,11 @@ if ($MyInvocation.InvocationName -ne '.') {
             $idleSec     = 0
             $stallSec    = 0
             $sawActivity = $false
+            # Fully disarmed for the next queue: the next render must again
+            # prove itself with ArmSec of sustained activity.
+            $activeSec   = 0
             $lastBytes   = Get-OutputBytes
+            $lastIoBytes = $null
             continue outer
         }
 

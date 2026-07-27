@@ -23,10 +23,14 @@ stop` and then **reads the attribute back** to confirm it took, aborting if the
 value is anything other than `stop`.
 
 Why it matters: a default EC2 instance **terminates** on a guest-initiated
-shutdown. With this set to `stop`, the watchdog's `Stop-Computer -Force` stops
-the box (preserving the root volume and letting you restart it) instead of
-destroying it. This is what lets the primary stop path work with **no AWS API
-call and no credentials on the box** (see [Architecture](01-architecture.md)).
+shutdown. With this set to `stop`, a guest-initiated `Stop-Computer -Force`
+stops the box (preserving the root volume and letting you restart it) instead
+of destroying it. This is required regardless of `Config.ps1`'s `StopStrategy`
+setting: even the default `'Auto'` strategy - which tries `ec2:StopInstances`
+first - falls back to this same guest shutdown whenever the API call is
+denied or does not take effect, so this is the credential-free **fallback**
+leg that every strategy except a bare `'Ec2ApiStop'` still depends on (see
+[Architecture](01-architecture.md)).
 
 ## 2. Create the least-privilege instance role
 
@@ -72,7 +76,7 @@ condition to that value before applying it (and to
 must agree, or the watchdog's `PutMetricData` calls to the custom namespace
 are denied outright.
 
-**Optional API-stop grant (off by default):**
+**Optional at this script's level, but exercised by default in `Config.ps1`:**
 
 ```bash
 INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> INCLUDE_EC2_STOP=1 \
@@ -84,15 +88,27 @@ INSTANCE_ID=i-XXXXXXXXXXXXXXXXX AWS_REGION=<region> INCLUDE_EC2_STOP=1 \
 an `ec2:StopInstances` grant **tag-scoped** to instances tagged
 `AutoStopEligible=true`, and **also tags the instance `AutoStopEligible=true`**
 itself as part of the same run - without that tag the grant it just attached
-would be unusable (every API stop call would fail `UnauthorizedOperation`). This
-is belt-and-suspenders for operators who want an API stop path; the normal
-guest-shutdown stop does not use it. Leave it off unless you specifically want
-it.
+would be unusable (every API stop call would fail `UnauthorizedOperation`).
 
-> **The primary path deliberately does not need this permission.** Granting
-> `ec2:StopInstances` is a *choice*, not a requirement. Keeping it off means the
-> box literally cannot call the EC2 API to stop anything - it can only shut its
-> own OS down.
+This script still treats the grant as opt-in - it is not attached unless you
+pass `INCLUDE_EC2_STOP=1` - but `in-guest/Config.ps1`'s `StopStrategy` now
+**defaults to `'Auto'`**, which tries `ec2:StopInstances` **first** on every
+stop regardless of whether this grant exists. Skip `INCLUDE_EC2_STOP=1` and
+that first attempt simply gets `AccessDenied` every time, costing one bounded
+AWS CLI round trip before `'Auto'` falls back to the credential-free
+`GuestShutdown` leg - harmless, but not free, and the box then depends
+entirely on `InstanceInitiatedShutdownBehavior=stop` (step 1 above) to
+actually end billing. Grant it if you want the stop to be provable rather
+than merely probable; leave it off (and consider setting
+`StopStrategy='GuestShutdown'` in `Config.ps1` to skip the wasted attempt
+outright) to keep the box's original zero-credential posture.
+
+> **Granting `ec2:StopInstances` is still a deliberate choice, not a bare
+> requirement.** The guest-shutdown fallback keeps working with or without
+> it. What changed is the default *order*: `'Auto'` reaches for the API first
+> because it is the only action that provably ends billing, not because the
+> guest-shutdown leg stopped working. See
+> [docs/01-architecture.md](01-architecture.md) for the full trade-off.
 
 Re-running the script *without* `INCLUDE_EC2_STOP=1` never auto-revokes a grant
 from an earlier run that had it set - that would be a destructive surprise the

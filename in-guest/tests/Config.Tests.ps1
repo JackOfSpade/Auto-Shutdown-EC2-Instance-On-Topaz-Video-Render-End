@@ -338,6 +338,78 @@ Describe 'Write-TopazLog output-stream hygiene' {
     }
 }
 
+Describe 'Write-TopazLog timestamp contract' {
+
+    # WHAT THIS GUARDS. These logs are the ONLY post-mortem available once the
+    # box has powered itself off, and reconstructing a render cycle means
+    # reading them alongside two other clocks: AWS API timestamps (UTC, ISO
+    # 8601) and Topaz's own .tzlog (box-local, millisecond precision). Two
+    # concrete failures motivated this contract:
+    #
+    #   1. Whole-second stamps lost ORDERING. A real completion logged three
+    #      consecutive lines all stamped [2026-07-27 12:51:35], so the log
+    #      could not say how long the output-unlock scan took, nor in which
+    #      order the handoff steps ran.
+    #   2. WARN and ERROR printed the BARE message to the console while the
+    #      log file received a timestamped copy, so a console transcript of a
+    #      live failure could not be aligned with the file it mirrored.
+    #
+    # A missing offset additionally forces the reader to ASSUME the box's time
+    # zone before comparing anything against AWS.
+
+    BeforeAll {
+        # [yyyy-MM-dd HH:mm:ss.fff +NN:NN] [LEVEL] -- millisecond precision and
+        # an explicit signed UTC offset are both required.
+        #
+        # Built by CONCATENATION, deliberately: the regex quantifiers here
+        # ({4}, {2}, {3}) collide with PowerShell's -f format placeholders, so
+        # "pattern -f 'INFO'" throws "Index (zero based) must be greater than
+        # or equal to zero and less than the size of the argument list".
+        $script:StampPrefix = '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] \['
+        $script:StampSuffix = '\] '
+    }
+
+    It 'stamps INFO with millisecond precision and an explicit UTC offset' {
+        $info = Write-TopazLog -Component 'test' -Level 'INFO' -Message 'stamp check' 6>&1
+        "$info" | Should -Match ($script:StampPrefix + 'INFO' + $script:StampSuffix)
+    }
+
+    It 'stamps WARN on the CONSOLE, not just in the log file' {
+        $warn = Write-TopazLog -Component 'test' -Level 'WARN' -Message 'stamp check' 3>&1
+        "$warn" | Should -Match ($script:StampPrefix + 'WARN' + $script:StampSuffix)
+    }
+
+    It 'stamps ERROR on the CONSOLE, not just in the log file' {
+        $err = & {
+            # Write-TopazLog calls Write-Error without -ErrorAction; a caller
+            # preference of 'Stop' would turn this into a throw rather than a
+            # capturable record.
+            $ErrorActionPreference = 'Continue'
+            Write-TopazLog -Component 'test' -Level 'ERROR' -Message 'stamp check' 2>&1
+        }
+        "$err" | Should -Match ($script:StampPrefix + 'ERROR' + $script:StampSuffix)
+    }
+
+    It 'still keeps WARN and ERROR off the output stream despite now passing the full line' {
+        # The timestamp fix routes $line (not $Message) into Write-Warning and
+        # Write-Error. Neither writes to the output stream -- but if anyone
+        # "simplifies" them to Write-Output/Write-Host, the return-value
+        # contract guarded above breaks again, this time on the failure paths
+        # where it matters most.
+        function Get-TestFalseAfterWarn {
+            Write-TopazLog -Component 'test' -Level 'WARN'  -Message 'w' 3>$null
+            Write-TopazLog -Component 'test' -Level 'ERROR' -Message 'e' 2>$null
+            return $false
+        }
+
+        $result = Get-TestFalseAfterWarn
+
+        @($result).Count | Should -Be 1
+        $result | Should -BeOfType [bool]
+        [bool]($result -eq $false) | Should -BeTrue
+    }
+}
+
 Describe 'Assert-ValidCompletionSignal' {
 
     It 'does not throw for WorkerOnly' {

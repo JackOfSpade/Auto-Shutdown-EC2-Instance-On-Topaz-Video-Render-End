@@ -195,7 +195,7 @@ try {
         -Trigger $trigger `
         -Settings $settings `
         -Principal $principalObj `
-        -Description "Topaz auto-stop wall-clock backstop: stops this instance at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss')) regardless of render state." `
+        -Description "Topaz auto-stop wall-clock backstop: stops this instance at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) regardless of render state." `
         -Force -ErrorAction Stop | Out-Null
 
     # -ErrorAction SilentlyContinue (not Stop): a not-found Get-ScheduledTask
@@ -209,14 +209,20 @@ try {
         throw "Register-TimedStop.ps1: registration could not be verified."
     }
 
+    # The fire time carries its UTC offset. Without it this line holds TWO
+    # timestamps -- Write-TopazLog's own stamp and this embedded $fireAt -- that
+    # look structurally identical, so a reader has no way to tell whether the
+    # deadline is quoted in the same zone as the line it sits on. This is a
+    # COST CAP; misreading it by a whole timezone is expensive in exactly the
+    # direction nobody notices until the bill arrives.
     Write-TopazLog -Component 'timedstop' -Level 'INFO' `
-        -Message "Timed stop ARMED: task '$taskName' will run Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss')) (in $Hours h)."
+        -Message "Timed stop ARMED: task '$taskName' will run Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) (in $Hours h)."
 
     Write-Output ""
     Write-Output "  Timed stop armed"
     Write-Output "  ----------------"
     Write-Output "  Task        : $taskName"
-    Write-Output "  Fires at    : $($fireAt.ToString('yyyy-MM-dd HH:mm:ss')) (local)  -- in $Hours hour(s)"
+    Write-Output "  Fires at    : $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) (local)  -- in $Hours hour(s)"
     Write-Output "  Retries     : every $RetryIntervalMinutes min if the stop is REFUSED"
     Write-Output "                (the upload interlock can refuse it; see stop.log)"
     Write-Output "  Action      : Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun"
@@ -245,6 +251,12 @@ try {
         }
     }
     catch {
+        # Also persist it. This is a genuine caught failure, and the console is
+        # not a record: if the courtesy check cannot see the process table, the
+        # operator is arming a wall-clock stop WITHOUT the one warning that
+        # would have told them a render is already running.
+        Write-TopazLog -Component 'timedstop' -Level 'WARN' `
+            -Message "Could not check for a live render before arming the timed stop: $($_.Exception.Message). The $Hours h deadline was set WITHOUT confirming whether a render is currently in progress."
         Write-Output "  (could not check for a live render: $($_.Exception.Message))"
         Write-Output ""
     }

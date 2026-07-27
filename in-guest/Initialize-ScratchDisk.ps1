@@ -83,7 +83,7 @@ if ($existing -and $existing.FileSystemType -ne 'Unknown') {
             -Message "Created output directory '$outputDir' on existing ${driveLetter}:."
     }
     Write-TopazLog -Component 'scratch' -Level 'INFO' `
-        -Message "Scratch drive ${driveLetter}: already present ($([math]::Round($existing.SizeRemaining/1GB,1)) GB free of $([math]::Round($existing.Size/1GB,1)) GB). Nothing to do."
+        -Message "Scratch drive ${driveLetter}: already present ($([math]::Round($existing.SizeRemaining/1GB,1)) GiB free of $([math]::Round($existing.Size/1GB,1)) GiB). Nothing to do."
     return
 }
 
@@ -132,7 +132,7 @@ if ($candidates.Count -eq 0) {
 
 if ($candidates.Count -gt 1) {
     # Refuse rather than guess. Picking wrong here destroys a disk.
-    $desc = ($candidates | ForEach-Object { "Disk $($_.Number) ($([math]::Round($_.Size/1GB,1))GB serial=$($_.SerialNumber))" }) -join '; '
+    $desc = ($candidates | ForEach-Object { "Disk $($_.Number) ($([math]::Round($_.Size/1GB,1))GiB serial=$($_.SerialNumber))" }) -join '; '
     Write-TopazLog -Component 'scratch' -Level 'ERROR' `
         -Message "AMBIGUOUS: $($candidates.Count) disks matched the instance-store filter ($desc). Refusing to format any of them. Resolve manually."
     throw "Initialize-ScratchDisk.ps1: ambiguous disk selection ($($candidates.Count) matches)."
@@ -151,7 +151,7 @@ if ($disk.SerialNumber -match '^vol') {
 }
 
 Write-TopazLog -Component 'scratch' -Level 'INFO' `
-    -Message "Selected Disk $($disk.Number) ($([math]::Round($disk.Size/1GB,1)) GB, serial=$($disk.SerialNumber)) as the instance-store scratch disk."
+    -Message "Selected Disk $($disk.Number) ($([math]::Round($disk.Size/1GB,1)) GiB, serial=$($disk.SerialNumber)) as the instance-store scratch disk."
 
 if ($WhatIfOnly) {
     Write-Output "WHAT-IF: would initialize Disk $($disk.Number) as GPT, create one full-size NTFS partition labelled '$label' as ${driveLetter}:, then create '$outputDir'."
@@ -195,14 +195,14 @@ try {
 
     $vol = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
     Write-TopazLog -Component 'scratch' -Level 'INFO' `
-        -Message "Scratch drive ready: ${driveLetter}: '$label' $([math]::Round($vol.Size/1GB,1)) GB, output directory '$outputDir' created (only this directory is uploaded)."
+        -Message "Scratch drive ready: ${driveLetter}: '$label' $([math]::Round($vol.Size/1GB,1)) GiB, output directory '$outputDir' created (only this directory is uploaded)."
 
     Write-Output ""
     Write-Output "  Scratch drive ready"
     Write-Output "  -------------------"
     Write-Output "  Disk        : $($disk.Number) (instance store, serial $($disk.SerialNumber))"
     Write-Output "  Mounted as  : ${driveLetter}:  label '$label'"
-    Write-Output "  Size        : $([math]::Round($vol.Size/1GB,1)) GB"
+    Write-Output "  Size        : $([math]::Round($vol.Size/1GB,1)) GiB"
     Write-Output "  Output dir  : $outputDir   (the ONLY thing uploaded to Drive)"
     Write-Output ""
     Write-Output "  Drop source footage anywhere else on ${driveLetter}: (the root is fine) -"

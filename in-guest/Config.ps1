@@ -327,6 +327,23 @@ function Get-TopazAutoStopConfig {
         # before the encoder starts producing output.
         StallSec         = 1800
 
+        # Bound (seconds) on how long the watchdog may log NOTHING while a
+        # render is healthy and progressing. 0 disables heartbeats.
+        #
+        # The poll loop is deliberately quiet: it logs stalls, idle countdowns
+        # and unreadable signals, but a progressing render logs nothing, so a
+        # long job does not produce thousands of identical lines. The cost of
+        # that is a healthy render being indistinguishable from a dead
+        # watchdog. MEASURED 2026-07-27: a 4K job left watchdog.log completely
+        # empty from 07:55:33 to 12:44:33 -- 4 h 49 m with no evidence the
+        # watchdog was alive at all (docs/14).
+        #
+        # 300s bounds that silence at five minutes. On a five-hour render that
+        # is ~60 lines total, trivial against the 5 MB rotation threshold, and
+        # it makes "the watchdog stopped logging" a real signal instead of the
+        # normal case. See Get-NextHeartbeatState in Watchdog.ps1.
+        HeartbeatSec     = 300
+
         # After "done", the watchdog waits up to this many minutes for every
         # output file to become unlocked before it hands off to the stop step.
         UnlockTimeoutMin = 5
@@ -516,7 +533,24 @@ function Write-TopazLog {
     )
 
     $cfg = Get-TopazAutoStopConfig
-    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+
+    # Millisecond precision AND an explicit UTC offset. Both are load-bearing
+    # for post-mortems, and both were learned from real analysis friction:
+    #
+    #   .fff  Whole-second stamps lose ORDERING. A real completion emitted
+    #         three consecutive lines all stamped [2026-07-27 12:51:35] --
+    #         "QUEUE considered COMPLETE", "waiting for output files to
+    #         unlock", "All output files are unlocked" -- so the log could not
+    #         show how long the unlock scan actually took, only that it was
+    #         under a second. The same bunching hides the ordering of a stop
+    #         handoff, which is exactly where a failure would need unpicking.
+    #
+    #   zzz   These logs are read side by side with AWS API timestamps (UTC,
+    #         ISO 8601) and with Topaz's own .tzlog (box-local, millisecond).
+    #         With no offset the reader has to ASSUME the box's zone; stating
+    #         it removes a guess from every cross-source correlation. It also
+    #         survives the box being re-imaged into another region.
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff zzz')
     $line = "[$stamp] [$Level] $Message"
 
     # INFO goes to the INFORMATION stream, never the output stream.
@@ -536,9 +570,17 @@ function Write-TopazLog {
     # erasing the render it had failed to save. Write-Information still
     # displays (InformationAction Continue) and still reaches the log file
     # below, but it cannot contaminate a return value.
+    #
+    # Every level emits the TIMESTAMPED $line, not the bare $Message. WARN and
+    # ERROR used to print undated text to the console while the log FILE got a
+    # timestamped copy, so a console transcript of a failure could not be lined
+    # up against the file it was supposedly mirroring -- worst exactly when a
+    # failure is being watched live. Neither Write-Warning nor Write-Error
+    # touches the output stream, so passing $line here cannot contaminate a
+    # return value the way Write-Output would.
     switch ($Level) {
-        'WARN'  { Write-Warning     $Message }
-        'ERROR' { Write-Error       $Message }
+        'WARN'  { Write-Warning     $line }
+        'ERROR' { Write-Error       $line }
         default { Write-Information $line -InformationAction Continue }
     }
 
@@ -1229,9 +1271,16 @@ function Invoke-TopazRenderUpload {
         return $true
     }
 
+    # PowerShell's 1GB literal is 2^30, so $totalBytes/1GB yields GiB, not GB.
+    # These lines used to label it "GB", which disagreed with rclone's own
+    # "9.836 GiB" for the SAME transfer by ~7% and invited the reader to think
+    # two different sizes were in play. The raw byte count is logged alongside
+    # it because that is the only figure that can be compared EXACTLY against
+    # rclone and against the destination listing when auditing whether a render
+    # arrived intact.
     $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
     Write-TopazLog -Component 'stop' -Level 'INFO' `
-        -Message "Uploading $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GB, from '$($cfg.OutputDir)' to '$($cfg.UploadTarget)' (reason=$Reason). This MUST finish before the instance may stop."
+        -Message "Uploading $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes), from '$($cfg.OutputDir)' to '$($cfg.UploadTarget)' (reason=$Reason). This MUST finish before the instance may stop."
 
     $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
 
@@ -1275,7 +1324,7 @@ function Invoke-TopazRenderUpload {
     if (-not $verified) { return $false }
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
-        -Message "Upload verified: $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GB now safely in '$($cfg.UploadTarget)'. Safe to stop."
+        -Message "Upload verified: $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes) now safely in '$($cfg.UploadTarget)'. Safe to stop."
     return $true
 }
 
@@ -1310,12 +1359,12 @@ function Get-TopazStopNotification {
     if ($DryRun) {
         return @{
             Subject = "Topaz render $Reason - DRY RUN (no stop) - $InstanceId"
-            Message = "Topaz watchdog decided '$Reason' on instance $InstanceId at $(Get-Date -Format 's'). DryRun is enabled, so the power-off was suppressed and the instance is still running."
+            Message = "Topaz watchdog decided '$Reason' on instance $InstanceId at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). DryRun is enabled, so the power-off was suppressed and the instance is still running."
         }
     }
 
     return @{
         Subject = "Topaz render $Reason - stopping $InstanceId"
-        Message = "Topaz render queue reported '$Reason' on instance $InstanceId at $(Get-Date -Format 's'). The guest is powering off, which stops the EC2 instance."
+        Message = "Topaz render queue reported '$Reason' on instance $InstanceId at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). The guest is powering off, which stops the EC2 instance."
     }
 }

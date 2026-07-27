@@ -749,6 +749,67 @@ function Resolve-RefusalStallSec {
     return [int]$carried
 }
 
+function Get-NextHeartbeatState {
+    <#
+    .SYNOPSIS
+        Pure: advance the "how long have we logged nothing" clock and decide
+        whether a heartbeat line is now due. No I/O.
+    .DESCRIPTION
+        WHY THIS EXISTS. This loop logs only on polls that are INTERESTING:
+        a stall, an idle countdown, an unreadable signal. A healthy, actively
+        progressing render logs nothing at all, deliberately, so that a long
+        job does not fill the log with thousands of identical lines.
+
+        Taken to its conclusion that means a healthy render is INVISIBLE. A
+        real 4K job on this box ran from 07:55:33 to 12:44:33 -- four hours
+        and forty-nine minutes -- during which watchdog.log contains not one
+        line (see docs/14). The render was fine, but the log could not
+        distinguish that from a watchdog that had crashed, wedged on a hung
+        CIM query, or been killed: the evidence for "still alive and working"
+        was identical to the evidence for "dead". That is the single worst
+        case for a post-mortem, because it is also the longest window.
+
+        So silence is now bounded: after HeartbeatSec of logging nothing, one
+        line is emitted. The clock measures SILENCE, not wall time -- every
+        branch that logs resets it -- so a stalling render that already logs
+        every poll gains no extra noise, and the heartbeat only ever appears
+        where there would otherwise be a void.
+
+        Cost at the defaults (PollSec=15, HeartbeatSec=300): one line per five
+        minutes of healthy rendering, i.e. ~12/hour, ~60 lines for the
+        five-hour render above -- against a 5 MB rotation threshold.
+    .PARAMETER SilentSec
+        Seconds of consecutive un-logged polls so far.
+    .PARAMETER PollSec
+        Config's PollSec; how much this poll adds.
+    .PARAMETER HeartbeatSec
+        Config's HeartbeatSec. Zero or negative DISABLES heartbeats entirely
+        (restoring the previous silent-while-healthy behaviour), in which case
+        the clock is pinned at 0 so it cannot quietly accumulate.
+    .OUTPUTS
+        [pscustomobject] @{ SilentSec = <int>; Due = <bool> }
+        Due = $true means the caller should log now; SilentSec is already
+        reset to 0 in that case, so the caller never has to remember to.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$SilentSec,
+        [Parameter(Mandatory)][int]$PollSec,
+        [Parameter(Mandatory)][int]$HeartbeatSec
+    )
+
+    if ($HeartbeatSec -le 0) {
+        return [pscustomobject]@{ SilentSec = 0; Due = $false }
+    }
+
+    $next = $SilentSec + $PollSec
+    if ($next -ge $HeartbeatSec) {
+        return [pscustomobject]@{ SilentSec = 0; Due = $true }
+    }
+
+    return [pscustomobject]@{ SilentSec = $next; Due = $false }
+}
+
 function Resolve-StopDecision {
     <#
     .SYNOPSIS
@@ -844,6 +905,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     $activeSec   = 0            # consecutive seconds active, for the arm debounce
     $lastBytes   = Get-OutputBytes
     $lastIoBytes = $null        # workers' cumulative I/O total; $null until first read
+    $silentSec   = 0            # seconds of consecutive un-logged polls (heartbeat clock)
 
     :outer while ($true) {
 
@@ -886,6 +948,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                 # log and wait for a better read on the next poll.
                 Write-TopazLog -Component 'watchdog' -Level 'WARN' `
                     -Message "worker+GPU signals unreadable; freezing watchdog state this poll (worker=$workerText gpu=$gpuText)."
+                # This poll DID log, so the silence clock restarts.
+                $silentSec = 0
                 continue
             }
 
@@ -903,6 +967,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $armText = if ($sawActivity) { 'armed' } else { "arming ${activeSec}s/$($cfg.ArmSec)s" }
                     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
                         -Message "Render active (worker=$workerText gpu=$gpuText, $armText) but NO progress on either signal (stall=${stallSec}s / $($cfg.StallSec)s, outputBytes=$currentBytes, workerIoBytes=$ioText)."
+                    $silentSec = 0
 
                     if ($state.Verdict -eq 'stalled') {
                         Write-TopazLog -Component 'watchdog' -Level 'WARN' `
@@ -911,8 +976,26 @@ if ($MyInvocation.InvocationName -ne '.') {
                         break
                     }
                 }
+                else {
+                    # THE ONLY SILENT PATH IN THIS LOOP: a healthy, progressing
+                    # render. Left alone it produces an unbroken void in the log
+                    # for the entire length of a job -- 4 h 49 m on the render in
+                    # docs/14 -- during which "working fine" and "watchdog dead"
+                    # look exactly alike. Bound that silence with a heartbeat.
+                    $hb = Get-NextHeartbeatState -SilentSec $silentSec `
+                        -PollSec $cfg.PollSec -HeartbeatSec $cfg.HeartbeatSec
+                    $silentSec = $hb.SilentSec
+
+                    if ($hb.Due) {
+                        $armText = if ($sawActivity) { 'armed' } else { "arming ${activeSec}s/$($cfg.ArmSec)s" }
+                        Write-TopazLog -Component 'watchdog' -Level 'INFO' `
+                            -Message "Render progressing (worker=$workerText gpu=$gpuText, $armText): active=${activeSec}s, outputBytes=$currentBytes, workerIoBytes=$ioText. Heartbeat every $($cfg.HeartbeatSec)s while healthy."
+                    }
+                }
             }
             else {
+                # Every branch below logs, so the silence clock restarts here.
+                $silentSec = 0
                 # No active render. Could be between queue items or genuinely done.
                 if (-not $sawActivity) {
                     # No render has started yet. "GUI up, nothing rendering" is also the

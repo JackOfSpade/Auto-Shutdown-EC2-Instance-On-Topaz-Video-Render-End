@@ -147,6 +147,27 @@ function Write-PreflightResult {
         Short check name, e.g. 'Elevation' or "Worker discovery ('ffmpeg.exe')".
     .PARAMETER Detail
         Human-readable explanation, appearing after ' - '.
+    .DESCRIPTION
+        Each result is written to BOTH the console and preflight.log.
+
+        Persisting every check used to be skipped, on the reasoning that the
+        operator is sitting there reading the console. That reasoning failed
+        the moment anyone had to read the result AFTERWARDS: a real run logged
+        only its summary line --
+
+            [2026-07-27 07:42:35] [WARN] Preflight verdict=GO pass=14 warn=2 fail=0.
+
+        -- and the DETAIL of those two warnings existed only as console text
+        that was never captured. A later post-mortem could establish that the
+        box had been warned about something before a five-hour render, but not
+        about WHAT, and the checks are not reproducible after the fact (the
+        instance-store volume, the running process tree, and the IAM answers
+        have all moved on).
+
+        Since every check in this script already funnels through this one
+        function, logging here captures all of them and nothing else needs to
+        change. Status maps to level so the file stays greppable:
+        PASS -> INFO, WARN -> WARN, FAIL -> ERROR.
     #>
     [CmdletBinding()]
     param(
@@ -156,6 +177,24 @@ function Write-PreflightResult {
     )
 
     Write-Output "[$Status] $Name - $Detail"
+
+    $level = switch ($Status) {
+        'FAIL'  { 'ERROR' }
+        'WARN'  { 'WARN' }
+        default { 'INFO' }
+    }
+
+    # -ErrorAction Continue is REQUIRED, not defensive noise. At 'ERROR' level
+    # Write-TopazLog calls Write-Error, and this script never sets
+    # $ErrorActionPreference -- so it inherits the caller's. Invoked from a
+    # session (or CI step) preferring 'Stop', the FIRST failing check would
+    # throw out of this function and abandon every remaining check, turning a
+    # complete "NO-GO, here are all 3 problems" report into a partial one that
+    # stops at the first. A preflight that hides later failures is worse than
+    # no preflight. Passing the preference in makes the write non-terminating
+    # inside Write-TopazLog while still emitting on the error stream.
+    Write-TopazLog -Component 'preflight' -Level $level `
+        -Message "[$Status] $Name - $Detail" -ErrorAction Continue
 
     switch ($Status) {
         'PASS' { $script:PassCount++ }
@@ -352,7 +391,7 @@ function Get-WorkerNamePattern {
 # ---------------------------------------------------------------------------
 
 Write-Output '===================================================================='
-Write-Output "Topaz Auto-Stop Preflight - $(Get-Date -Format 's')"
+Write-Output "Topaz Auto-Stop Preflight - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
 Write-Output "Host=$env:COMPUTERNAME User=$env:USERDOMAIN\$env:USERNAME"
 Write-Output '===================================================================='
 Write-Output ''

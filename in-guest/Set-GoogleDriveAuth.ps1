@@ -98,6 +98,8 @@ $remotes = & $rclone listremotes --config $configPath 2>&1
 if ($remotes -notcontains "${RemoteName}:") {
     Write-Output "  [FAIL] remote '${RemoteName}:' is not present in $configPath"
     Write-Output "         found: $($remotes -join ', ')"
+    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+        -Message "Drive auth FAILED: remote '${RemoteName}:' is not present in '$configPath' (found: $($remotes -join ', ')). Every later upload will fail until this is fixed."
     exit 1
 }
 Write-Output "  [PASS] remote '${RemoteName}:' exists"
@@ -107,6 +109,8 @@ $about = & $rclone about "${RemoteName}:" --config $configPath 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Output "  [FAIL] could not query the Drive account (token bad or access denied):"
     $about | ForEach-Object { "         $_" }
+    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+        -Message "Drive auth FAILED: 'rclone about ${RemoteName}:' returned exit $LASTEXITCODE -- the refresh token is bad, expired, or access was revoked."
     exit 1
 }
 Write-Output "  [PASS] authenticated to Google Drive:"
@@ -117,11 +121,13 @@ $about | ForEach-Object { "         $_" }
 $probeDir  = Join-Path $env:TEMP ("topaz-probe-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
 $probeFile = Join-Path $probeDir 'topaz-upload-probe.txt'
-Set-Content -LiteralPath $probeFile -Value "topaz-autostop upload probe $(Get-Date -Format 's')" -Encoding UTF8
+Set-Content -LiteralPath $probeFile -Value "topaz-autostop upload probe $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')" -Encoding UTF8
 
 & $rclone copy $probeDir $cfg.UploadTarget --config $configPath 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Output "  [FAIL] could not upload a probe file to '$($cfg.UploadTarget)'"
+    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+        -Message "Drive auth FAILED: probe upload to '$($cfg.UploadTarget)' returned exit $LASTEXITCODE. The destination path or write permission is wrong."
     exit 1
 }
 Write-Output "  [PASS] probe file uploaded to '$($cfg.UploadTarget)'"
@@ -129,6 +135,8 @@ Write-Output "  [PASS] probe file uploaded to '$($cfg.UploadTarget)'"
 & $rclone check $probeDir $cfg.UploadTarget --config $configPath --one-way 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Output "  [FAIL] probe uploaded but could not be VERIFIED at the destination"
+    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+        -Message "Drive auth FAILED: probe uploaded to '$($cfg.UploadTarget)' but 'rclone check --one-way' returned exit $LASTEXITCODE, so the upload could not be verified."
     exit 1
 }
 Write-Output "  [PASS] probe verified at the destination"
@@ -153,7 +161,17 @@ try {
 }
 catch {
     Write-Output "  [WARN] could not tighten permissions on '$configPath': $($_.Exception.Message)"
+    Write-TopazLog -Component 'driveauth' -Level 'WARN' `
+        -Message "Could not tighten ACLs on '$configPath': $($_.Exception.Message). The file holds a Google refresh token and may still be readable by non-administrators."
 }
+
+# Persist the outcome. Until now this script -- the one-time step that
+# provisions the credential EVERY later automated upload depends on -- wrote
+# nothing to any log file. A post-mortem asking "why did the 03:00 upload
+# fail?" could not tell whether Drive auth had ever been set up on this boot,
+# when it was last verified, or whether it had actually passed.
+Write-TopazLog -Component 'driveauth' -Level 'INFO' `
+    -Message "Drive auth VERIFIED: remote '${RemoteName}:' authenticated, probe file round-tripped and verified at '$($cfg.UploadTarget)', config at '$configPath'. Renders in '$($cfg.OutputDir)' can now be uploaded before a stop."
 
 Write-Output ""
 Write-Output "  Google Drive upload is ready. Renders in $($cfg.OutputDir) will be"

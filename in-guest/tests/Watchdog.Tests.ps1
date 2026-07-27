@@ -1154,3 +1154,81 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
         }
     }
 }
+
+Describe 'Get-NextHeartbeatState (bounding silence during a healthy render)' {
+
+    # WHAT THIS GUARDS. The poll loop logs only interesting polls, so a healthy
+    # progressing render logs NOTHING. On the render reconstructed in docs/14
+    # that produced 4 h 49 m of completely empty watchdog.log -- during which a
+    # working watchdog and a dead one were indistinguishable. The heartbeat
+    # bounds that silence. These tests pin the two properties that matter:
+    # it fires on schedule, and it is driven by SILENCE rather than wall time
+    # (so branches that already log never accrue toward it).
+
+    It 'does not fire before HeartbeatSec has elapsed' {
+        $s = Get-NextHeartbeatState -SilentSec 0 -PollSec 15 -HeartbeatSec 300
+        $s.Due       | Should -BeFalse
+        $s.SilentSec | Should -Be 15
+    }
+
+    It 'fires exactly at the HeartbeatSec boundary and resets the clock itself' {
+        # 285 + 15 = 300, the -ge boundary.
+        $s = Get-NextHeartbeatState -SilentSec 285 -PollSec 15 -HeartbeatSec 300
+        $s.Due       | Should -BeTrue
+        $s.SilentSec | Should -Be 0
+    }
+
+    It 'fires after exactly HeartbeatSec/PollSec silent polls, then repeats on the same cadence' {
+        # 300/15 = 20 polls per heartbeat. Walk 60 polls and count.
+        $silent = 0
+        $fired  = @()
+        foreach ($poll in 1..60) {
+            $s = Get-NextHeartbeatState -SilentSec $silent -PollSec 15 -HeartbeatSec 300
+            $silent = $s.SilentSec
+            if ($s.Due) { $fired += $poll }
+        }
+        $fired | Should -Be @(20, 40, 60)
+    }
+
+    It 'treats HeartbeatSec=0 as DISABLED and pins the clock at 0 so it cannot silently accumulate' {
+        $silent = 0
+        foreach ($poll in 1..500) {
+            $s = Get-NextHeartbeatState -SilentSec $silent -PollSec 15 -HeartbeatSec 0
+            $silent = $s.SilentSec
+            $s.Due | Should -BeFalse
+        }
+        $silent | Should -Be 0
+    }
+
+    It 'treats a negative HeartbeatSec as disabled too, rather than firing every poll' {
+        # A -ge comparison against a negative limit would otherwise be true
+        # immediately, turning a nonsense config into a line every 15 seconds.
+        $s = Get-NextHeartbeatState -SilentSec 0 -PollSec 15 -HeartbeatSec -1
+        $s.Due       | Should -BeFalse
+        $s.SilentSec | Should -Be 0
+    }
+
+    It 'still fires when a single poll overshoots the interval (PollSec > HeartbeatSec)' {
+        $s = Get-NextHeartbeatState -SilentSec 0 -PollSec 600 -HeartbeatSec 300
+        $s.Due       | Should -BeTrue
+        $s.SilentSec | Should -Be 0
+    }
+
+    It 'measures SILENCE, not wall time: a reset part-way through defers the heartbeat' {
+        # 19 silent polls (285s), then the caller logs something and resets to
+        # 0. The heartbeat must NOT fire on the next poll just because 300s of
+        # wall time has passed -- it is only due after 300s of CONTINUED
+        # silence. This is what stops a stalling render (which logs every poll)
+        # from also emitting heartbeats.
+        $silent = 0
+        foreach ($poll in 1..19) {
+            $silent = (Get-NextHeartbeatState -SilentSec $silent -PollSec 15 -HeartbeatSec 300).SilentSec
+        }
+        $silent | Should -Be 285
+
+        $silent = 0   # a logging branch fired
+
+        $next = Get-NextHeartbeatState -SilentSec $silent -PollSec 15 -HeartbeatSec 300
+        $next.Due | Should -BeFalse
+    }
+}

@@ -125,7 +125,7 @@ elseif ($cfg.OutputIsEphemeral) {
         -Message "OutputDir '$($cfg.OutputDir)' is on EPHEMERAL storage but no UploadTarget is configured. Stopping would erase every render in it. REFUSING TO STOP."
     Write-TopazLog -Component 'stop' -Level 'ERROR' `
         -Message "Fix: set UploadTarget in Config.ps1 (and re-run Install.ps1), or move OutputDir onto the persistent C: drive and set OutputIsEphemeral = `$false."
-    return
+    return $false
 }
 else {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
@@ -137,7 +137,13 @@ if ($cfg.OutputIsEphemeral -and ($uploadOk -eq $false)) {
         -Message "UPLOAD FAILED and OutputDir '$($cfg.OutputDir)' is on EPHEMERAL storage. Stopping now would PERMANENTLY DESTROY the renders in it. REFUSING TO STOP -- the instance stays up so the render can still be recovered."
     Write-TopazLog -Component 'stop' -Level 'ERROR' `
         -Message "Recover with:  & '$($cfg.RclonePath)' --config '$($cfg.RcloneConfigPath)' copy '$($cfg.OutputDir)' '$($cfg.UploadTarget)' -P   then re-run this script."
-    return
+
+    # $false tells Watchdog.ps1 the stop was REFUSED rather than performed, so
+    # it re-arms and tries again instead of exiting. Without that the watchdog
+    # would quit here, nothing would ever retry the upload, and the render
+    # would sit on a volume that the out-of-band CloudWatch idle alarm is about
+    # to erase -- turning a recoverable upload failure into a permanent loss.
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -173,7 +179,11 @@ else {
 if ($cfg.DryRun -and -not $IgnoreDryRun) {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "DRY RUN - would stop now (reason=$Reason). No stop performed."
-    return
+    # $true, not $false: nothing FAILED here. The stop was deliberately
+    # suppressed, and the watchdog's own DryRun re-arm path already handles
+    # resuming. Returning $false would conflate "suppressed on purpose" with
+    # "refused because the render is not safe".
+    return $true
 }
 
 if ($cfg.DryRun -and $IgnoreDryRun) {
@@ -271,3 +281,8 @@ foreach ($action in $plan) {
 
 Write-TopazLog -Component 'stop' -Level 'ERROR' `
     -Message "Every action in the stop plan [$($plan -join ' -> ')] was attempted and the instance is STILL RUNNING. It is very likely still being billed. Fix the stop path per docs/11-deploying-on-this-instance.md."
+
+# Reaching here means no action in the plan took effect. Report it as a refusal
+# so the watchdog keeps monitoring rather than exiting into a state where
+# nothing is watching a box that is still running and still billing.
+return $false

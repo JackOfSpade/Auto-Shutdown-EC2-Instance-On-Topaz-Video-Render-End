@@ -974,7 +974,36 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-TopazLog -Component 'watchdog' -Level 'INFO' `
             -Message "Invoking Stop-Sequence.ps1 (reason=$reason)."
 
-        & (Join-Path $PSScriptRoot 'Stop-Sequence.ps1') -Reason $reason
+        # Stop-Sequence.ps1 returns $false when it REFUSED to stop -- most
+        # importantly when the renders in OutputDir could not be uploaded and
+        # OutputDir is on the ephemeral scratch volume. This return value is
+        # only trustworthy because Write-TopazLog no longer writes to the
+        # output stream; see its comment in Config.ps1.
+        $stopResult = & (Join-Path $PSScriptRoot 'Stop-Sequence.ps1') -Reason $reason
+
+        if ($stopResult -eq $false) {
+            # DO NOT exit. Exiting here would leave nothing watching a box that
+            # is still running, still billing, and still holding an un-uploaded
+            # render on a volume the out-of-band CloudWatch idle alarm will
+            # erase within ~30 minutes. Re-arm instead, so the debounce elapses
+            # again and the whole completed -> unlock -> upload path RETRIES
+            # roughly every DebounceSec until the upload finally succeeds.
+            #
+            # SawActivity/ActiveSec are restored to their armed values rather
+            # than reset: a render demonstrably happened, and forcing it to
+            # re-earn ArmSec would mean the retry never fires at all once the
+            # worker has exited.
+            Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+                -Message "Stop-Sequence REFUSED to stop (reason=$reason) -- most likely the render upload failed or could not be verified. The instance stays UP so the render is not lost. Re-arming to retry in ~$($cfg.DebounceSec)s."
+
+            $idleSec     = 0
+            $stallSec    = 0
+            $sawActivity = $true
+            $activeSec   = $cfg.ArmSec
+            $lastBytes   = Get-OutputBytes
+            $lastIoBytes = $null
+            continue outer
+        }
 
         if ((Resolve-StopDecision -Reason $reason -ReverifyActive $null -DryRun $cfg.DryRun) -eq 'resume') {
             # DryRun suppresses the actual power-off (see Stop-Sequence.ps1). Without

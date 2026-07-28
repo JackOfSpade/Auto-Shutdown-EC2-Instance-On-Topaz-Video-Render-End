@@ -36,6 +36,18 @@
     under DryRun, the watchdog re-arms and resumes monitoring instead of
     exiting for good.
 
+    INCREMENTAL UPLOAD (CORRECTION 3, 2026-07-28 operator instruction): every
+    poll, regardless of whether a render is currently active, the loop also
+    checks OutputDir for a file that looks FINISHED (unlocked and size-stable
+    for UploadStableSec) and uploads it immediately via rclone, rather than
+    waiting for the whole queue to drain. This is what protects a completed
+    multi-GB deliverable during every subsequent queue item's render, instead
+    of leaving it unprotected on the ephemeral scratch volume for hours. See
+    Invoke-TopazIncrementalUploadPoll below; switch off via Config.ps1's
+    UploadWhenReady. The final Stop-Sequence.ps1 upload sweep is unchanged and
+    still runs regardless -- it is the catch-all for anything this pass
+    missed or failed to upload.
+
     All configuration comes from Config.ps1 - nothing is hard-coded here.
 
 .NOTES
@@ -61,6 +73,39 @@ $cfg = Get-TopazAutoStopConfig
 # Get-TopazWorkers can keep counting an orphan as active until it actually
 # exits. See Get-TopazWorkers below.
 $script:KnownWorkers = @{}
+
+# --- Incremental-upload tracking state --------------------------------------
+# CORRECTION 3 (2026-07-28): per-file bookkeeping for "upload each render as
+# it finishes" (see Invoke-TopazIncrementalUploadPoll below), keyed by a
+# file's FullName -> @{ SizeLastSeen; SecondsStable; UploadedSize;
+# UploadedWriteTimeUtc }.
+#
+# UploadedSize/UploadedWriteTimeUtc (both $null until a successful upload)
+# replace the old bare "AlreadyUploaded" boolean -- FINDING 2 of the
+# 2026-07-28 adversarial review (see Resolve-IncrementalUploadEligibility's
+# own comment for the full rationale). Keying "already uploaded" on FullName
+# ALONE was wrong on this box specifically: independent forensic verification
+# of the 2026-07-28 incident proved Topaz's own crash-recovery path reloads
+# the project and re-queues the export through a different internal code path
+# after a worker crash (the log shows "export_source" flip from "export_as"
+# to "quick"), which does NOT carry forward the user-chosen output folder and
+# leaves a previously-uploaded file's path holding new, different bytes. A
+# path-only key would exclude that corrected content from ever being
+# re-uploaded by this incremental path for the rest of the process's life.
+# Keying on path PLUS the size/write-time actually uploaded means a file that
+# changes after its upload becomes eligible again automatically -- see
+# Invoke-TopazIncrementalUploadPoll below for where that re-upload is
+# additionally logged as a distinct, greppable event.
+#
+# Declared ONCE here, outside the ':outer' re-arm loop, so it survives a
+# DryRun re-arm or a Stop-Sequence refusal-and-retry -- there is no reason to
+# forget a file is already uploaded just because the watchdog looped back to
+# monitoring. IN-MEMORY ONLY: a watchdog PROCESS restart (as opposed to a
+# re-arm within the same process) loses this table entirely, which is
+# harmless, not just tolerable -- rclone `copy`/`check` are idempotent
+# against a destination file that already matches by size, so a redundant
+# re-upload after a restart costs bandwidth and time, never correctness.
+$script:UploadTracking = @{}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -405,30 +450,11 @@ function Get-OutputBytes {
     return [int64]$sum
 }
 
-function Test-FileUnlocked {
-    <#
-    .SYNOPSIS
-        $true if the file can be opened for read with no sharing (i.e. nothing
-        else holds a write/append handle on it), otherwise $false.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    $stream = $null
-    try {
-        $stream = [System.IO.File]::Open(
-            $Path,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::None)
-        return $true
-    }
-    catch {
-        return $false
-    }
-    finally {
-        if ($stream) { $stream.Close(); $stream.Dispose() }
-    }
-}
+# Test-FileUnlocked MOVED to Config.ps1 (2026-07-28): it is now shared with
+# the recovery scan (Find-RenderRecoveryCandidates) and the incremental
+# per-file upload pass (Invoke-TopazIncrementalUploadPoll, below), not just
+# the unlock-gate loop at the bottom of this file. Config.ps1 is dot-sourced
+# above, so the name resolves exactly as before -- see its own comment there.
 
 function Test-RenderActive {
     <#
@@ -693,6 +719,408 @@ function Get-NextWatchdogState {
     }
 }
 
+function Resolve-IncrementalUploadEligibility {
+    <#
+    .SYNOPSIS
+        Pure: is this ONE OutputDir file eligible for an incremental
+        (upload-as-it-finishes) upload RIGHT NOW? No I/O, so it is fully
+        unit-testable -- CORRECTION 3 (2026-07-28 operator instruction),
+        expressed as a pure decision per this file's own convention (mirrors
+        Get-NextWatchdogState's own stall/idle verdict).
+    .DESCRIPTION
+        FIVE conditions ALL gate eligibility -- every one of them is load-
+        bearing, not defence-in-depth padding:
+          1. NOT a Topaz temp/scratch file (IsTemp, via Test-TopazTempFile).
+             Topaz may leave scratch files behind after a successful export;
+             uploading them wastes bandwidth and clutters the destination.
+          2. Unlocked THIS poll (IsUnlocked, via Test-FileUnlocked).
+          3. That size has held for at least StableThresholdSec of
+             consecutive polls (SecondsStable -ge StableThresholdSec).
+          4. The size reported NOW still matches the size the caller tracked
+             as of the LAST poll (SizeNow -eq SizeLastSeen). Belt-and-braces
+             alongside #3: even if a caller bug mis-tracked SecondsStable, a
+             file whose size just changed cannot become eligible here.
+          5. NOT already uploaded earlier this session WITH THIS SAME CONTENT
+             (UploadedSize/UploadedWriteTimeUtc) -- this is what stops the
+             SAME finished file being re-uploaded on every subsequent poll,
+             while still allowing a file that has genuinely changed SINCE its
+             upload to become eligible again. See "WHY IDENTITY IS SIZE+
+             WRITE-TIME, NOT JUST FULLNAME" below.
+
+        WHY UNLOCKED ALONE IS NOT ENOUGH (conditions 2 AND 3+4 TOGETHER, not
+        either alone). Some encoders/muxers briefly release and reacquire
+        their write handle between internal buffer flushes, so a file mid-
+        write can read as momentarily unlocked on any single poll. Requiring
+        the SAME size across multiple consecutive polls in addition to being
+        unlocked on the poll that actually triggers the upload is what
+        distinguishes "genuinely finished" from "caught between two writes".
+
+        WHY IDENTITY IS SIZE+WRITE-TIME, NOT JUST FULLNAME -- FINDING 2 of the
+        2026-07-28 adversarial review, and NOT a hypothetical on this box.
+        Independent forensic verification of the 2026-07-28 incident proved
+        that a Topaz worker crashing mid-export is DOCUMENTED, RECURRING
+        behaviour here: on a crash, Topaz reloads the project and re-queues
+        the export through a different internal code path (the log shows
+        "export_source" flip from "export_as" to "quick"), and that path does
+        not carry the user-chosen output folder forward. The crashed writer's
+        handle is released (unlocked) while its partial file sits at a stable
+        -- but INCOMPLETE -- size for however long Topaz takes to notice the
+        crash and resume, which is not bounded under StableThresholdSec. This
+        function's five conditions CANNOT distinguish that partial from a
+        genuinely finished file, so a partial CAN still be uploaded and
+        verified. What condition 5 fixes is what happens NEXT: keying
+        "already uploaded" on FullName alone would exclude that path from
+        EVER being re-uploaded again, even after the resumed writer overwrote
+        it with the correct, complete content -- so the stale partial would
+        sit at the destination, believed "verified", until the final
+        Stop-Sequence.ps1 sweep eventually re-copies everything (potentially
+        hours later on a multi-export queue). Comparing SizeNow/WriteTimeNow
+        against the size/write-time actually uploaded means the resumed
+        writer's overwrite is detected the moment it restabilizes, and the
+        correction reaches the destination on the very next eligible poll
+        instead of waiting for that final sweep. This does NOT make
+        unlocked+size-stable a reliable "finished" signal -- it makes the
+        mistake self-correcting within one poll of the real writer finishing,
+        rather than persisting for the rest of the process's life.
+    .PARAMETER IsTemp
+        Whether the file matches TempMarker (Test-TopazTempFile).
+    .PARAMETER IsUnlocked
+        Whether Test-FileUnlocked succeeded this poll.
+    .PARAMETER SizeNow
+        The file's length as of this poll.
+    .PARAMETER SizeLastSeen
+        The file's length as tracked as of the PREVIOUS poll this file was
+        seen at, or $null if this is the first poll this file has been seen
+        (a file can never be eligible on the very first poll it is observed:
+        there is nothing yet to compare its size against).
+    .PARAMETER SecondsStable
+        Consecutive seconds the size has been observed unchanged, as already
+        computed by the caller (see Get-NextUploadTrackingState below).
+    .PARAMETER StableThresholdSec
+        Config's UploadStableSec.
+    .PARAMETER WriteTimeNow
+        The file's LastWriteTimeUtc as of this poll.
+    .PARAMETER UploadedSize
+        The size that was actually uploaded for this file earlier this
+        session, or $null if this file has never been successfully uploaded
+        this session. $null here means conditions 3/4/5 below are the only
+        gates that matter; a non-null value means this file was previously
+        uploaded and is excluded UNLESS its content has since changed.
+    .PARAMETER UploadedWriteTimeUtc
+        The LastWriteTimeUtc that was actually uploaded alongside
+        UploadedSize, or $null under the same condition as UploadedSize (the
+        two are always set, and cleared, together by the caller).
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$IsTemp,
+        [Parameter(Mandatory)][bool]$IsUnlocked,
+        [Parameter(Mandatory)][int64]$SizeNow,
+        [AllowNull()]$SizeLastSeen,
+        [Parameter(Mandatory)][int]$SecondsStable,
+        [Parameter(Mandatory)][int]$StableThresholdSec,
+        [Parameter(Mandatory)][datetime]$WriteTimeNow,
+        [AllowNull()]$UploadedSize,
+        [AllowNull()]$UploadedWriteTimeUtc
+    )
+
+    if ($IsTemp) { return $false }
+    if (-not $IsUnlocked) { return $false }
+
+    # Condition 5, identity-based (FINDING 2 fix). $null UploadedSize means
+    # "never uploaded this session" -- fall through to the ordinary stability
+    # gates below exactly as before. A non-null UploadedSize means this exact
+    # path WAS uploaded earlier; it stays excluded only while BOTH its size
+    # and its write-time still match what was actually uploaded. Either one
+    # differing means the content at this path has changed since that upload
+    # (the crash-retry rewrite this fix targets) -- do NOT exclude here, let
+    # the normal stability gates below decide whether the NEW content looks
+    # finished yet.
+    if ($null -ne $UploadedSize) {
+        $unchangedSinceUpload = ([int64]$UploadedSize -eq $SizeNow) -and ($UploadedWriteTimeUtc -eq $WriteTimeNow)
+        if ($unchangedSinceUpload) { return $false }
+    }
+
+    if ($null -eq $SizeLastSeen) { return $false }
+    if ([int64]$SizeLastSeen -ne $SizeNow) { return $false }
+    if ($SecondsStable -lt $StableThresholdSec) { return $false }
+
+    return $true
+}
+
+function Get-NextUploadTrackingState {
+    <#
+    .SYNOPSIS
+        Pure: combine one file's per-poll stability bookkeeping with the
+        eligibility gate above, given the previous poll's tracked state for
+        THIS ONE file and this poll's freshly measured signals. No I/O, so it
+        is fully unit-testable.
+    .DESCRIPTION
+        Mirrors Get-NextWatchdogState's own shape (state transition + verdict
+        in one pure call) at file granularity instead of queue granularity.
+        Callers own the per-file table (Invoke-TopazIncrementalUploadPoll
+        below) and are expected to call this once per tracked file, per poll.
+
+        SIZE-CHANGED RESETS THE STABILITY CLOCK TO ZERO, mirroring
+        Get-NextWatchdogState's own stall-clock reset on any progress signal:
+        a file whose size just moved has, by definition, not been stable for
+        any length of time yet.
+    .PARAMETER IsTemp
+        Whether the file matches TempMarker (Test-TopazTempFile).
+    .PARAMETER IsUnlocked
+        Whether Test-FileUnlocked succeeded this poll.
+    .PARAMETER SizeNow
+        The file's length as of this poll.
+    .PARAMETER PreviousSizeLastSeen
+        The file's tracked size as of the previous poll it was seen at, or
+        $null if this is the first poll this file has been observed.
+    .PARAMETER PreviousSecondsStable
+        The tracked stability-clock value as of the previous poll (0 if this
+        is the first poll this file has been observed).
+    .PARAMETER WriteTimeNow
+        The file's LastWriteTimeUtc as of this poll -- passed straight
+        through to Resolve-IncrementalUploadEligibility; this function does
+        not track a write-time stability clock of its own (the size-based
+        clock above is unchanged by FINDING 2 -- see THE FIX below).
+    .PARAMETER UploadedSize
+        The size actually uploaded for this file earlier this session, or
+        $null if never uploaded -- carried through unchanged; the caller
+        updates it separately once an upload attempt actually succeeds. Pass
+        straight through to Resolve-IncrementalUploadEligibility.
+    .PARAMETER UploadedWriteTimeUtc
+        The LastWriteTimeUtc actually uploaded alongside UploadedSize, same
+        carry-through contract as UploadedSize.
+    .PARAMETER PollSec
+        Config's PollSec; how much the stability clock advances per poll when
+        the size has not changed.
+    .PARAMETER StableThresholdSec
+        Config's UploadStableSec.
+    .OUTPUTS
+        [pscustomobject]@{ SizeLastSeen; SecondsStable; Eligible }
+        SizeLastSeen/SecondsStable are the values the caller should persist
+        for this file for the NEXT poll. Eligible is this poll's
+        Resolve-IncrementalUploadEligibility verdict.
+
+        THE FIX (FINDING 2, 2026-07-28 adversarial review) IS SCOPED TO
+        IDENTITY, NOT TO THIS STABILITY CLOCK. UploadedSize/UploadedWriteTimeUtc
+        only change condition 5 of Resolve-IncrementalUploadEligibility (was
+        this exact content already uploaded?); the SizeLastSeen/SecondsStable
+        clock computed here is exactly the same size-only calculation as
+        before. A resumed writer that grows the file after a crash already
+        resets this clock to 0 via the ordinary sizeUnchanged check below --
+        the same mechanism that has always distinguished "still writing" from
+        "finished" -- so the crash-resume case naturally has to re-earn
+        StableThresholdSec of stability on its new, correct size before the
+        identity check (which now sees a mismatch) lets it become eligible
+        again. Nothing about this per-poll clock needed to change for that.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$IsTemp,
+        [Parameter(Mandatory)][bool]$IsUnlocked,
+        [Parameter(Mandatory)][int64]$SizeNow,
+        [AllowNull()]$PreviousSizeLastSeen,
+        [Parameter(Mandatory)][int]$PreviousSecondsStable,
+        [Parameter(Mandatory)][datetime]$WriteTimeNow,
+        [AllowNull()]$UploadedSize,
+        [AllowNull()]$UploadedWriteTimeUtc,
+        [Parameter(Mandatory)][int]$PollSec,
+        [Parameter(Mandatory)][int]$StableThresholdSec
+    )
+
+    $sizeUnchanged = ($null -ne $PreviousSizeLastSeen) -and ([int64]$PreviousSizeLastSeen -eq $SizeNow)
+    $nextSecondsStable = if ($sizeUnchanged) { $PreviousSecondsStable + $PollSec } else { 0 }
+
+    $eligible = Resolve-IncrementalUploadEligibility -IsTemp $IsTemp -IsUnlocked $IsUnlocked `
+        -SizeNow $SizeNow -SizeLastSeen $PreviousSizeLastSeen -SecondsStable $nextSecondsStable `
+        -StableThresholdSec $StableThresholdSec -WriteTimeNow $WriteTimeNow `
+        -UploadedSize $UploadedSize -UploadedWriteTimeUtc $UploadedWriteTimeUtc
+
+    return [pscustomobject]@{
+        SizeLastSeen  = $SizeNow
+        SecondsStable = $nextSecondsStable
+        Eligible      = $eligible
+    }
+}
+
+function Invoke-TopazIncrementalUploadPoll {
+    <#
+    .SYNOPSIS
+        One poll's worth of incremental (per-file, upload-as-it-finishes)
+        work: enumerate OutputDir, update each file's stability bookkeeping in
+        $Tracking, and upload any file that is now eligible. CORRECTION 3
+        (2026-07-28 operator instruction) -- see Config.ps1's
+        Invoke-TopazIncrementalUpload for the actual upload mechanics.
+    .DESCRIPTION
+        CALLED EVERY POLL, REGARDLESS OF WHETHER A RENDER IS CURRENTLY
+        ACTIVE. The whole point is protecting a deliverable that finished
+        writing WHILE THE NEXT QUEUE ITEM IS ALREADY RENDERING -- exactly the
+        case that left a 2.3 GB completed render unprotected for the entire
+        multi-hour duration of a SUBSEQUENT export in the 2026-07-28
+        incident. Gating this call on $active would silently reintroduce
+        that exact hole, so the caller (the main monitoring loop below) must
+        not do that.
+
+        WHERE THIS SITS IN THE POLL LOOP, AND WHY. This is called AFTER the
+        existing idle/stall/arm state-machine update and its logging for the
+        poll (Get-NextWatchdogState and everything that reacts to its
+        Verdict) -- never before it, and never interleaved with it. Two
+        reasons:
+          1. This pass can BLOCK for up to UploadTimeoutSec per rclone
+             attempt (see Invoke-TopazIncrementalUpload's own comment on the
+             accepted blind window) -- reading the render-active signal FIRST
+             keeps the safety-critical idle/stall bookkeeping's timing as
+             close to the real PollSec cadence as this loop ever achieves.
+             Running the upload first would delay that read by however long
+             the upload took, on every single poll, not just the rare
+             eligible one.
+          2. It never touches $idleSec/$stallSec/$sawActivity/$activeSec/
+             $lastBytes/$lastIoBytes -- it is a fully independent concern from
+             the completion state machine, so its result cannot corrupt that
+             bookkeeping regardless of where it runs. Placing it after,
+             rather than before or inside, keeps that independence visibly
+             true in the code, not just true in principle.
+
+        NEVER THROWS, NEVER LEAVES THE POLL LOOP WORSE OFF THAN BEFORE THE
+        CALL. A failure anywhere in this pass (enumerating OutputDir,
+        checking one file's lock state, an upload attempt) is caught and
+        logged; it must never take down the poll loop, the single most
+        safety-critical loop in the project. A failed incremental upload for
+        one file is NOT fatal: it is logged, the file is left unmarked in
+        $Tracking, and a later poll (or the final Stop-Sequence.ps1 sweep)
+        retries it.
+
+        $Tracking IS MUTATED IN PLACE (hashtables are reference types in
+        PowerShell -- same pattern as $script:KnownWorkers above) and is
+        IN-MEMORY ONLY. See $script:UploadTracking's own declaration comment
+        for why losing it across a process restart is harmless, not just
+        tolerable.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object.
+    .PARAMETER Tracking
+        Hashtable keyed by a file's FullName -> @{ SizeLastSeen;
+        SecondsStable; UploadedSize; UploadedWriteTimeUtc }, mutated in place
+        across polls. UploadedSize/UploadedWriteTimeUtc are $null until this
+        file's first successful upload, and thereafter hold the size/
+        LastWriteTimeUtc that were ACTUALLY uploaded -- see
+        Resolve-IncrementalUploadEligibility's own comment (FINDING 2,
+        2026-07-28) for why FullName alone is not a safe upload-identity key
+        on this box.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][hashtable]$Tracking
+    )
+
+    $cfg = $Config
+
+    if (-not $cfg.UploadWhenReady) { return }
+    if ([string]::IsNullOrWhiteSpace($cfg.UploadTarget)) { return }
+
+    try {
+        if (-not (Test-Path -LiteralPath $cfg.OutputDir)) { return }
+
+        $files    = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+        $seenKeys = @{}
+
+        foreach ($f in $files) {
+            $key = $f.FullName
+            $seenKeys[$key] = $true
+
+            $prev              = $Tracking[$key]
+            $prevSize          = if ($prev) { $prev.SizeLastSeen } else { $null }
+            $prevStable        = if ($prev) { $prev.SecondsStable } else { 0 }
+            $uploadedSize      = if ($prev) { $prev.UploadedSize } else { $null }
+            $uploadedWriteTime = if ($prev) { $prev.UploadedWriteTimeUtc } else { $null }
+
+            $isTemp     = Test-TopazTempFile -Name $f.Name -TempMarker $cfg.TempMarker
+            $isUnlocked = Test-FileUnlocked -Path $f.FullName
+            $writeTimeNow = $f.LastWriteTimeUtc
+
+            $next = Get-NextUploadTrackingState -IsTemp $isTemp -IsUnlocked $isUnlocked `
+                -SizeNow ([int64]$f.Length) -PreviousSizeLastSeen $prevSize `
+                -PreviousSecondsStable $prevStable -WriteTimeNow $writeTimeNow `
+                -UploadedSize $uploadedSize -UploadedWriteTimeUtc $uploadedWriteTime `
+                -PollSec $cfg.PollSec -StableThresholdSec $cfg.UploadStableSec
+
+            $nextUploadedSize      = $uploadedSize
+            $nextUploadedWriteTime = $uploadedWriteTime
+
+            if ($next.Eligible) {
+                # A non-null $uploadedSize reaching here means this exact path
+                # was uploaded once already THIS session, and Resolve-
+                # IncrementalUploadEligibility just decided it is eligible
+                # again anyway -- which, by that function's own identity gate,
+                # can only happen because the size and/or write-time no longer
+                # match what was uploaded. That is FINDING 2's re-upload path,
+                # not routine first-time coverage, and it is this box's
+                # documented, recurring signature of a Topaz worker crash +
+                # crash-recovery re-queue (export_source flips from
+                # "export_as" to "quick" -- see the 2026-07-28 incident and
+                # Resolve-IncrementalUploadEligibility's own comment). Log it
+                # distinctly and GREPPABLY (the literal string "SUPERSEDED")
+                # so a reader of the log can tell this apart from an ordinary
+                # first upload without having to reconstruct $Tracking state.
+                if ($null -ne $uploadedSize) {
+                    Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+                        -Message "Incremental upload: '$($f.FullName)' CHANGED since its earlier upload this session (was $uploadedSize bytes @ $($uploadedWriteTime.ToString('o')) UTC; now $($f.Length) bytes @ $($writeTimeNow.ToString('o')) UTC). The previously uploaded copy is SUPERSEDED and stale -- re-uploading the corrected content now rather than waiting for the final stop-sequence sweep. This is the expected signature of Topaz's crash-recovery re-queue path on this box, not a defect in this watchdog."
+                }
+
+                # BLOCKING (see this function's own .DESCRIPTION) -- bounded by
+                # Invoke-TopazIncrementalUpload's own use of
+                # Invoke-TopazAwsCli's WaitForExit timeout. A failure here is
+                # caught by Invoke-TopazIncrementalUpload itself and returns
+                # $false; it must never throw out to this loop.
+                if (Invoke-TopazIncrementalUpload -Config $cfg -File $f) {
+                    # Record the IDENTITY actually uploaded (this poll's size
+                    # and write-time), not just a bool -- this is what lets a
+                    # LATER change to this same path be detected again next
+                    # time, instead of excluding it for the rest of the
+                    # process's life (FINDING 2).
+                    $nextUploadedSize      = [int64]$f.Length
+                    $nextUploadedWriteTime = $writeTimeNow
+                }
+                # else: upload failed. Leave $nextUploadedSize/$nextUploadedWriteTime
+                # exactly as they were -- if this was a first-ever upload attempt
+                # they stay $null (unmarked, as before FINDING 2: a later poll
+                # retries it). If this was a SUPERSEDED re-upload attempt that
+                # failed, they stay pointed at the STALE prior upload; that is
+                # correct, not a regression -- the next poll's identity compare
+                # will still see the same mismatch and try again, exactly as a
+                # first-time failure does today.
+            }
+
+            $Tracking[$key] = @{
+                SizeLastSeen         = $next.SizeLastSeen
+                SecondsStable        = $next.SecondsStable
+                UploadedSize         = $nextUploadedSize
+                UploadedWriteTimeUtc = $nextUploadedWriteTime
+            }
+        }
+
+        # Prune entries for files no longer present in OutputDir (renamed,
+        # deleted, or the volume was just wiped by a stop this table does not
+        # yet know happened). Mirrors $script:KnownWorkers's own pruning --
+        # a stale entry is harmless either way, but there is no reason to let
+        # this table grow across a long, multi-item queue.
+        foreach ($key in @($Tracking.Keys)) {
+            if (-not $seenKeys.ContainsKey($key)) { $Tracking.Remove($key) }
+        }
+    }
+    catch {
+        # Best-effort, exactly like every other bounded I/O helper in this
+        # pipeline (Get-GpuUtilizationMax, Invoke-TopazAwsCli,
+        # Find-RenderRecoveryCandidates): ANY failure here must degrade
+        # gracefully, never throw into the poll loop and take the watchdog
+        # down with it.
+        Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+            -Message "Incremental upload pass FAILED (best-effort, ignored): $($_.Exception.Message)"
+    }
+}
+
 function Resolve-RefusalStallSec {
     <#
     .SYNOPSIS
@@ -755,10 +1183,23 @@ function Get-NextHeartbeatState {
         Pure: advance the "how long have we logged nothing" clock and decide
         whether a heartbeat line is now due. No I/O.
     .DESCRIPTION
-        WHY THIS EXISTS. This loop logs only on polls that are INTERESTING:
-        a stall, an idle countdown, an unreadable signal. A healthy, actively
-        progressing render logs nothing at all, deliberately, so that a long
-        job does not fill the log with thousands of identical lines.
+        WHY THIS EXISTS. The monitoring loop logs only on polls that are
+        INTERESTING: a stall, an idle countdown, an unreadable signal. A
+        healthy, actively progressing render logs nothing at all, deliberately,
+        so that a long job does not fill the log with thousands of identical
+        lines.
+
+        SCOPE. Both of the watchdog's blocking loops use this, and the second
+        one was added only after a real run proved the first was not enough:
+          1. the pre-GUI wait loop, which polls for a Topaz GUI process and
+             otherwise logs nothing at all, and
+          2. the main monitoring loop's silent-while-healthy path.
+        The 00d21ef version of this function was called only from (2). The
+        14:06-14:56 cycle on 2026-07-27 then logged NOTHING for 361s inside
+        (1) -- past the 300s bound this function is supposed to enforce -- for
+        the mundane reason that the clock variable was declared below that loop
+        (docs/15). Any future blocking loop added to this script needs a call
+        here too, or it reintroduces exactly that hole.
 
         Taken to its conclusion that means a healthy render is INVISIBLE. A
         real 4K job on this box ran from 07:55:33 to 12:44:33 -- four hours
@@ -808,6 +1249,50 @@ function Get-NextHeartbeatState {
     }
 
     return [pscustomobject]@{ SilentSec = $next; Due = $false }
+}
+
+function Get-TopazWaitHeartbeatMessage {
+    <#
+    .SYNOPSIS
+        Pure: the heartbeat line the pre-GUI wait loop emits. No I/O.
+    .DESCRIPTION
+        Exists to make the wait loop's heartbeat TESTABLE. The loop itself sits
+        inside the "$MyInvocation.InvocationName -ne '.'" guard at the bottom of
+        this file, which dot-sourcing (and therefore Pester) never executes -- so
+        anything expressed inline there is, structurally, untestable. This file
+        already resolves that tension the same way everywhere else (see
+        Get-NextWatchdogState, Get-NextHeartbeatState, Resolve-StopDecision):
+        the DECISION is a pure function and the guarded block keeps only
+        orchestration. This function carries the one piece of that heartbeat
+        with any judgement in it.
+
+        WHAT THE JUDGEMENT IS. Get-TopazPids returns $null when the CIM query
+        FAILED and @() when it succeeded and found nothing. Both make the wait
+        loop go round again, and before the heartbeat existed both looked
+        identical in the log -- identical, too, to a watchdog that had died. A
+        query failing every poll forever is a FAULT and needs to read as one; an
+        operator who simply has not opened Topaz yet is the normal case. Saying
+        which is which is the entire value of the line.
+    .PARAMETER TopazPids
+        The most recent Get-TopazPids result: $null (query failed) or a
+        collection (query succeeded).
+    .PARAMETER NameLike
+        Config's TopazNameLike, echoed so the log says what it was looking for.
+    .PARAMETER HeartbeatSec
+        Config's HeartbeatSec, echoed so the reader knows the cadence to expect
+        and can therefore spot a MISSING heartbeat.
+    .OUTPUTS
+        [string] the full log message.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$TopazPids,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$NameLike,
+        [Parameter(Mandatory)][int]$HeartbeatSec
+    )
+
+    $waitText = if ($null -eq $TopazPids) { 'CIM process query UNREADABLE' } else { 'not running' }
+    return "Still waiting for a Topaz GUI process (LIKE '$NameLike'): $waitText. Heartbeat every ${HeartbeatSec}s while waiting."
 }
 
 function Resolve-StopDecision {
@@ -877,6 +1362,18 @@ if ($MyInvocation.InvocationName -ne '.') {
     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
         -Message "Watchdog starting. Signal=$($cfg.CompletionSignal). Waiting for a Topaz GUI process (LIKE '$($cfg.TopazNameLike)')."
 
+    # Seconds of consecutive un-logged polls -- the heartbeat clock. Declared
+    # HERE, above the wait loop, and not (as it first was) just above the
+    # monitoring loop below.
+    #
+    # MEASURED 2026-07-27: this wait loop produced 361s of TOTAL silence
+    # (14:06:57.451 -> 14:12:58.709, docs/15) which SURVIVED the heartbeat added
+    # in 00d21ef, because the clock was declared below this loop and so could
+    # not reach it. That left the one blind spot the heartbeat was supposed to
+    # remove: a watchdog wedged on a hung CIM query here logs exactly what one
+    # patiently waiting for the operator to open Topaz logs -- nothing.
+    $silentSec = 0
+
     # Get-TopazPids now returns $null on a CIM query failure (vs. @() for "query
     # succeeded, nothing found"). Treat $null the same as "not seen yet" here and
     # keep retrying -- testing $null.Count directly would silently treat a query
@@ -884,7 +1381,20 @@ if ($MyInvocation.InvocationName -ne '.') {
     while ($true) {
         $topazPids = Get-TopazPids
         if ($topazPids -and $topazPids.Count -gt 0) { break }
+
         Start-Sleep -Seconds $cfg.PollSec
+
+        $beat = Get-NextHeartbeatState -SilentSec $silentSec -PollSec $cfg.PollSec `
+            -HeartbeatSec $cfg.HeartbeatSec
+        $silentSec = $beat.SilentSec
+        if ($beat.Due) {
+            # The message (and the $null-vs-@() distinction that gives it its
+            # value) is the pure Get-TopazWaitHeartbeatMessage above, so it is
+            # unit-tested despite this loop living inside the dot-source guard.
+            Write-TopazLog -Component 'watchdog' -Level 'INFO' `
+                -Message (Get-TopazWaitHeartbeatMessage -TopazPids $topazPids `
+                    -NameLike $cfg.TopazNameLike -HeartbeatSec $cfg.HeartbeatSec)
+        }
     }
 
     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
@@ -905,7 +1415,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     $activeSec   = 0            # consecutive seconds active, for the arm debounce
     $lastBytes   = Get-OutputBytes
     $lastIoBytes = $null        # workers' cumulative I/O total; $null until first read
-    $silentSec   = 0            # seconds of consecutive un-logged polls (heartbeat clock)
+    # RESET (not declaration -- see above the wait loop): the "Topaz GUI
+    # detected" line immediately above just broke the silence, so the clock
+    # restarts here rather than carrying the wait loop's tail into monitoring.
+    $silentSec   = 0
 
     :outer while ($true) {
 
@@ -1017,6 +1530,22 @@ if ($MyInvocation.InvocationName -ne '.') {
                     }
                 }
             }
+
+            # ---------------------------------------------------------------------------
+            # CORRECTION 3 (2026-07-28): upload each render AS IT FINISHES, not
+            # only after the whole queue drains. Deliberately placed AFTER the
+            # idle/stall/arm state-machine update above (not before, not
+            # interleaved with it) and UNCONDITIONALLY -- not inside either the
+            # $active or the "no active render" branch -- because a file can
+            # finish and need protecting WHILE THE NEXT QUEUE ITEM IS ALREADY
+            # RENDERING, which is exactly the gap that left a 2.3 GB completed
+            # render unprotected for the full duration of a subsequent export
+            # in the 2026-07-28 incident. See Invoke-TopazIncrementalUploadPoll's
+            # own comment for why this ordering is safe for the timing of the
+            # bookkeeping above, and why a blocking rclone call inside this
+            # single-threaded loop is an accepted, bounded tradeoff rather than
+            # an oversight.
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:UploadTracking
         }
 
         # ---------------------------------------------------------------------------
@@ -1060,6 +1589,39 @@ if ($MyInvocation.InvocationName -ne '.') {
 
             Start-Sleep -Seconds $cfg.UnlockPollSec
         }
+
+        # ---------------------------------------------------------------------------
+        # 3a. Snapshot OutputDir's real file count + byte total AT HANDOFF, right
+        #     after the unlock gate above -- not during the live poll loop.
+        #
+        #     THIS READING IS TRUSTWORTHY IN A WAY THE LIVE outputBytes SIGNAL IS
+        #     NOT. Get-NextWatchdogState's outputBytes is read WHILE a render may
+        #     still be writing, and NTFS does not reliably refresh an open
+        #     handle's directory-entry length (measured frozen for up to 476s
+        #     mid-render -- see Get-WorkerIoBytes's own comment), so a live
+        #     reading can legitimately UNDERCOUNT a perfectly healthy job. By
+        #     THIS point every non-scratch output file has just been confirmed
+        #     unlocked (or the wait above timed out trying), so every handle
+        #     that could still be growing a file is gone: whatever Get-ChildItem
+        #     reports here is the ACTUAL, FINAL state of the folder, not a
+        #     lagging snapshot.
+        #
+        #     THIS IS EXACTLY THE LINE THE 2026-07-28 INCIDENT WAS MISSING. The
+        #     "Render QUEUE considered COMPLETE" line said nothing about what
+        #     was actually produced; Stop-Sequence.ps1 independently re-read
+        #     OutputDir moments later and logged "is empty; ... Safe to
+        #     proceed" with nothing in watchdog.log to compare it against. Two
+        #     independently-written logs agreeing (or, just as usefully,
+        #     DISAGREEING because the folder changed between the two reads) is
+        #     worth one extra line here.
+        # ---------------------------------------------------------------------------
+
+        $handoffFiles    = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+        $handoffBytesSum = ($handoffFiles | Measure-Object -Property Length -Sum).Sum
+        $handoffBytes    = if ($null -eq $handoffBytesSum) { [int64]0 } else { [int64]$handoffBytesSum }
+
+        Write-TopazLog -Component 'watchdog' -Level 'INFO' `
+            -Message "OutputDir '$($cfg.OutputDir)' at handoff (reason=$reason): $($handoffFiles.Count) file(s), $handoffBytes bytes. This is a post-unlock-gate reading (handles closed) -- unlike the live outputBytes logged during polling, this one is not subject to NTFS directory-entry lag and can be trusted as final."
 
         # ---------------------------------------------------------------------------
         # 3b. Re-verify a 'completed' decision once: the operator may have queued

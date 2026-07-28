@@ -516,7 +516,7 @@ elseif ($gpuSignalNeedsNvidiaSmi) {
 }
 else {
     Write-PreflightResult -Status 'WARN' -Name 'nvidia-smi' `
-        -Detail "Could not be resolved or read. Not fatal because CompletionSignal='$($cfg.CompletionSignal)' does not use the GPU signal, but Push-GpuMetric.ps1 (the CloudWatch safety net) needs it too."
+        -Detail "Could not be resolved or read. Not fatal because CompletionSignal='$($cfg.CompletionSignal)' does not use the GPU signal, and the CloudWatch idle alarm's default IDLE_SIGNAL=render evaluates RenderActive, a CIM worker query that does not need nvidia-smi either -- but Push-GpuMetric.ps1's GPUUtilization metric will not publish without it, which costs GPU telemetry and matters if the alarm is instead run with the legacy IDLE_SIGNAL=gpu."
 }
 
 # ---------------------------------------------------------------------------

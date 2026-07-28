@@ -671,6 +671,704 @@ Describe 'Get-NextWatchdogState' {
     }
 }
 
+Describe 'Resolve-IncrementalUploadEligibility (CORRECTION 3 -- per-file incremental-upload gate)' {
+    # THE PRODUCTION CONTEXT: this is the pure gate Get-NextUploadTrackingState
+    # (below) and Invoke-TopazIncrementalUploadPoll consult every poll to decide
+    # whether ONE OutputDir file looks finished enough to upload right now,
+    # instead of waiting for the whole render queue to drain (Config.ps1's
+    # INCREMENTAL UPLOAD comment / operator instruction, 2026-07-28). Every
+    # input is a plain boolean/number/datetime -- no I/O -- so every gate is
+    # pinned directly here, with no mocking required.
+    #
+    # PRIOR STATE OF THIS TEST FILE: this function (and Get-NextUploadTrackingState
+    # / Invoke-TopazIncrementalUploadPoll below) had ZERO test coverage even
+    # though Watchdog.ps1 fully implements and wires them into the poll loop --
+    # an earlier pass of Config.Tests.ps1 had mistakenly documented them as
+    # "not yet defined in Watchdog.ps1" dead code. See this file's own
+    # Config.Tests.ps1 comment fix alongside this addition.
+    #
+    # FINDING 2 (2026-07-28 adversarial review) COVERAGE ADDED HERE: the old
+    # bare "AlreadyUploaded" boolean was replaced by UploadedSize/
+    # UploadedWriteTimeUtc ($null = never uploaded this session; non-null =
+    # the size/write-time that WERE actually uploaded). $null values below are
+    # the exact equivalent of the old "-AlreadyUploaded $false"; a non-null
+    # pair that MATCHES SizeNow/WriteTimeNow is the exact equivalent of the
+    # old "-AlreadyUploaded $true". The new behaviour under test is what
+    # happens when a non-null pair does NOT match -- see the dedicated
+    # "FINDING 2" Context below.
+
+    Context 'the all-clear baseline: every condition satisfied, never uploaded before -> eligible' {
+        It 'returns $true' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $true
+        }
+    }
+
+    Context 'LOCKED is disqualifying on its own -- THE case that stops a half-written render being uploaded as if finished' {
+        It 'returns $false when IsUnlocked is $false, even with a perfectly stable, matching, non-temp, never-uploaded size' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $false `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 999 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $false
+        }
+    }
+
+    Context 'a SIZE CHANGE since the last poll is disqualifying on its own -- THE OTHER case that stops a half-written render being uploaded as if finished' {
+        It 'returns $false when SizeNow differs from SizeLastSeen, even with SecondsStable already past the threshold' {
+            # Belt-and-braces alongside the SecondsStable check (see the
+            # function's own .DESCRIPTION, point 4): a caller bug that
+            # mis-tracked SecondsStable must not be able to override a size
+            # that plainly just moved.
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 999 -SecondsStable 999 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $false
+        }
+    }
+
+    Context 'a Topaz temp/scratch file is never eligible' {
+        It 'returns $false when IsTemp is $true, all else equal to the eligible baseline' {
+            Resolve-IncrementalUploadEligibility -IsTemp $true -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $false
+        }
+    }
+
+    Context 'a file already uploaded earlier this session, UNCHANGED since, is never re-uploaded' {
+        It 'returns $false when UploadedSize/UploadedWriteTimeUtc both match SizeNow/WriteTimeNow exactly, all else equal to the eligible baseline' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') | Should -Be $false
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review): a file that CHANGED since its earlier upload becomes eligible again' {
+        # THE REGRESSION THIS GUARDS AGAINST. Keying "already uploaded" on
+        # FullName alone would exclude a crash-resumed writer's CORRECTED
+        # overwrite of a previously-uploaded partial forever, because the
+        # path never changes even though the bytes at it do. See this
+        # function's own .DESCRIPTION for the full crash-recovery mechanism
+        # this defends against (Topaz's export_source flip from "export_as"
+        # to "quick", 2026-07-28 incident).
+
+        It 'is eligible when SizeNow differs from UploadedSize, even though UploadedWriteTimeUtc still matches WriteTimeNow' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 2000 -SizeLastSeen 2000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') | Should -Be $true
+        }
+
+        It 'is eligible when WriteTimeNow differs from UploadedWriteTimeUtc, even though UploadedSize still matches SizeNow' {
+            # A same-size overwrite is an unlikely real-world shape (a resumed
+            # export usually differs in byte count too), but the identity
+            # check is defined on BOTH fields independently, and each one
+            # must be able to lift the exclusion on its own -- this pins that.
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T11:30:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') | Should -Be $true
+        }
+
+        It 'is NOT eligible if the content changed but has not yet restabilized (still short of StableThresholdSec on the new size)' {
+            # A changed identity lifts condition 5, but conditions 3/4 (the
+            # ordinary stability gates) still apply to the NEW content -- a
+            # resumed writer must earn a fresh StableThresholdSec of stability
+            # before it is uploaded again, exactly like a first-time upload.
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 2000 -SizeLastSeen 2000 -SecondsStable 15 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T11:30:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') | Should -Be $false
+        }
+    }
+
+    Context 'a file seen for the FIRST time ever (no previous size to compare against) is never eligible on that poll' {
+        It 'returns $false when SizeLastSeen is $null, however large SecondsStable claims to be' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen $null -SecondsStable 999 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $false
+        }
+    }
+
+    Context 'the stability threshold is a real -ge boundary, not an approximation' {
+        It 'is NOT eligible one second short of StableThresholdSec' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 29 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $false
+        }
+
+        It 'IS eligible exactly at StableThresholdSec' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 30 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $true
+        }
+
+        It 'stays eligible well past the threshold (no upper bound)' {
+            Resolve-IncrementalUploadEligibility -IsTemp $false -IsUnlocked $true `
+                -SizeNow 1000 -SizeLastSeen 1000 -SecondsStable 3000 -StableThresholdSec 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize $null -UploadedWriteTimeUtc $null | Should -Be $true
+        }
+    }
+}
+
+Describe 'Get-NextUploadTrackingState (CORRECTION 3 -- per-file stability clock feeding the eligibility gate)' {
+    # Mirrors Get-NextWatchdogState's own shape/tests above: state is threaded
+    # through successive SIMULATED polls and the exact boundary is pinned,
+    # rather than calling the function once in isolation.
+    #
+    # $null for -UploadedSize/-UploadedWriteTimeUtc below is this function's
+    # equivalent of the old "-AlreadyUploaded $false" (see this file's
+    # Resolve-IncrementalUploadEligibility Describe above for the full
+    # rationale) -- these Contexts are otherwise UNCHANGED behaviour and exist
+    # to prove FINDING 2's fix did not disturb the existing stability-clock
+    # logic at all.
+
+    Context 'first poll a file is ever observed' {
+        It 'is never eligible (nothing yet to compare the size against), and seeds SizeLastSeen/SecondsStable at 0 for the next poll' {
+            $next = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen $null -PreviousSecondsStable 0 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+
+            $next.Eligible      | Should -Be $false
+            $next.SizeLastSeen  | Should -Be 1000
+            $next.SecondsStable | Should -Be 0
+        }
+    }
+
+    Context 'a size held across consecutive polls climbs the stability clock to the exact boundary (PollSec=15, StableThresholdSec=30 -> 2 intervals)' {
+        It 'is NOT yet eligible after 1 interval (15s), and IS eligible after 2 (30s)' {
+            $state = [pscustomobject]@{ SizeLastSeen = 1000; SecondsStable = 0 }
+
+            # This file was already seen once before at this same size (SizeLastSeen=1000
+            # carried in from that prior poll) -- this call is the SECOND poll overall.
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+            $state.SecondsStable | Should -Be 15
+            $state.Eligible      | Should -Be $false
+
+            # Third poll overall: still the same size -> SecondsStable reaches 30, exactly at the threshold.
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+            $state.SecondsStable | Should -Be 30
+            $state.Eligible      | Should -Be $true
+        }
+    }
+
+    Context 'a size change resets the stability clock to zero, mirroring Get-NextWatchdogState''s own stall-clock reset' {
+        It 'drops SecondsStable back to 0 the instant the size changes, even after several stable polls' {
+            $state = [pscustomobject]@{ SizeLastSeen = 1000; SecondsStable = 45 }
+
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 2000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.SecondsStable | Should -Be 0
+            $state.SizeLastSeen  | Should -Be 2000
+            $state.Eligible      | Should -Be $false
+        }
+
+        It 'must climb the FULL threshold again from the new size before becoming eligible' {
+            $state = [pscustomobject]@{ SizeLastSeen = 2000; SecondsStable = 0 }
+
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 2000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+            $state.Eligible | Should -Be $false
+
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 2000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+            $state.Eligible | Should -Be $true
+        }
+    }
+
+    Context 'a LOCKED file still accrues the stability clock on an unchanged size, but is never Eligible while locked' {
+        It 'SecondsStable advances normally even though IsUnlocked is $false; Eligible stays $false' {
+            $state = [pscustomobject]@{ SizeLastSeen = 1000; SecondsStable = 15 }
+
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $false -SizeNow 1000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.SecondsStable | Should -Be 30
+            $state.Eligible      | Should -Be $false
+        }
+
+        It 'becomes Eligible on the very next poll once unlocked, WITHOUT waiting through the threshold again -- the clock already satisfied it while locked' {
+            $state = [pscustomobject]@{ SizeLastSeen = 1000; SecondsStable = 30 }
+
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen $state.SizeLastSeen -PreviousSecondsStable $state.SecondsStable `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.Eligible | Should -Be $true
+        }
+    }
+
+    Context 'a file already uploaded this session, UNCHANGED since, stays excluded' {
+        It 'stays ineligible even with a perfectly stable, matching, unlocked, non-temp size, when UploadedSize/UploadedWriteTimeUtc still match' {
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen 1000 -PreviousSecondsStable 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.Eligible | Should -Be $false
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review): a file that changed since its earlier upload becomes eligible again through this function too' {
+        It 'is Eligible when SizeNow differs from UploadedSize, given the size has also already restabilized at the NEW value' {
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 2000 `
+                -PreviousSizeLastSeen 2000 -PreviousSecondsStable 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T11:30:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.Eligible | Should -Be $true
+        }
+
+        It 'is Eligible when only WriteTimeNow differs from UploadedWriteTimeUtc (same size, already restabilized)' {
+            $state = Get-NextUploadTrackingState -IsTemp $false -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen 1000 -PreviousSecondsStable 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T11:30:00Z') `
+                -UploadedSize 1000 -UploadedWriteTimeUtc ([datetime]'2026-07-28T10:00:00Z') `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.Eligible | Should -Be $true
+        }
+    }
+
+    Context 'a temp file accrues stability bookkeeping like any other file, but is never Eligible' {
+        It 'tracks SizeLastSeen/SecondsStable normally, Eligible stays $false' {
+            $state = Get-NextUploadTrackingState -IsTemp $true -IsUnlocked $true -SizeNow 1000 `
+                -PreviousSizeLastSeen 1000 -PreviousSecondsStable 30 `
+                -WriteTimeNow ([datetime]'2026-07-28T10:00:00Z') -UploadedSize $null -UploadedWriteTimeUtc $null `
+                -PollSec 15 -StableThresholdSec 30
+
+            $state.SecondsStable | Should -Be 45
+            $state.Eligible      | Should -Be $false
+        }
+    }
+}
+
+Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth of the incremental-upload pass)' {
+    # Orchestration around the two pure functions above: enumerates OutputDir,
+    # updates $Tracking in place, and uploads whatever is now eligible. Every
+    # I/O boundary (Test-Path, Get-ChildItem, Test-FileUnlocked,
+    # Invoke-TopazIncrementalUpload, Write-TopazLog) is mocked; Test-TopazTempFile
+    # is left REAL since it is itself a pure, already-tested function -- using it
+    # for real here is simpler than mocking it and exercises the actual
+    # TempMarker wiring too.
+
+    BeforeAll {
+        function Get-PollTestConfig {
+            param(
+                [bool]$UploadWhenReady = $true,
+                [string]$UploadTarget = 'gdrive:temp',
+                [string]$OutputDir = 'D:\Renders',
+                [int]$PollSec = 15,
+                [int]$UploadStableSec = 30,
+                [string]$TempMarker = '_temp'
+            )
+            [pscustomobject]@{
+                UploadWhenReady = $UploadWhenReady
+                UploadTarget    = $UploadTarget
+                OutputDir       = $OutputDir
+                PollSec         = $PollSec
+                UploadStableSec = $UploadStableSec
+                TempMarker      = $TempMarker
+            }
+        }
+
+        function Get-FakeOutputFile {
+            param(
+                [Parameter(Mandatory)][string]$Name,
+                [Parameter(Mandatory)][int64]$Length,
+                # Fixed default (not Get-Date) so tests that do not care about
+                # write-time get an IDENTICAL value across repeated Get-ChildItem
+                # mock invocations -- a real Get-Date default would risk the
+                # clock ticking over a second mid-test and spuriously tripping
+                # FINDING 2's write-time-changed re-upload path.
+                [datetime]$LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
+            )
+            [pscustomobject]@{
+                FullName         = "D:\Renders\$Name"
+                Name             = $Name
+                Length           = $Length
+                LastWriteTimeUtc = $LastWriteTimeUtc
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:Tracking = @{}
+        Mock Write-TopazLog { }
+        Mock Test-Path { $true }
+        Mock Invoke-TopazIncrementalUpload { $true }
+    }
+
+    Context 'preconditions gate the whole pass before ANY filesystem call' {
+        It 'UploadWhenReady=$false -> returns immediately, never calls Get-ChildItem' {
+            Mock Get-ChildItem { throw 'must not be called when UploadWhenReady is $false' }
+            $cfg = Get-PollTestConfig -UploadWhenReady $false
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            $script:Tracking.Count | Should -Be 0
+        }
+
+        It 'UploadTarget empty -> returns immediately, never calls Get-ChildItem' {
+            Mock Get-ChildItem { throw 'must not be called when UploadTarget is empty' }
+            $cfg = Get-PollTestConfig -UploadTarget ''
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+        }
+
+        It 'UploadTarget whitespace-only -> also treated as unset' {
+            Mock Get-ChildItem { throw 'must not be called when UploadTarget is whitespace' }
+            $cfg = Get-PollTestConfig -UploadTarget '   '
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+        }
+
+        It 'OutputDir missing (Test-Path $false) -> never calls Get-ChildItem' {
+            Mock Test-Path { $false }
+            Mock Get-ChildItem { throw 'must not be called when OutputDir does not exist' }
+            $cfg = Get-PollTestConfig
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+        }
+    }
+
+    Context 'no files in OutputDir' {
+        It 'completes without error, leaves Tracking empty, never uploads' {
+            # Plain '@()', not the leading-comma ', @()' idiom used elsewhere in this
+            # file for Get-TopazPids/Get-TopazWorkers: those need the comma because
+            # THEIR callers do not always re-wrap the result in @() themselves, so a
+            # bare empty array would collapse to $null crossing the return boundary.
+            # Invoke-TopazIncrementalUploadPoll ALWAYS re-wraps with
+            # '@(Get-ChildItem ...)', which already guarantees array-ness on its own --
+            # adding the comma here would instead double-wrap into a 1-element array
+            # containing an empty array, and foreach would iterate once over that
+            # inner empty array instead of zero times.
+            Mock Get-ChildItem { return @() }
+            $cfg = Get-PollTestConfig
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            $script:Tracking.Count | Should -Be 0
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+    }
+
+    Context 'a single file across successive polls: first seen, then stable-but-short, then eligible and uploaded exactly once' {
+        It 'uploads on poll 3 (2 full PollSec intervals of a stable size), never again after' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'done.mov' -Length 1000)) }
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable, still short
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> eligible, uploaded
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: unchanged since upload -> blocks a repeat
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            $script:Tracking['D:\Renders\done.mov'].UploadedSize | Should -Be 1000
+        }
+    }
+
+    Context 'a LOCKED file is never uploaded no matter how many stable-size polls pass' {
+        It 'never calls Invoke-TopazIncrementalUpload while Test-FileUnlocked keeps returning $false' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $false }
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'writing.mov' -Length 5000)) }
+
+            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+    }
+
+    Context 'a file whose size CHANGES between polls is never uploaded while it keeps changing, only once it finally settles' {
+        It 'resets the stability clock on each size change and uploads only after the size holds for the full threshold' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'growing.mov' -Length 1000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen at 1000
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'growing.mov' -Length 2000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: size changed -> clock resets
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: stable for 1 interval (15s)
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: stable for 2 intervals (30s) -> eligible
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+        }
+    }
+
+    Context 'a Topaz temp/scratch file is tracked but never uploaded, however long its size holds' {
+        It 'never calls Invoke-TopazIncrementalUpload for a name matching TempMarker' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30 -TempMarker '_temp'
+            Mock Test-FileUnlocked { $true }
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'scratch_temp.mov' -Length 1000)) }
+
+            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+    }
+
+    Context 'a FAILED incremental upload leaves the file unmarked so a later poll retries it -- NOT fatal, per Invoke-TopazIncrementalUpload''s own contract' {
+        It 'UploadedSize stays $null after a failed attempt, and the next eligible poll retries the upload' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+            Mock Invoke-TopazIncrementalUpload { $false }
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'flaky.mov' -Length 1000)) }
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable, not yet eligible
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> eligible, attempted, fails
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+            $script:Tracking['D:\Renders\flaky.mov'].UploadedSize | Should -Be $null
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: still eligible (unmarked) -> retried
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
+        }
+    }
+
+    Context 'multiple files are tracked independently, without cross-contamination' {
+        It 'uploads only the file that is actually eligible this poll, leaves the other alone' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+
+            Mock Get-ChildItem {
+                return @(
+                    (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),
+                    (Get-FakeOutputFile -Name 'still-growing.mov' -Length 500)
+                )
+            }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: both first-seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: both 15s stable
+
+            Mock Get-ChildItem {
+                return @(
+                    (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),          # unchanged -> reaches 30s
+                    (Get-FakeOutputFile -Name 'still-growing.mov' -Length 900)    # changed -> resets
+                )
+            }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3
+
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Name -eq 'ready.mov' }
+            $script:Tracking['D:\Renders\ready.mov'].UploadedSize         | Should -Be 1000
+            $script:Tracking['D:\Renders\still-growing.mov'].UploadedSize | Should -Be $null
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review): a file unchanged since its successful upload is never re-uploaded, however many further polls see it' {
+        It 'calls Invoke-TopazIncrementalUpload exactly once total, across an initial upload plus many identical subsequent polls' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'stable.mov' -Length 1000)) }
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> uploaded
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            # Many further polls, same size, same write-time (Get-FakeOutputFile's
+            # fixed default) -- THIS is the "must NOT turn into re-uploading the
+            # same bytes every poll" requirement the fix is explicitly scoped not
+            # to break.
+            1..6 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+            $script:Tracking['D:\Renders\stable.mov'].UploadedSize | Should -Be 1000
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review): a file whose SIZE differs from what was uploaded becomes eligible again' {
+        It 'uploads again once the new size restabilizes, records the NEW size as the uploaded identity, and logs the supersession distinctly' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'resized.mov' -Length 1000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2 (15s)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3 (30s) -> uploaded at 1000
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+            $script:Tracking['D:\Renders\resized.mov'].UploadedSize | Should -Be 1000
+
+            # Size now differs from what was uploaded -- must restabilize at the
+            # NEW size before re-upload, exactly like a first-time upload would.
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'resized.mov' -Length 4000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: size changed -> clock resets
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 5: 15s stable at 4000
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 6: 30s stable at 4000 -> eligible again
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 4000 }
+
+            $script:Tracking['D:\Renders\resized.mov'].UploadedSize | Should -Be 4000
+
+            # Greppable, distinct from an ordinary first-time upload log line.
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'SUPERSEDED'
+            }
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review): a file whose LAST-WRITE TIME differs from what was uploaded becomes eligible again, even at an unchanged size' {
+        It 'uploads again the moment the write-time changes, without needing to re-earn the stability threshold since the size itself never moved' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+            $t0 = [datetime]'2026-07-28T10:00:00Z'
+            $t1 = [datetime]'2026-07-28T11:30:00Z'
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t0)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2 (15s)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3 (30s) -> uploaded at (1000, t0)
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            # Same size, but a NEW write-time. SizeLastSeen/SecondsStable were
+            # already sitting at/past the threshold on this UNCHANGED size, so
+            # (per Get-NextUploadTrackingState's own contract) the identity
+            # mismatch alone is enough to re-open eligibility on this very poll
+            # -- no extra stabilization pass required.
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t1)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4
+
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
+            $script:Tracking['D:\Renders\overwritten.mov'].UploadedWriteTimeUtc | Should -Be $t1
+
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'SUPERSEDED'
+            }
+        }
+    }
+
+    Context 'FINDING 2 (2026-07-28 adversarial review) -- THE REGRESSION TEST: a crashed writer''s partial is uploaded, then the resumed writer overwrites it, and the corrected content is re-uploaded automatically' {
+        It 'uploads the partial once stable, does not re-upload while the resumed writer keeps growing it, then uploads the FINAL corrected size once it restabilizes' {
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            Mock Test-FileUnlocked { $true }
+
+            # PHASE 1: the crashed worker's partial. Its handle was released
+            # (unlocked) and it sat at a stable-but-INCOMPLETE size for long
+            # enough that this gate -- which cannot distinguish "finished" from
+            # "crashed and not yet resumed" -- treats it as finished and
+            # uploads it. THIS IS THE DOCUMENTED, ACCEPTED LIMITATION described
+            # on Resolve-IncrementalUploadEligibility: a partial CAN still be
+            # uploaded and verified in the first instance. That is NOT what
+            # this test is pinning; what it pins is what happens next.
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 900)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> "finished", uploaded
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 900 }
+            $script:Tracking['D:\Renders\export.mov'].UploadedSize | Should -Be 900
+
+            # PHASE 2: Topaz notices the crash, reloads the project, and
+            # resumes the export through its "quick" re-queue path (see
+            # Resolve-IncrementalUploadEligibility's own comment) -- the file
+            # starts growing again. It must NOT be re-uploaded while still
+            # moving, exactly like any other in-progress render.
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 1500)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: size changed -> clock resets
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 2200)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 5: still growing -> clock resets again
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            # PHASE 3: the resumed export finishes for real, at its correct,
+            # complete size.
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 3000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 6: size changed again -> clock resets
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 7: 15s stable at 3000
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 8: 30s stable at 3000 -> eligible again (differs from the uploaded 900)
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 3000 }
+
+            $script:Tracking['D:\Renders\export.mov'].UploadedSize | Should -Be 3000
+
+            # The re-upload is logged as a DISTINCT, greppable event -- the
+            # visible signature, on this box, of Topaz's crash-recovery
+            # re-queue path having fired, not silent noise folded into an
+            # ordinary "looks finished" line.
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'SUPERSEDED' -and $Message -match 'export\.mov'
+            }
+        }
+    }
+
+    Context 'pruning: a file no longer present in OutputDir is dropped from Tracking' {
+        It 'removes the tracking entry once Get-ChildItem stops returning it' {
+            $cfg = Get-PollTestConfig
+            Mock Test-FileUnlocked { $true }
+
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'gone-soon.mov' -Length 1000)) }
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking
+            $script:Tracking.ContainsKey('D:\Renders\gone-soon.mov') | Should -Be $true
+
+            Mock Get-ChildItem { return @() }   # see the 'no files in OutputDir' Context above for why NOT ', @()' here
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking
+            $script:Tracking.ContainsKey('D:\Renders\gone-soon.mov') | Should -Be $false
+        }
+    }
+
+    Context 'a failure anywhere in the pass is caught, logged as a WARN, and never thrown into the caller -- the single most safety-critical loop in the project' {
+        It 'does not throw and logs a WARN when Get-ChildItem itself fails unexpectedly' {
+            $cfg = Get-PollTestConfig
+            Mock Get-ChildItem { throw 'simulated filesystem failure' }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'Incremental upload pass FAILED'
+            }
+        }
+
+        It 'does not throw when Test-FileUnlocked itself throws for a tracked file' {
+            $cfg = Get-PollTestConfig
+            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'weird.mov' -Length 1000)) }
+            Mock Test-FileUnlocked { throw 'simulated lock-check failure' }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+    }
+}
+
 Describe 'Resolve-StopDecision' {
 
     It "('stalled', ReverifyActive=`$true) -> stop (a stalled reason is NEVER resumed via re-verify)" {
@@ -1230,5 +1928,105 @@ Describe 'Get-NextHeartbeatState (bounding silence during a healthy render)' {
 
         $next = Get-NextHeartbeatState -SilentSec $silent -PollSec 15 -HeartbeatSec 300
         $next.Due | Should -BeFalse
+    }
+
+    It 'is a pure function of (SilentSec, PollSec, HeartbeatSec) alone -- the property the docs/15 fix actually relies on' {
+        # Watchdog.ps1 now calls this from TWO blocking loops (the pre-GUI
+        # wait loop and the main monitoring loop, see its own SCOPE section).
+        # That is only safe because the function has no hidden coupling to
+        # which loop is calling it -- no $script:-scoped clock of its own, no
+        # memory of a previous call. Two independent calls with identical
+        # arguments, as if interleaved between the two different loops, must
+        # return identical results every time.
+        $fromWaitLoop       = Get-NextHeartbeatState -SilentSec 285 -PollSec 15 -HeartbeatSec 300
+        $fromMonitoringLoop = Get-NextHeartbeatState -SilentSec 285 -PollSec 15 -HeartbeatSec 300
+
+        $fromWaitLoop.Due       | Should -Be $fromMonitoringLoop.Due
+        $fromWaitLoop.SilentSec | Should -Be $fromMonitoringLoop.SilentSec
+
+        1..5 | ForEach-Object {
+            $s = Get-NextHeartbeatState -SilentSec 100 -PollSec 15 -HeartbeatSec 300
+            $s.Due       | Should -BeFalse
+            $s.SilentSec | Should -Be 115
+        }
+    }
+
+    It 'HeartbeatSec<=0 pins SilentSec at 0 no matter which loop-shaped PollSec feeds it, so a disabled heartbeat cannot silently accumulate' {
+        # PollSec varies here to prove the pin holds independent of the
+        # caller's own poll cadence -- both loops' cadence and a deliberately
+        # oversized one, so no loop-specific assumption is hiding in the pin.
+        foreach ($pollSec in @(15, 30, 600)) {
+            $s = Get-NextHeartbeatState -SilentSec 999999 -PollSec $pollSec -HeartbeatSec 0
+            $s.Due       | Should -BeFalse
+            $s.SilentSec | Should -Be 0
+        }
+    }
+}
+
+Describe 'Get-TopazWaitHeartbeatMessage (pre-GUI wait loop heartbeat text)' {
+
+    # WHAT THIS GUARDS. Get-TopazPids returns $null when the CIM query FAILED
+    # and @() when the query SUCCEEDED but simply found no Topaz GUI yet. Both
+    # send the wait loop round again, and before this function existed both
+    # looked identical in the log -- identical, too, to a watchdog that had
+    # died outright. The $null-vs-@() branch below is the entire judgement
+    # this function carries; the empty-collection test just below is the
+    # single most important one in this Describe, because a regression there
+    # silently restores the original ambiguity.
+
+    It "renders `$null TopazPids as a CIM query fault, not as 'not running'" {
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids $null -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $msg | Should -Match 'CIM process query UNREADABLE'
+        $msg | Should -Not -Match 'not running'
+    }
+
+    It "renders an EMPTY collection as 'not running', never as UNREADABLE -- the exact distinction this fix exists to make" {
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids @() -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $msg | Should -Match 'not running'
+        $msg | Should -Not -Match 'UNREADABLE'
+    }
+
+    It "renders a NON-empty collection as 'not running' too -- only an unreadable query is a fault, not the GUI's plain absence" {
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids @(1234) -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $msg | Should -Match 'not running'
+        $msg | Should -Not -Match 'UNREADABLE'
+    }
+
+    It 'echoes NameLike verbatim, wildcard and all' {
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids @() -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $msg | Should -Match ([regex]::Escape("LIKE 'Topaz Video%'"))
+    }
+
+    It 'echoes HeartbeatSec formatted as e.g. "300s" -- no space, and the ${HeartbeatSec}s brace form not silently broken' {
+        # If a future edit dropped the braces (bare $HeartbeatSecs), PowerShell
+        # would try to interpolate a nonexistent variable named "HeartbeatSecs"
+        # and silently render an empty string instead -- "every s while
+        # waiting" -- which the exact match below would catch.
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids @() -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $msg | Should -Match 'every 300s while waiting'
+        $msg | Should -Not -Match 'every 300 s'
+    }
+
+    It 'does not throw on an empty-string NameLike (the param is AllowEmptyString)' {
+        { Get-TopazWaitHeartbeatMessage -TopazPids @() -NameLike '' -HeartbeatSec 300 } | Should -Not -Throw
+
+        $msg = Get-TopazWaitHeartbeatMessage -TopazPids @() -NameLike '' -HeartbeatSec 300
+        $msg | Should -Match "LIKE ''"
+    }
+
+    It 'is pure: two calls with identical arguments return an identical string' {
+        $first  = Get-TopazWaitHeartbeatMessage -TopazPids @(111, 222) -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $second = Get-TopazWaitHeartbeatMessage -TopazPids @(111, 222) -NameLike 'Topaz Video%' -HeartbeatSec 300
+        $second | Should -Be $first
+    }
+
+    It 'is side-effect free: it never logs, it only returns text for the caller to log' {
+        # No Write-TopazLog convention exists elsewhere in this suite to lean
+        # on, so this is deliberately simple: make the mock fail loudly if the
+        # pure formatter ever calls it, on either the fault or normal path.
+        Mock Write-TopazLog { throw 'Get-TopazWaitHeartbeatMessage must not log -- the wait loop does the logging, this function only builds the string' }
+
+        { Get-TopazWaitHeartbeatMessage -TopazPids $null -NameLike 'Topaz Video%' -HeartbeatSec 300 } | Should -Not -Throw
+        { Get-TopazWaitHeartbeatMessage -TopazPids @()   -NameLike 'Topaz Video%' -HeartbeatSec 300 } | Should -Not -Throw
     }
 }

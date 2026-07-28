@@ -390,6 +390,37 @@ document - it is read-only evidence for values another engineer owns):
   DCV's 55% peaks. **`CompletionSignal` is therefore `'WorkerOnly'`** on this
   deployment, relying on the ancestry-matched worker signal - which never
   flickered across all 94 samples of §3, nor across either complete queue item.
+- **A second, independent measurement (2026-07-27) forces the same conclusion
+  onto the out-of-band CloudWatch idle alarm, which - unlike `Resolve-RenderActive`
+  above - was still keyed on `GPUUtilization` at the time.** `metric.log`
+  recorded **25 consecutive one-per-minute samples reading under 5%** during a
+  confirmed-healthy, actively-progressing 4K render (`workerIoBytes` climbing
+  on the watchdog's own heartbeat throughout the same window):
+  `14:16:25.209` -> `14:40:25.070`, values `0, 0, 2, 0, 0, 0, 0, 2, 2, 0, 1, 0,
+  0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0` - a **25-minute** sub-5% streak, five
+  minutes short of the alarm's default 30-consecutive-minute breach window,
+  broken only by a late burst of `100, 100, 28, 100` at
+  `14:41:25`-`14:44:25.411` as the encode finished. Full detail, including the
+  contrasting too-high-when-idle DCV numbers already established above, is in
+  [docs/15 §K](15-third-end-to-end-run.md#k-gpu-telemetry-a-genuine-healthy-render-near-miss-for-the-idle-alarm).
+  The same untrustworthiness that disqualified the GPU as a **completion**
+  signal (immediately above) therefore also disqualifies it as the **alarm**
+  signal: too low during a real render (this measurement, and the 9%/12%
+  troughs above) and too high when idle (the DCV measurement above) are the
+  same defect observed from two different consumers of the same metric. This
+  is why the idle alarm's default was changed to key on a `RenderActive`
+  worker-presence metric instead of `GPUUtilization` - see
+  [docs/06](06-phase4-safety-net.md#why-the-alarm-no-longer-defaults-to-gpu-and-why-30-minutes--notbreaching).
+  **That re-key narrowed the hazard; it did not remove the structural
+  problem that any idle-presence signal cannot distinguish "abandoned" from
+  "between two queue items" or "still setting up".** The operator decided on
+  2026-07-28 to stop arming this alarm at all for this project, rather than
+  trust a narrower-but-still-imperfect signal - see
+  [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box).
+  The measurements in this document remain the empirical basis for the
+  `RenderActive` signal itself (still true, and still what the watchdog's own
+  `CompletionSignal='WorkerOnly'` relies on); they are no longer the basis for
+  an armed alarm.
 - **A newly measured, previously undocumented hazard for `UnlockTimeoutMin`:**
   both queued **input** files - `SDR_Render_short.mp4` and
   `SDR_Render_video.mp4` - were reported `locked: true` in **94 of 94

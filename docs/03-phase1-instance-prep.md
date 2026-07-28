@@ -152,10 +152,14 @@ Get-Command aws.exe
 
 [`Install.ps1`](../in-guest/Install.ps1) also checks this and **warns** (without
 failing) if either is missing. If the warning appears, install / add the missing
-tool before relying on the idle alarm - otherwise the box can publish no GPU
-metric and the safety net has nothing to watch. (The `nvidia-smi` visibility you
-confirmed in Phase 0 is the interactive-session view; make sure the executable is
-resolvable on PATH for the SYSTEM task too.)
+tool - otherwise the box can publish neither metric at all. This matters even
+though no alarm watches these metrics by default on this project (see
+[Phase 4](06-phase4-safety-net.md) and
+[docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)):
+the telemetry is still useful on its own, and if you or a future deployment
+does opt into the idle alarm, it needs this publisher working. (The
+`nvidia-smi` visibility you confirmed in Phase 0 is the interactive-session
+view; make sure the executable is resolvable on PATH for the SYSTEM task too.)
 
 ## Phase 1 exit checklist
 

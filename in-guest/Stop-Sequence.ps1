@@ -133,8 +133,14 @@ else {
 }
 
 if ($cfg.OutputIsEphemeral -and ($uploadOk -eq $false)) {
+    # Invoke-TopazRenderUpload already made TWO attempts (1 initial + 1
+    # retry, per Resolve-UploadRetryDecision) before returning $false here --
+    # see its own comment for why a single blip no longer refuses the stop
+    # outright. Say so explicitly: a reader landing on just this ERROR line
+    # (without having scrolled up through both attempts) must not conclude
+    # only one try was made.
     Write-TopazLog -Component 'stop' -Level 'ERROR' `
-        -Message "UPLOAD FAILED and OutputDir '$($cfg.OutputDir)' is on EPHEMERAL storage. Stopping now would PERMANENTLY DESTROY the renders in it. REFUSING TO STOP -- the instance stays up so the render can still be recovered."
+        -Message "UPLOAD FAILED after 2 attempts (1 initial + 1 retry -- see the 'Upload attempt' lines above for both) and OutputDir '$($cfg.OutputDir)' is on EPHEMERAL storage. Stopping now would PERMANENTLY DESTROY the renders in it. REFUSING TO STOP -- the instance stays up so the render can still be recovered."
     Write-TopazLog -Component 'stop' -Level 'ERROR' `
         -Message "Recover with:  & '$($cfg.RclonePath)' --config '$($cfg.RcloneConfigPath)' copy '$($cfg.OutputDir)' '$($cfg.UploadTarget)' -P   then re-run this script."
 

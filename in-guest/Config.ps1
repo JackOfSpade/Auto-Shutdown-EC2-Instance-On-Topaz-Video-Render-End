@@ -239,13 +239,20 @@ function Get-TopazAutoStopConfig {
         #                   spawns, at the cost of needing a sensible
         #                   GpuBusyPercent. Recommended if the worker process is
         #                   not reliably a child of the GUI on your version.
-        # DEFAULT IS 'WorkerOrGpu' here deliberately. The two signals fail in
-        # different directions, and the asymmetry of the consequences decides
-        # it: a false "idle" powers the box off MID-RENDER and destroys hours
-        # of GPU time, while a false "busy" merely leaves the box up a little
-        # longer (and the out-of-band CloudWatch idle alarm exists precisely
-        # to catch that). Requiring BOTH signals to go quiet before calling a
-        # queue complete is therefore the correct bias.
+        # THE BIAS THAT DECIDES THIS. The signals fail in different directions,
+        # and the asymmetry of the consequences settles which way to lean: a
+        # false "idle" powers the box off MID-RENDER and destroys hours of GPU
+        # time, while a false "busy" merely leaves the box up a little longer.
+        # So whichever mode is chosen, it should be the one that is hardest to
+        # fool into reading "idle".
+        #
+        # On a box where the GPU is NOT shared with a remote-display encoder
+        # that argument selects 'WorkerOrGpu', because requiring BOTH signals
+        # to go quiet is the strongest guard against a false "idle". On THIS
+        # box it does not -- see the measured note below, which is why the
+        # shipped value is 'WorkerOnly'. Do not read this paragraph as
+        # describing the default; the executable value is at the end of this
+        # block.
         # Every mode gracefully degrades: both the worker and GPU signals are
         # three-valued ($true/$false/$null, $null = "could not be read this
         # poll"). If a signal is $null, it simply stops contributing per
@@ -327,8 +334,9 @@ function Get-TopazAutoStopConfig {
         # before the encoder starts producing output.
         StallSec         = 1800
 
-        # Bound (seconds) on how long the watchdog may log NOTHING while a
-        # render is healthy and progressing. 0 disables heartbeats.
+        # Bound (seconds) on how long the watchdog may log NOTHING -- while a
+        # render is healthy and progressing, AND while it is waiting for the
+        # Topaz GUI to appear. 0 disables heartbeats.
         #
         # The poll loop is deliberately quiet: it logs stalls, idle countdowns
         # and unreadable signals, but a progressing render logs nothing, so a
@@ -342,6 +350,14 @@ function Get-TopazAutoStopConfig {
         # is ~60 lines total, trivial against the 5 MB rotation threshold, and
         # it makes "the watchdog stopped logging" a real signal instead of the
         # normal case. See Get-NextHeartbeatState in Watchdog.ps1.
+        #
+        # This bound applies to BOTH of the watchdog's blocking loops. It did
+        # not always: on 2026-07-27 the FIRST cycle to run the heartbeat still
+        # logged nothing for 361s while waiting for the GUI, because the clock
+        # was declared below that loop (docs/15). Note the consequence of the
+        # clock measuring SILENCE rather than wall time -- a heartbeat interval
+        # observes ~320s, not 300s, because it counts 20 nominal PollSec ticks
+        # and an active poll really costs ~15.9-16.1s. That is by design.
         HeartbeatSec     = 300
 
         # After "done", the watchdog waits up to this many minutes for every
@@ -373,15 +389,40 @@ function Get-TopazAutoStopConfig {
         LogDir           = 'C:\topaz-autostop\logs'
 
         # ------------------------------------------------------------------
-        # PHASE 4 - GPU METRIC (published by Push-GpuMetric.ps1)
+        # PHASE 4 - SAFETY-NET METRICS (published by Push-GpuMetric.ps1)
         # ------------------------------------------------------------------
 
-        # These two values are MIRRORED by control-plane/03-create-idle-alarm.sh
+        # These values are MIRRORED by control-plane/03-create-idle-alarm.sh
         # (METRIC_NAMESPACE/METRIC_NAME env overrides there). If you change
         # them here, re-run that script with matching overrides, or the idle
         # alarm silently keeps watching a dead metric.
         MetricNamespace  = 'TopazRender/GPU'
         MetricName       = 'GPUUtilization'
+
+        # Name of the SECOND metric published every cycle: 1 when at least one
+        # encoder worker process exists, 0 when none does. See
+        # Test-RenderWorkerPresent below for why this exists and why it is
+        # matched more loosely than the watchdog's own worker signal.
+        #
+        # WHY A SECOND METRIC. The idle alarm used to key on GPUUtilization,
+        # and that metric is now known to be wrong in BOTH directions on this
+        # box:
+        #   * TOO HIGH when idle - a connected DCV session encodes the remote
+        #     display on the same GPU and holds it at 14-58% with nothing
+        #     rendering, so a 5% "idle" alarm can never fire while anyone is
+        #     connected (docs/12).
+        #   * TOO LOW when busy - MEASURED 2026-07-27: a confirmed-healthy 4K
+        #     render read under 5% for 25 CONSECUTIVE one-minute samples
+        #     (14:16:25 -> 14:40:25, mostly literal 0%), five minutes short of
+        #     the alarm's 30-minute breach window, ON A BOX THAT WAS RENDERING
+        #     (docs/15).
+        # The second of those is the dangerous one: it means the safety net
+        # could have stopped the box mid-render. docs/12 already concluded the
+        # GPU is unusable as a COMPLETION signal, which is why CompletionSignal
+        # is 'WorkerOnly' -- but the alarm went on reading it anyway. This
+        # metric gives the alarm the same class of signal the watchdog itself
+        # trusts. GPUUtilization is still published, as telemetry.
+        RenderActiveMetricName = 'RenderActive'
 
         # ------------------------------------------------------------------
         # OPTIONAL BEHAVIOUR
@@ -425,9 +466,163 @@ function Get-TopazAutoStopConfig {
         # OutputIsEphemeral) blocks the stop rather than discarding the render.
         UploadTimeoutSec = 14400
 
+        # Delay between upload attempt 1 and the single retry (see
+        # Resolve-UploadRetryDecision / Invoke-TopazRenderUpload). Long enough
+        # for a transient Drive-side blip (rate limiting, a dropped TCP
+        # connection mid-chunk) to clear; short enough that it never
+        # meaningfully delays a legitimate stop, since it is paid AT MOST
+        # ONCE, only on a failure, not on every stop. 15s split the difference
+        # between "a few seconds" and the "~30s" ceiling this was scoped to.
+        UploadRetryDelaySec = 15
+
+        # ------------------------------------------------------------------
+        # INCREMENTAL UPLOAD  (upload each render AS IT FINISHES)
+        #
+        # CORRECTION 3 (2026-07-28, operator instruction verbatim: "make the
+        # improvement that it starts uploading after each render is done, not
+        # waiting till after all render is done"). Before this, the ONLY
+        # upload ran inside Stop-Sequence.ps1 after the whole QUEUE went idle
+        # for DebounceSec -- so on a multi-export queue, a finished multi-GB
+        # deliverable sat completely unprotected on the EPHEMERAL scratch
+        # volume for the ENTIRE duration of every subsequent export (hours,
+        # in the session this was written for). See
+        # Invoke-TopazIncrementalUpload below and
+        # Invoke-TopazIncrementalUploadPoll in Watchdog.ps1 for the fix: the
+        # watchdog's own poll loop now uploads a file the moment it looks
+        # finished, and the final Stop-Sequence.ps1 sweep is UNCHANGED --
+        # it becomes a cheap catch-all, since rclone skips a destination file
+        # that already matches by size.
+        # ------------------------------------------------------------------
+
+        # Feature switch. $false restores the pre-2026-07-28 behaviour
+        # (upload only once, at the final stop) with no code changes -- flip
+        # this rather than deleting the feature if it ever needs to be ruled
+        # out while debugging something else.
+        UploadWhenReady  = $true
+
+        # How many CONSECUTIVE seconds an OutputDir file's size must sit
+        # UNCHANGED, in addition to being unlocked (Test-FileUnlocked), before
+        # the watchdog's poll loop treats it as "finished" and uploads it
+        # early.
+        #
+        # UNLOCKED ALONE IS NOT ENOUGH. Some encoders/muxers briefly release
+        # and reacquire their write handle between internal buffer flushes,
+        # so a file mid-write can read as momentarily unlocked on any single
+        # poll. Requiring the SAME size across multiple consecutive polls (at
+        # PollSec=15s, 30s here is 2 polls) in addition to being unlocked on
+        # the poll that actually triggers the upload is what distinguishes
+        # "genuinely finished" from "between two writes". See
+        # Resolve-IncrementalUploadEligibility in Watchdog.ps1 for the exact
+        # decision.
+        #
+        # 30s is short relative to DebounceSec (300s) and the ~1-2 minutes a
+        # real upload takes at this box's measured ~55-65 MiB/s -- the goal is
+        # catching a finished file promptly, not building a large safety
+        # margin the way RecoveryMaxAgeMin does; a real deliverable, once
+        # written, does not change size again.
+        UploadStableSec  = 30
+
         # If set to an SNS topic ARN, Stop-Sequence.ps1 publishes a best-effort
         # "render complete / stalled" notification before stopping. Empty = skip.
         SnsTopicArn      = ''
+
+        # ------------------------------------------------------------------
+        # MISPLACED-OUTPUT ANOMALY  (recovery scan + Topaz forensics)
+        #
+        # THE INCIDENT THIS EXISTS FOR (2026-07-28). Reason='completed' fires
+        # only after ArmSec of confirmed worker activity, yet OutputDir was
+        # empty: Topaz's own crash-recovery retry had silently dropped the
+        # "Renders\" subfolder from its cleanupPass output path, so a real,
+        # finished 2.3 GB render landed one directory up (D:\ root) and was
+        # invisible to every check scoped to OutputDir alone -- then the stop
+        # erased the ephemeral volume it sat on.
+        #
+        # CORRECTION 1 (also 2026-07-28, same day, before the fix above ever
+        # shipped): an empty OutputDir was the wrong TRIGGER, not just the
+        # wrong LABEL. The live counter-example was sitting on this very box:
+        # OutputDir held a correctly-placed FIRST deliverable (pnat-1) while a
+        # SECOND export was still writing its raw intermediate at the volume
+        # root. Had that second export's mux repeated the same "Renders\"-
+        # dropping bug, its output would have landed at D:\ root while
+        # OutputDir was NON-empty -- an empty-OutputDir trigger would never
+        # have fired, and the second render would have been erased exactly
+        # like the first. So the scan below now runs whenever reason=
+        # 'completed', REGARDLESS of whether OutputDir itself has files -- see
+        # Resolve-OutputAnomalyClass / Find-RenderRecoveryCandidates /
+        # Invoke-TopazForensicCapture / Invoke-TopazOutputAnomalyHandling
+        # below for the fix. The operator's explicit instruction is to STILL
+        # STOP either way, just to look first and record what happened --
+        # never to refuse.
+        # ------------------------------------------------------------------
+
+        # Extensions Find-RenderRecoveryCandidates treats as "plausibly a
+        # Topaz render deliverable" when scanning OUTSIDE OutputDir. This is a
+        # forensic/recovery aid only -- it does not gate uploads of files
+        # already inside OutputDir (Invoke-TopazRenderUpload uploads whatever
+        # is there, of any extension) and does not replace TempMarker.
+        RenderFileExtensions = @('.mov', '.mp4', '.mkv', '.avi', '.mxf')
+
+        # Bounds on the recovery scan, so a forensic aid can never itself
+        # become the reason a stop is slow or hung: stop collecting once this
+        # many candidates are found (a cap this generous already means
+        # something is very wrong; more precision would not change the
+        # response) ...
+        # Only files modified within this many minutes of the stop count as
+        # RECOVERY candidates. Older matches are still FOUND and still LOGGED,
+        # they are just not uploaded and do not decide the error class.
+        #
+        # WHY THIS EXISTS -- it is not a performance tweak, it is correctness.
+        # Extension alone cannot tell a just-finished render from a file that
+        # has legitimately sat on this volume for hours. The OutputDir comment
+        # above says outright that source footage is expected to be staged at
+        # the volume ROOT, and in the 2026-07-28 incident it was: the 1.6 GB
+        # source D:\SDR_Render_video3.mov sat beside the lost render the whole
+        # session, as did pnat-1's abandoned partial output. Without a recency
+        # bound the scan would (a) re-upload multi-GB source footage that was
+        # never at risk and is already safe, logging it as a "recovered
+        # render", and much worse (b) make a render that produced NOTHING AT
+        # ALL still report CandidatesFound = true purely because normal source
+        # footage exists at the root -- misfiling a total render failure as a
+        # merely-misplaced success, and destroying the one distinction the
+        # operator asked for ("both errors must be recorded in logs").
+        #
+        # 60 minutes is generous: a real deliverable's last-write time IS the
+        # moment the render finished, and the stop follows only DebounceSec
+        # (300s) plus the unlock gate after that -- roughly five minutes, not
+        # sixty. The margin covers a slow unlock or a watchdog restart without
+        # widening far enough to readmit hours-old staged source.
+        RecoveryMaxAgeMin      = 60
+
+        RecoveryScanMaxFiles   = 200
+        # ... do not descend more than this many directories below the
+        # OutputDir volume's root (0 = the root's own files only) ...
+        RecoveryScanMaxDepth   = 4
+        # ... and never let the walk itself run longer than this many
+        # seconds, checked BETWEEN directories (see Find-RenderRecoveryCandidates).
+        RecoveryScanTimeoutSec = 60
+
+        # OPERATOR SETTING: the folder Topaz itself writes its own *.tzlog
+        # session logs into, for THIS box's interactive Windows account (NOT
+        # the SYSTEM account Stop-Sequence.ps1 runs as -- SYSTEM has no way to
+        # resolve another account's %APPDATA%, so this must be an explicit,
+        # literal path). Defaults to the path observed on this deployment
+        # during the 2026-07-28 incident. Invoke-TopazForensicCapture
+        # tolerates this not existing (wrong account, or Topaz never opened)
+        # -- it is strictly best-effort.
+        TopazLogsBasePath = 'C:\Users\Administrator\AppData\Roaming\Topaz Labs LLC\Topaz Video\logs'
+
+        # Cap on how many matched "process exited"/"error occurred" lines
+        # Invoke-TopazForensicCapture copies out of the *.tzlog into stop.log.
+        # A stuck/crash-looping render can produce many such lines; the LAST
+        # N are what is actually diagnostic (the final, decisive failure),
+        # not the first.
+        TopazForensicMaxLines   = 40
+
+        # Bound (seconds) on the whole Topaz-log forensic capture: locating
+        # the newest *.tzlog plus scanning it for matching lines. Generous for
+        # a single-file text scan, but still finite -- this must never be able
+        # to hang or meaningfully delay the stop it is a side-note to.
+        TopazForensicTimeoutSec = 10
 
         # ------------------------------------------------------------------
         # HOW THE STOP IS PERFORMED
@@ -796,6 +991,72 @@ function Get-GpuUtilizationMax {
     }
 }
 
+function Test-RenderWorkerPresent {
+    <#
+    .SYNOPSIS
+        Is at least one encoder worker process alive right now? Deliberately
+        loose, stateless worker check for the out-of-band safety-net metric.
+    .DESCRIPTION
+        Feeds the RenderActive metric that Push-GpuMetric.ps1 publishes, which
+        the CloudWatch idle alarm keys on instead of GPUUtilization.
+
+        WHY THIS IS NOT Get-TopazWorkers (Watchdog.ps1). Two reasons, and both
+        of them matter:
+
+        1. IT MUST BE STATELESS. Get-TopazWorkers attributes workers by
+           ANCESTRY (descendants of a live Topaz GUI PID) and keeps a
+           $script:KnownWorkers table so that a worker ORPHANED by a crashed
+           GUI still counts as active. That table is built up across polls
+           inside one long-lived process. Push-GpuMetric.ps1 is relaunched by
+           the scheduler EVERY MINUTE, so it would start empty every single
+           time: an orphaned encoder -- GUI gone, ffmpeg still writing -- would
+           be attributed to nothing and read as IDLE, thirty of those in a row
+           would breach the alarm, and the safety net would power the box off
+           on top of a live render. Precisely the accident it exists to prevent.
+
+        2. THE TWO CALLERS WANT OPPOSITE BIASES. The watchdog is deciding
+           whether to STOP, so it needs a PRECISE signal -- an unrelated
+           ffmpeg.exe belonging to someone else's tool must not hold the box up
+           forever, hence ancestry. The alarm is deciding whether stopping is
+           SAFE, so it needs a CONSERVATIVE one: if anything on this box looks
+           remotely like an encoder, do not stop. Matching on name alone is the
+           strictly safer error in that direction, and it happens to be exactly
+           what makes it stateless. A stray ffmpeg here only ever costs uptime,
+           never a render.
+
+        DCV is unaffected by this signal, which is the other half of the fix:
+        the remote-display encoder is dwm.exe/dcvagent.exe and matches no
+        WorkerNamesLike pattern, so a connected session no longer suppresses
+        the alarm the way GPU load did.
+    .OUTPUTS
+        $true  - at least one process matching WorkerNamesLike is alive.
+        $false - the query succeeded and found none.
+        $null  - the query FAILED, so presence is unknown this cycle. Callers
+                 must publish NOTHING on $null rather than coercing it to 0;
+                 the alarm's treat-missing-data=notBreaching then holds its
+                 state instead of counting a failed query as an idle minute.
+    .PARAMETER WorkerNamesLike
+        Config's WorkerNamesLike patterns.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$WorkerNamesLike
+    )
+
+    try {
+        $filter  = Build-WorkerWqlFilter -Patterns $WorkerNamesLike
+        $workers = @(Get-CimInstance -ClassName Win32_Process -Filter $filter `
+            -Property ProcessId -OperationTimeoutSec 30 -ErrorAction Stop)
+        return ($workers.Count -gt 0)
+    }
+    catch {
+        # Includes Build-WorkerWqlFilter throwing on an empty pattern list --
+        # which would otherwise build a filter matching EVERY process and
+        # report a permanently active render, pinning the alarm OK forever.
+        return $null
+    }
+}
+
 function Resolve-RenderActive {
     <#
     .SYNOPSIS
@@ -907,6 +1168,55 @@ function Test-TopazTempFile {
 
     $pattern = [regex]::Escape($TempMarker) + '([._-]|$)'
     return [bool]($Name -match $pattern)
+}
+
+function Test-FileUnlocked {
+    <#
+    .SYNOPSIS
+        $true if the file can be opened for read with no sharing (i.e. nothing
+        else holds a write/append handle on it), otherwise $false.
+    .DESCRIPTION
+        MOVED HERE FROM Watchdog.ps1 (2026-07-28) so it can be shared with the
+        recovery scan (Find-RenderRecoveryCandidates, below) and the
+        incremental per-file upload pass (Invoke-TopazIncrementalUploadPoll in
+        Watchdog.ps1) without duplicating the exact same
+        FileShare.None-exclusive-open probe in three places. Watchdog.ps1 dot-
+        sources this file, so every existing caller (its own unlock-gate loop,
+        and Watchdog.Tests.ps1, which dot-sources Watchdog.ps1) keeps working
+        unchanged -- the function is still visible under the same name, it
+        just now lives one file over.
+
+        THE REASON THIS MATTERS FOR RECOVERY (CORRECTION 2, 2026-07-28). Topaz
+        writes a raw enhanced intermediate at the scratch volume ROOT
+        (D:\SDR_Render_video3_<digits>.mov) WHILE an export is still running,
+        then a separate mux pass combines it with the source's audio to
+        produce the real deliverable. A bare extension+recency match at the
+        volume root cannot tell that live intermediate apart from a genuinely
+        finished, misplaced deliverable -- both are recent files with a
+        render-shaped extension. Locked-ness is the signal that can: a file
+        still being written holds an exclusive (or at least a
+        write-incompatible) handle, so this probe fails for it and succeeds
+        the instant the writer closes it. See Find-RenderRecoveryCandidates's
+        own comment for how this keeps an in-progress render from being
+        misread as recovery evidence.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::None)
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($stream) { $stream.Close(); $stream.Dispose() }
+    }
 }
 
 function Build-AwsCliArgs {
@@ -1197,6 +1507,940 @@ function Test-IsScratchDiskCandidate {
     return $true
 }
 
+function Resolve-UploadRetryDecision {
+    <#
+    .SYNOPSIS
+        Pure: given the attempt just completed, decide whether the caller
+        should try again. No I/O, so it is fully unit-testable -- and it is
+        the ONE place the "how many attempts total" number lives, rather than
+        an inline loop counter duplicated at every call site.
+    .DESCRIPTION
+        THE BOUND IS THE POINT. This pipeline's whole design assumes that
+        once Reason='completed'/'stalled' fires, EITHER the stop succeeds OR
+        it refuses and leaves the box running for a human -- there is no
+        longer any other automatic stop watching an ephemeral render (the
+        out-of-band CloudWatch idle alarm cannot fire here either; see
+        docs/12). An unbounded or "just retry a few more times" upload loop
+        would instead sit burning instance-hours against a permanently broken
+        credential with nobody watching. MaxAttempts is therefore a real
+        parameter (so tests can pin the exact number), but every call site in
+        this file passes a literal small constant (2 = one initial attempt
+        plus one retry) -- it is deliberately not exposed as an
+        OPERATOR-tunable Config.ps1 knob, so bumping it up is not a one-line
+        config edit.
+    .PARAMETER AttemptNumber
+        The attempt that just ran (1-based).
+    .PARAMETER MaxAttempts
+        Total attempts allowed.
+    .PARAMETER Succeeded
+        Whether that attempt succeeded (copy AND verify both passed).
+    .OUTPUTS
+        [bool] $true if the caller should attempt again.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$AttemptNumber,
+        [Parameter(Mandatory)][int]$MaxAttempts,
+        [Parameter(Mandatory)][bool]$Succeeded
+    )
+
+    if ($Succeeded) { return $false }
+    return ($AttemptNumber -lt $MaxAttempts)
+}
+
+function Resolve-OutputAnomalyClass {
+    <#
+    .SYNOPSIS
+        Pure: classify the render-output situation at stop time, given why the
+        stop was invoked, whether OutputDir itself has any files, and whether
+        a best-effort scan of the OutputDir volume found any RECENT, UNLOCKED
+        candidate render file elsewhere. No I/O, so it is fully unit-testable.
+    .DESCRIPTION
+        RENAMED from Resolve-EmptyOutputDirDecision (2026-07-28, CORRECTION 1).
+        The old name and its single OutputDir-is-empty trigger were built
+        around the SYMPTOM the first incident happened to produce, not the
+        actual failure. Live counter-example, present on this box the day this
+        was fixed:
+
+            D:\Renders\SDR_Render_video3_pnat1.mov   2,311,449,636 bytes  (correct)
+            D:\SDR_Render_video3_227249191.mov       growing              (live intermediate)
+            D:\SDR_Render_video3.mov                 1,616,764,730 bytes  (source)
+
+        OutputDir is NON-EMPTY here (it holds pnat-1's correctly placed
+        output). If the SECOND export's mux again drops the "Renders\"
+        prefix, its deliverable lands at D:\ root while OutputDir still has
+        pnat-1's file sitting in it -- an empty-OutputDir trigger would never
+        fire, and the second render would be erased exactly like the first.
+        The real question was never "is OutputDir empty", it is "does a
+        recent, complete render file exist OUTSIDE OutputDir that the stop is
+        about to erase" -- which is orthogonal to whatever OutputDir itself
+        contains. Hence CandidatesFound and OutputDirHasFiles are now two
+        INDEPENDENT booleans, not one implied by the other.
+
+        THE INCIDENT THIS STILL ENCODES. Reason='completed' only ever fires
+        after ArmSec of CONTINUOUSLY observed worker activity (see ArmSec's
+        own comment) -- so by the time it fires, a real render is known to
+        have run. That is what makes "OutputDir has nothing AND nothing was
+        found anywhere else" a genuine anomaly (ErrorClassB) rather than the
+        unremarkable case it would be mid-render. 'stalled' and 'maxlifetime'
+        carry no such guarantee (a render may simply not have produced a
+        deliverable YET), so they are always 'NotApplicable' here, regardless
+        of OutputDir's contents -- preserving the pipeline's original
+        "nothing to upload from OutputDir itself, safe to proceed" behaviour
+        for those two reasons.
+
+        THE TWO ERROR CLASSES ARE NOW INDEPENDENT OF OutputDir's OWN STATE:
+          ErrorClassA (RENDER-OUTSIDE-OUTPUTDIR) fires whenever a recent
+            candidate is found elsewhere on the volume, WHETHER OR NOT
+            OutputDir itself is empty -- a misplaced SECOND file is just as
+            real a loss when OutputDir already holds a correct FIRST one.
+          ErrorClassB (RENDER-PRODUCED-NO-OUTPUT) only ever applies when
+            OutputDir is ALSO empty: if OutputDir has files, something was
+            produced and correctly placed, so "no output" is false even if
+            nothing extra was found outside it.
+        Class A therefore takes priority when both conditions could
+        theoretically be evaluated -- but by construction they cannot both be
+        true simultaneously (CandidatesFound=true blocks ErrorClassB by
+        definition), so this is a precedence rule in name only.
+
+        THE OPERATOR'S CHOSEN BEHAVIOUR (verbatim; see Stop-Sequence.ps1's own
+        comment for the full quote): stop the box EITHER WAY, after best-
+        effort recovery and an unambiguous log record. This function only
+        LABELS which situation occurred -- greppably and distinctly, so none
+        of the four are ever confused when read later -- it does not decide
+        whether to stop; nothing downstream of it may turn any class into a
+        refusal.
+    .PARAMETER Reason
+        'completed' | 'stalled' | 'maxlifetime'.
+    .PARAMETER OutputDirHasFiles
+        Whether OutputDir itself currently has at least one file. No longer
+        the trigger for running the scan (see CORRECTION 1 above) -- purely
+        an input to the classification now.
+    .PARAMETER CandidatesFound
+        Whether Find-RenderRecoveryCandidates found ANY recent, UNLOCKED
+        candidate file outside OutputDir. Only consulted when Reason is
+        'completed'; harmless (ignored) otherwise.
+    .OUTPUTS
+        'NotApplicable' - Reason is not 'completed': the ArmSec guarantee that
+                          makes an anomaly diagnosable does not hold yet, so
+                          this function does not classify anything.
+        'ErrorClassA'   - RENDER-OUTSIDE-OUTPUTDIR: reason='completed' and a
+                          recent, unlocked candidate was found elsewhere on
+                          the volume -- regardless of OutputDir's own state.
+        'ErrorClassB'   - RENDER-PRODUCED-NO-OUTPUT: reason='completed',
+                          OutputDir is empty, and nothing was found anywhere
+                          else on the volume either.
+        'Normal'        - reason='completed', OutputDir has file(s), and
+                          nothing anomalous was found outside it. The ordinary,
+                          healthy single-deliverable case.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('completed', 'stalled', 'maxlifetime')][string]$Reason,
+        [Parameter(Mandatory)][bool]$OutputDirHasFiles,
+        [Parameter(Mandatory)][bool]$CandidatesFound
+    )
+
+    if ($Reason -ne 'completed') { return 'NotApplicable' }
+    if ($CandidatesFound) { return 'ErrorClassA' }
+    if (-not $OutputDirHasFiles) { return 'ErrorClassB' }
+    return 'Normal'
+}
+
+function Find-RenderRecoveryCandidates {
+    <#
+    .SYNOPSIS
+        Best-effort scan of the volume housing OutputDir for candidate render
+        files OUTSIDE OutputDir -- the forensic/recovery aid for the
+        2026-07-28 incident, where a finished 2.3 GB render landed one
+        directory above OutputDir (D:\ root, not D:\Renders) and was invisible
+        to every check in this pipeline (all scoped to OutputDir alone) until
+        the box was already gone.
+    .DESCRIPTION
+        SCOPE IS DELIBERATELY THE OUTPUTDIR VOLUME, NOT THE WHOLE MACHINE.
+        Independent verification of the incident found that a render
+        INTERMEDIATE also transiently touched C:\...\previews\ mid-job
+        (Topaz's own internal concat/mux staging) -- but it self-deleted
+        before the mux finished, and more to the point: C: is NOT the
+        ephemeral volume, so nothing there is destroyed by the stop regardless
+        of whether this scan sees it. This scan exists to catch exactly what
+        the stop is about to ERASE, which (see OutputIsEphemeral) is scoped to
+        OutputDir's own volume. Anything genuinely lost on a PERSISTENT volume
+        was never at risk from the stop in the first place.
+
+        BOUNDED on every axis that could turn a forensic aid into a delayed or
+        hung stop:
+          - depth-limited (MaxDepth), so a deeply nested project tree cannot
+            blow up the walk;
+          - count-limited (MaxFiles), so a volume full of small scratch files
+            cannot make the candidate list unusable;
+          - wall-clock-limited (MaxSeconds), checked BETWEEN directories (not
+            only once at the very end) via a manual iterative walk rather
+            than a single Get-ChildItem -Recurse, so a slow/degraded disk
+            cannot hang the stop path this is strictly subordinate to;
+          - wrapped in try/catch throughout: ANY failure here (including a
+            single unreadable subdirectory) degrades gracefully rather than
+            aborting the whole scan or throwing into the stop sequence.
+        Like every other bounded I/O call in this file (Get-GpuUtilizationMax,
+        Invoke-TopazAwsCli), this bound is cooperative, not preemptive: it
+        cannot abort a single Get-ChildItem call that is itself wedged on a
+        dead I/O path. That is an accepted, not a hidden, limitation -- the
+        volume in question is the local instance-store scratch disk, not a
+        network share, so a genuinely hung directory listing is not a
+        realistic failure mode here the way a hung external process is.
+
+        A CAP MUST NEVER READ AS "CONFIRMED NOTHING ELSE IS ON THE VOLUME",
+        and a SCAN FAILURE MUST NEVER READ AS "CONFIRMED FOUND NOTHING"
+        either -- those are three different facts, so all three are reported
+        back distinctly (Candidates / Truncated / ScanFailed) for the caller
+        to log distinctly.
+
+        RECENCY IS PART OF THE MATCH, NOT AN OPTIMISATION. Extension alone
+        cannot distinguish a render that finished minutes ago from source
+        footage that has sat on this volume all session -- and OutputDir's own
+        config comment states that staging source at the volume ROOT is the
+        expected layout. In the 2026-07-28 incident the 1.6 GB source and
+        pnat-1's abandoned partial output both sat at D:\ root alongside the
+        lost render. Matching on extension alone would therefore re-upload
+        already-safe source footage as though it were the recovery, and would
+        make a render that produced NOTHING still report candidates -- turning
+        "the render failed outright" into "the render was merely misplaced".
+        So files older than ModifiedAfter are split out into ExcludedByAge:
+        still found, still reported, never uploaded, and never allowed to
+        decide the error class. Reporting rather than silently dropping them
+        follows the same rule as the caps above -- the operator must be able
+        to see everything the scan saw.
+
+        OVER-RECOVERING IS ACCEPTED AND PREFERRED TO UNDER-RECOVERING. A
+        recent, unlocked, extension-matching file that turns out to just be
+        source footage staged at the root (rather than a lost deliverable)
+        gets uploaded needlessly -- but rclone `copy`/`check` skip a
+        destination file that already matches by size, so a re-upload of
+        something already safe costs a little bandwidth and nothing else. The
+        opposite mistake -- narrowing the match until a real deliverable slips
+        through -- is UNRECOVERABLE once the stop erases this volume. Do not
+        "tighten" ModifiedAfter, Extensions, or this margin later in the name
+        of precision without weighing that asymmetry again.
+
+        A THIRD BUCKET, SkippedInProgress, EXISTS FOR THE SAME REASON
+        Test-FileUnlocked was moved into this file (CORRECTION 2, 2026-07-28):
+        recency and extension alone cannot tell a just-finished, misplaced
+        deliverable apart from Topaz's own LIVE intermediate
+        (D:\SDR_Render_video3_<digits>.mov), which is written at the volume
+        root WHILE an export is still running and is neither abandoned nor a
+        recovery candidate -- it is the normal, expected shape of an
+        in-progress job. A file that is recent AND extension-matches AND is
+        still LOCKED (a writer holds it open) is exactly that case: it goes to
+        SkippedInProgress, never Candidates, and -- critically -- never gets a
+        vote in Resolve-OutputAnomalyClass's decision. Without this split, a
+        live intermediate mid-mux would either (a) get uploaded half-written
+        by Invoke-TopazRecoveryUpload, or (b) wrongly count as "found
+        something", masking the fact that the REAL deliverable is still
+        missing.
+    .PARAMETER OutputDir
+        The configured output folder (may or may not be empty -- see
+        CORRECTION 1: this scan runs regardless of OutputDir's own contents).
+        Excluded from the walk, along with "System Volume Information" and
+        "$RECYCLE.BIN".
+    .PARAMETER Extensions
+        Config's RenderFileExtensions, e.g. @('.mov','.mp4','.mkv','.avi','.mxf').
+    .PARAMETER ModifiedAfter
+        Only files whose LastWriteTime is at or after this instant are
+        considered for Candidates/SkippedInProgress; older extension-matches
+        go to ExcludedByAge regardless of lock state.
+    .PARAMETER MaxFiles
+        Stop collecting once this many candidates are found.
+    .PARAMETER MaxDepth
+        Directory depth bound below the volume root (0 = the root's own files
+        only).
+    .PARAMETER MaxSeconds
+        Wall-clock bound on the whole scan.
+    .OUTPUTS
+        [pscustomobject]@{
+            Candidates       = @(<System.IO.FileInfo>, ...)  # recent, unlocked; possibly empty
+            ExcludedByAge    = @(<System.IO.FileInfo>, ...)  # matched, too old
+            SkippedInProgress = @(<System.IO.FileInfo>, ...) # recent, but still LOCKED (a live write)
+            Truncated        = [bool]  # MaxFiles/MaxSeconds cut the scan short
+            ScanFailed       = [bool]  # the scan itself could not run/complete
+        }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string[]]$Extensions,
+        [Parameter(Mandatory)][datetime]$ModifiedAfter,
+        [Parameter(Mandatory)][int]$MaxFiles,
+        [Parameter(Mandatory)][int]$MaxDepth,
+        [Parameter(Mandatory)][int]$MaxSeconds
+    )
+
+    $result = [pscustomobject]@{
+        Candidates        = @()
+        ExcludedByAge     = @()
+        SkippedInProgress = @()
+        Truncated         = $false
+        ScanFailed        = $false
+    }
+
+    try {
+        $root = [System.IO.Path]::GetPathRoot($OutputDir)
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
+            $result.ScanFailed = $true
+            return $result
+        }
+
+        $excluded = @(
+            (Join-Path $root 'System Volume Information'),
+            (Join-Path $root '$RECYCLE.BIN'),
+            $OutputDir
+        ) | ForEach-Object { $_.TrimEnd('\').ToLowerInvariant() }
+
+        $extSet = @{}
+        foreach ($e in $Extensions) {
+            if (-not [string]::IsNullOrWhiteSpace($e)) { $extSet[$e.ToLowerInvariant()] = $true }
+        }
+
+        $deadline   = (Get-Date).AddSeconds($MaxSeconds)
+        $found      = New-Object System.Collections.Generic.List[object]
+        $tooOld     = New-Object System.Collections.Generic.List[object]
+        $inProgress = New-Object System.Collections.Generic.List[object]
+
+        # Manual iterative walk (not a single Get-ChildItem -Recurse) so the
+        # wall-clock deadline and the file cap can both be checked BETWEEN
+        # directories, not only after the whole recursive enumeration has
+        # already finished -- the exact bound that matters on a large volume.
+        $dirQueue = New-Object System.Collections.Generic.Queue[object]
+        $dirQueue.Enqueue([pscustomobject]@{ Path = $root; Depth = 0 })
+
+        while ($dirQueue.Count -gt 0) {
+            if ((Get-Date) -ge $deadline) { $result.Truncated = $true; break }
+            # Cap the COMBINED total across ALL THREE buckets, not just the
+            # recent/candidate list: otherwise a volume full of old media (or
+            # full of in-progress writes) would leave $found at 0, sail past
+            # this bound, and let ExcludedByAge/SkippedInProgress grow without
+            # limit.
+            if (($found.Count + $tooOld.Count + $inProgress.Count) -ge $MaxFiles) { $result.Truncated = $true; break }
+
+            $current = $dirQueue.Dequeue()
+
+            if ($excluded -contains $current.Path.TrimEnd('\').ToLowerInvariant()) { continue }
+
+            try {
+                $entries = Get-ChildItem -LiteralPath $current.Path -Force -ErrorAction Stop
+            }
+            catch {
+                # One unreadable directory (permissions, a transient handle)
+                # should not sink the whole scan -- skip it and keep going.
+                continue
+            }
+
+            foreach ($entry in $entries) {
+                if (($found.Count + $tooOld.Count + $inProgress.Count) -ge $MaxFiles) {
+                    $result.Truncated = $true; break
+                }
+
+                if ($entry.PSIsContainer) {
+                    if ($current.Depth -lt $MaxDepth) {
+                        $childPath = $entry.FullName.TrimEnd('\').ToLowerInvariant()
+                        if ($excluded -notcontains $childPath) {
+                            $dirQueue.Enqueue([pscustomobject]@{ Path = $entry.FullName; Depth = $current.Depth + 1 })
+                        }
+                    }
+                    continue
+                }
+
+                if ($extSet.ContainsKey($entry.Extension.ToLowerInvariant())) {
+                    # Recency decides RECOVERY, not discovery: an older match is
+                    # still recorded so the log shows everything the scan saw,
+                    # it is just not uploaded and cannot flip the error class
+                    # (see .DESCRIPTION -- source footage lives here too).
+                    if ($entry.LastWriteTime -ge $ModifiedAfter) {
+                        # RECENT: still need to rule out a LIVE intermediate
+                        # (CORRECTION 2). A file a writer still holds open is
+                        # not abandoned and not a recovery candidate -- it is
+                        # Topaz's normal in-progress layout (see
+                        # Test-FileUnlocked's own comment on why this moved
+                        # here). Locked-ness must NEVER decide the error class,
+                        # so it goes to its own bucket, not ExcludedByAge (that
+                        # bucket is for AGE, a different fact) and not
+                        # Candidates.
+                        if (Test-FileUnlocked -Path $entry.FullName) {
+                            [void]$found.Add($entry)
+                        }
+                        else {
+                            [void]$inProgress.Add($entry)
+                        }
+                    }
+                    else {
+                        [void]$tooOld.Add($entry)
+                    }
+                }
+            }
+        }
+
+        $result.Candidates        = $found.ToArray()
+        $result.ExcludedByAge     = $tooOld.ToArray()
+        $result.SkippedInProgress = $inProgress.ToArray()
+        return $result
+    }
+    catch {
+        # Whatever failed, the scan itself did not complete -- this is a
+        # DIFFERENT fact from "completed and found nothing" (see .DESCRIPTION).
+        $result.ScanFailed = $true
+        return $result
+    }
+}
+
+function Invoke-TopazForensicCapture {
+    <#
+    .SYNOPSIS
+        Best-effort: locate the most recently modified *.tzlog under
+        TopazLogsBasePath and copy its "process exited"/"error occurred"
+        lines into stop.log, so a future reader can see WHY Topaz's own
+        render failed without needing a box that may already be gone.
+    .DESCRIPTION
+        THE GAP THIS CLOSES. Neither anomalous branch of
+        Invoke-TopazOutputAnomalyHandling records anything about what Topaz
+        itself did -- that information existed ONLY in Topaz's own session
+        log. In the 2026-07-28 incident the .tzlog was the sole source that
+        showed process 31/34 dying with "process exited error occurred: 31 1"
+        / "...34 1", the crash-recovery reload that silently dropped
+        "Renders\" from the retried export's cleanupPass path, and pnat-1's
+        outright, unretried failure. Without this capture, "render failed"
+        was completely invisible from this pipeline's OWN logs, and the whole
+        incident was only reconstructable because the .tzlog happened to
+        still be sitting on a persistent volume (C:) after the box stopped.
+
+        STRICTLY BEST-EFFORT: every failure mode (missing/wrong
+        TopazLogsBasePath, no *.tzlog present, an unreadable file, a
+        Select-String failure, anything) is caught here and logged as a WARN,
+        never allowed to throw, hang, or delay the stop sequence this is a
+        side-note to. Time-bounded via TopazForensicTimeoutSec, checked
+        between the file-listing and the content-scan steps.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object (uses TopazLogsBasePath,
+        TopazForensicMaxLines, TopazForensicTimeoutSec).
+    .OUTPUTS
+        None -- writes directly via Write-TopazLog. Never throws.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $cfg = $Config
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($cfg.TopazLogsBasePath) -or -not (Test-Path -LiteralPath $cfg.TopazLogsBasePath)) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Topaz forensic capture SKIPPED: TopazLogsBasePath '$($cfg.TopazLogsBasePath)' does not exist (wrong account, or Topaz has never run on this box). No .tzlog forensics captured."
+            return
+        }
+
+        $deadline = (Get-Date).AddSeconds($cfg.TopazForensicTimeoutSec)
+
+        $latest = Get-ChildItem -LiteralPath $cfg.TopazLogsBasePath -Filter '*.tzlog' -File -ErrorAction Stop |
+            Sort-Object -Property LastWriteTime -Descending |
+            Select-Object -First 1
+
+        if (-not $latest) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Topaz forensic capture: no *.tzlog file found under '$($cfg.TopazLogsBasePath)'."
+            return
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Topaz forensic capture ABORTED: locating the newest *.tzlog under '$($cfg.TopazLogsBasePath)' alone exceeded the $($cfg.TopazForensicTimeoutSec)s bound (TopazForensicTimeoutSec)."
+            return
+        }
+
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message "Topaz forensic capture: most recent session log is '$($latest.FullName)' (last write $($latest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff')))."
+
+        $matched = @(Select-String -LiteralPath $latest.FullName `
+            -Pattern 'process exited error occurred', 'process exited:' -ErrorAction Stop)
+
+        if ((Get-Date) -ge $deadline) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Topaz forensic capture ABORTED after scanning '$($latest.FullName)': exceeded the $($cfg.TopazForensicTimeoutSec)s bound (TopazForensicTimeoutSec) before logging any matched line."
+            return
+        }
+
+        if ($matched.Count -eq 0) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "Topaz forensic capture: '$($latest.FullName)' contains no 'process exited' line."
+            return
+        }
+
+        # The LAST N matches are the diagnostic ones (the final, decisive
+        # failure), not the first -- a crash-looping render can log many.
+        $capped = $matched | Select-Object -Last $cfg.TopazForensicMaxLines
+        if ($matched.Count -gt $cfg.TopazForensicMaxLines) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Topaz forensic capture: $($matched.Count) matching line(s) found in '$($latest.FullName)'; logging only the last $($cfg.TopazForensicMaxLines) (TopazForensicMaxLines)."
+        }
+
+        foreach ($m in $capped) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "TOPAZ-LOG [$($latest.Name)]: $($m.Line.Trim())"
+        }
+    }
+    catch {
+        # Best-effort, no exceptions: must never abort or delay the stop.
+        Write-TopazLog -Component 'stop' -Level 'WARN' `
+            -Message "Topaz forensic capture FAILED (best-effort, ignored): $($_.Exception.Message)"
+    }
+}
+
+function Invoke-TopazRecoveryUpload {
+    <#
+    .SYNOPSIS
+        Best-effort upload + independent verification of a SPECIFIC list of
+        candidate render files found OUTSIDE OutputDir (ERROR CLASS A:
+        "render landed outside OutputDir"). Logs an explicit per-file
+        disposition. NEVER blocks the stop -- unlike
+        Invoke-TopazRenderUpload's ephemeral interlock, the caller proceeds to
+        stop regardless of what this function achieves.
+    .DESCRIPTION
+        REUSES THE SAME rclone copy + check PLUMBING AS THE NORMAL UPLOAD
+        PATH, scoped down with `--include` filters to exactly the candidate
+        files' paths relative to the OutputDir volume's root, rather than
+        shelling out to rclone afresh or writing a per-file copyto loop. This
+        is the "simplest approach that reuses existing, already-tested code"
+        the task calls for: `copy`/`check` (not `copyto`, not a bespoke
+        per-file command) with the SAME argument shape Invoke-TopazRenderUpload
+        already uses, just with the source widened to the volume root and
+        `--include` narrowing it back down to only the discovered candidates
+        (each candidate can live in a different directory; a single `--include`
+        list handles that without needing a common parent folder).
+
+        THE DELIBERATE ASYMMETRY WITH THE NORMAL PATH. A normal-path upload
+        failing twice REFUSES to stop (Stop-Sequence.ps1's ephemeral
+        interlock), because OutputDir holding EXPECTED output is the common
+        case this whole pipeline exists to protect, and losing a render nobody
+        knows is broken yet is the worst outcome. This recovery path is
+        different BY THE OPERATOR'S OWN EXPLICIT INSTRUCTION: it is already
+        handling an anomaly the operator chose in advance to accept ("if
+        human error and render lands in wrong folder, im fine with it
+        shutting down but try best effort to find it first and complete the
+        upload"). So a failure here still lets the caller STOP -- this
+        function's whole job is to make the disposition of every file
+        unambiguous in the log, not to gate the stop.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object.
+    .PARAMETER Candidates
+        FileInfo objects from Find-RenderRecoveryCandidates.
+    .OUTPUTS
+        [pscustomobject]@{ AnyUnrecovered = [bool] } -- informational only;
+        the caller does not use this to decide whether to stop.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Candidates
+    )
+
+    $cfg = $Config
+
+    if ($Candidates.Count -eq 0) { return [pscustomobject]@{ AnyUnrecovered = $false } }
+
+    function Write-RecoveryDisposition {
+        param([Parameter(Mandatory)]$File, [Parameter(Mandatory)][string]$Disposition, [string]$Detail = '')
+        $sizeAndTime = "$($File.Length) bytes, last write $($File.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))"
+        Write-TopazLog -Component 'stop' -Level $(if ($Disposition -eq 'uploaded+verified') { 'INFO' } else { 'ERROR' }) `
+            -Message "RECOVERY DISPOSITION: $Disposition -- '$($File.FullName)' ($sizeAndTime). $Detail".TrimEnd()
+    }
+
+    $notRecoveredDetail = if ($cfg.OutputIsEphemeral) {
+        'This file will be PERMANENTLY DESTROYED when the stop wipes the ephemeral volume, and is UNRECOVERABLE after that.'
+    }
+    else {
+        'OutputDir is not on ephemeral storage, so the file itself is not being destroyed by this stop -- but it was NOT uploaded anywhere and remains only on local disk.'
+    }
+
+    if (-not (Test-Path -LiteralPath $cfg.RclonePath) -or -not (Test-Path -LiteralPath $cfg.RcloneConfigPath) `
+        -or [string]::IsNullOrWhiteSpace($cfg.UploadTarget)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "RECOVERY UPLOAD SKIPPED: rclone ('$($cfg.RclonePath)'), its config ('$($cfg.RcloneConfigPath)'), or UploadTarget is not available. Every candidate below is NOT RECOVERED."
+        foreach ($c in $Candidates) { Write-RecoveryDisposition -File $c -Disposition 'NOT RECOVERED' -Detail $notRecoveredDetail }
+        return [pscustomobject]@{ AnyUnrecovered = $true }
+    }
+
+    $root     = [System.IO.Path]::GetPathRoot($cfg.OutputDir)
+    $destBase = "$($cfg.UploadTarget.TrimEnd('/'))/recovered"
+
+    $includeArgs = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $Candidates) {
+        $rel = $c.FullName.Substring($root.Length).Replace('\', '/')
+        [void]$includeArgs.Add('--include')
+        [void]$includeArgs.Add($rel)
+    }
+
+    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
+    $common    = @('--config', $cfg.RcloneConfigPath, '--log-file', $rcloneLog, '--log-level', 'INFO')
+    $tuning    = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
+
+    $copyArgs  = @('copy', $root, $destBase) + $common + $tuning + $includeArgs
+    $checkArgs = @('check', $root, $destBase) + $common + @('--one-way') + $includeArgs
+
+    Write-TopazLog -Component 'stop' -Level 'INFO' `
+        -Message "Attempting best-effort recovery upload of $($Candidates.Count) candidate file(s) from '$root' -> '$destBase'."
+
+    # Same MAX-ONE-RETRY policy as the normal upload path, via the SAME pure
+    # Resolve-UploadRetryDecision helper -- it can only help a transient blip,
+    # and the hard cap matters here too: this runs on every anomalous
+    # completion, and an unbounded loop here would burn instance hours against
+    # a broken credential just as readily as it would on the normal path.
+    $maxAttempts  = 2
+    $lastCopied   = $false
+    $lastVerified = $false
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message "Recovery upload attempt $attempt of $maxAttempts (rclone copy)."
+
+        $lastCopied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
+            -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `
+            -SuccessMessage "Recovery upload attempt $attempt of ${maxAttempts}: rclone copy completed." `
+            -FailureVerb "Recovery upload attempt $attempt of $maxAttempts (rclone copy)" `
+            -FailureContext "target=$destBase."
+
+        $lastVerified = $false
+        if ($lastCopied) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "Recovery upload attempt $attempt of $maxAttempts (rclone check)."
+
+            $lastVerified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
+                -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `
+                -SuccessMessage "Recovery upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED every candidate file." `
+                -FailureVerb "Recovery upload attempt $attempt of $maxAttempts (rclone check)" `
+                -FailureContext "target=$destBase."
+        }
+
+        if ($lastCopied -and $lastVerified) { break }
+
+        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Recovery upload attempt $attempt of $maxAttempts failed (copied=$lastCopied verified=$lastVerified). Retrying once more in $($cfg.UploadRetryDelaySec)s."
+            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
+        }
+    }
+
+    $anyUnrecovered = $false
+    foreach ($c in $Candidates) {
+        if ($lastCopied -and $lastVerified) {
+            Write-RecoveryDisposition -File $c -Disposition 'uploaded+verified' -Detail "-> '$destBase'."
+        }
+        elseif ($lastCopied) {
+            # rclone copy succeeded (and validates its own transfer hash) but
+            # the independent `check` pass did not confirm it -- a real,
+            # distinct middle state between "safe" and "lost", per the task.
+            $anyUnrecovered = $true
+            Write-RecoveryDisposition -File $c -Disposition 'uploaded-but-unverified' `
+                -Detail "-> '$destBase', but rclone check could not confirm it after $maxAttempts attempt(s). Treat as UNCONFIRMED, not safe."
+        }
+        else {
+            $anyUnrecovered = $true
+            Write-RecoveryDisposition -File $c -Disposition 'NOT RECOVERED' `
+                -Detail "Both recovery upload attempts failed to even copy it. $notRecoveredDetail"
+        }
+    }
+
+    return [pscustomobject]@{ AnyUnrecovered = $anyUnrecovered }
+}
+
+function Invoke-TopazIncrementalUpload {
+    <#
+    .SYNOPSIS
+        Best-effort upload + independent verification of ONE specific
+        OutputDir file the watchdog's poll loop has already confirmed
+        ELIGIBLE (Resolve-IncrementalUploadEligibility in Watchdog.ps1).
+        CORRECTION 3 (2026-07-28 operator instruction): upload each render AS
+        IT FINISHES, not only after the whole queue drains.
+    .DESCRIPTION
+        REUSES THE SAME rclone copy + check PLUMBING AS THE OTHER TWO UPLOAD
+        PATHS in this file (Invoke-TopazRenderUpload, Invoke-TopazRecoveryUpload),
+        scoped down with a single `--include` to exactly this file's path
+        relative to OutputDir. Source/destination are OutputDir ->
+        UploadTarget -- the SAME pair the final Stop-Sequence.ps1 sweep uses
+        (unlike Invoke-TopazRecoveryUpload's distinct ".../recovered"
+        destination for files found OUTSIDE OutputDir) -- so that when the
+        final sweep re-runs `rclone copy` over the whole of OutputDir at stop
+        time, it sees this file already present and correctly sized at the
+        SAME destination path and skips re-transferring it. That is what
+        makes the final sweep "cost almost nothing" once this has already run.
+
+        CALLED FROM INSIDE THE POLL LOOP -- THE MOST SAFETY-CRITICAL LOOP IN
+        THE PROJECT. This function must never throw and must never block
+        longer than its own bounded rclone calls: a failed incremental upload
+        is NOT fatal, is logged, and is left for a later poll (or the final
+        Stop-Sequence.ps1 sweep) to retry -- the caller (Invoke-TopazIncremental
+        UploadPoll in Watchdog.ps1) must treat $false purely as "leave this
+        file unmarked", never as a reason to stop polling or to escalate.
+
+        THE BLIND WINDOW THIS CREATES IS DELIBERATE AND ACCEPTED, NOT AN
+        OVERSIGHT. rclone runs SYNCHRONOUSLY on the watchdog's single polling
+        thread, bounded by UploadTimeoutSec via Invoke-TopazAwsCli's own
+        WaitForExit timeout (the SAME bound the final sweep uses -- this is
+        "the existing rclone timeout plumbing" the fix was scoped to reuse,
+        not a new, smaller number invented for this path). At the measured
+        ~55-65 MiB/s on this box a 2.3 GB file takes ~1-2 minutes; both
+        DebounceSec (300s) and StallSec (1800s) have enormous margin over
+        that, and the upload only ever starts the instant a file looks
+        finished -- exactly when a brief blind window costs the least, since
+        nothing new can finish DURING it that the next poll would not also
+        catch. Restructuring this into a background job/runspace was
+        deliberately rejected: the added concurrency-control complexity in
+        this specific loop is not worth it for a window this small and this
+        well covered by DebounceSec/StallSec's own margins.
+
+        Uses the SAME single-retry policy as the other two upload paths
+        (Resolve-UploadRetryDecision, 2 attempts total, one retry after
+        UploadRetryDelaySec) -- not a bespoke retry count for this path.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object.
+    .PARAMETER File
+        A single System.IO.FileInfo (from OutputDir) already confirmed
+        eligible by the caller.
+    .OUTPUTS
+        [bool] $true only if copy AND check both succeeded within 2 attempts.
+        $false on anything else (missing rclone/config/target, a copy
+        failure, or a check failure) -- the caller must treat $false as
+        "try again on a later poll", never as fatal.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$File
+    )
+
+    $cfg = $Config
+
+    if (-not (Test-Path -LiteralPath $cfg.RclonePath) -or -not (Test-Path -LiteralPath $cfg.RcloneConfigPath) `
+        -or [string]::IsNullOrWhiteSpace($cfg.UploadTarget)) {
+        Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+            -Message "Incremental upload SKIPPED for '$($File.FullName)': rclone ('$($cfg.RclonePath)'), its config, or UploadTarget is not available. Will retry on a later poll or at the final stop-sequence sweep."
+        return $false
+    }
+
+    # Path relative to OutputDir (not the volume root -- contrast
+    # Invoke-TopazRecoveryUpload, whose candidates can live anywhere under the
+    # root). Forward slashes: rclone's --include matches POSIX-style paths
+    # regardless of the host OS.
+    $outputRoot = $cfg.OutputDir.TrimEnd('\')
+    $rel = $File.FullName.Substring($outputRoot.Length).TrimStart('\').Replace('\', '/')
+
+    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
+    $common = @('--config', $cfg.RcloneConfigPath, '--log-file', $rcloneLog, '--log-level', 'INFO')
+    $tuning = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
+
+    $copyArgs  = @('copy', $cfg.OutputDir, $cfg.UploadTarget) + $common + $tuning + @('--include', $rel)
+    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way', '--include', $rel)
+
+    Write-TopazLog -Component 'watchdog' -Level 'INFO' `
+        -Message "Incremental upload: '$($File.FullName)' ($($File.Length) bytes) looks finished (unlocked + size-stable for $($cfg.UploadStableSec)s) -- uploading now instead of waiting for the whole queue to complete (CORRECTION 3)."
+
+    $maxAttempts = 2
+    $copied      = $false
+    $verified    = $false
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
+            -TimeoutSec $cfg.UploadTimeoutSec -Component 'watchdog' `
+            -SuccessMessage "Incremental upload attempt $attempt of ${maxAttempts}: rclone copy of '$($File.Name)' completed." `
+            -FailureVerb "Incremental upload attempt $attempt of $maxAttempts (rclone copy) for '$($File.Name)'" `
+            -FailureContext "target=$($cfg.UploadTarget)."
+
+        $verified = $false
+        if ($copied) {
+            $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
+                -TimeoutSec $cfg.UploadTimeoutSec -Component 'watchdog' `
+                -SuccessMessage "Incremental upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED '$($File.Name)'." `
+                -FailureVerb "Incremental upload attempt $attempt of $maxAttempts (rclone check) for '$($File.Name)'" `
+                -FailureContext "target=$($cfg.UploadTarget)."
+        }
+
+        if ($copied -and $verified) { break }
+
+        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
+            Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+                -Message "Incremental upload attempt $attempt of $maxAttempts failed for '$($File.Name)' (copied=$copied verified=$verified). Retrying once more in $($cfg.UploadRetryDelaySec)s."
+            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
+        }
+    }
+
+    if ($copied -and $verified) {
+        Write-TopazLog -Component 'watchdog' -Level 'INFO' `
+            -Message "Incremental upload verified: '$($File.FullName)' ($($File.Length) bytes) safely in '$($cfg.UploadTarget)'. Marked as already-uploaded for this session; the final Stop-Sequence sweep will see it already present and skip it."
+        return $true
+    }
+
+    Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+        -Message "Incremental upload FAILED for '$($File.FullName)' after $maxAttempts attempt(s) (copied=$copied verified=$verified). NOT fatal -- left unmarked so a later poll or the final Stop-Sequence sweep retries it."
+    return $false
+}
+
+function Invoke-TopazOutputAnomalyHandling {
+    <#
+    .SYNOPSIS
+        Runs the misplaced-output recovery scan on EVERY reason='completed'
+        stop, REGARDLESS of whether OutputDir itself has any files: scan for
+        a recent, unlocked candidate elsewhere on the OutputDir volume,
+        best-effort recover it if found, capture Topaz's own forensics on any
+        anomaly, and log an unambiguous, greppable record of which (if any)
+        of the two error classes occurred. 'stalled' / 'maxlifetime' are
+        always a no-op here (see .DESCRIPTION).
+    .DESCRIPTION
+        RENAMED from Invoke-TopazEmptyOutputDirHandling, and no longer called
+        only from Invoke-TopazRenderUpload's empty-OutputDir branch
+        (CORRECTION 1, 2026-07-28). The old design ran this ONLY when
+        OutputDir was empty -- which is exactly the hole that would let a
+        SECOND misplaced deliverable hide behind a correctly-placed FIRST one
+        already sitting in OutputDir. See Resolve-OutputAnomalyClass's own
+        comment for the live counter-example that made this change necessary
+        the same day the original fix shipped.
+
+        ALWAYS RETURNS $true, AND NEVER THROWS. Per the operator's explicit,
+        verbatim instruction (see Stop-Sequence.ps1's own comment for the full
+        quote), no outcome of this scan may ever refuse the stop -- this
+        function's entire job is best-effort recovery plus an unambiguous
+        record, never a gate. Contrast Invoke-TopazRenderUpload's own
+        retry-then-refuse path for the case where OutputDir's OWN upload
+        fails twice: that asymmetry is deliberate and operator-chosen, not an
+        inconsistency (see Invoke-TopazRecoveryUpload's own comment on it).
+        The scan/recovery/forensic work below is wrapped in a single top-level
+        try/catch for exactly the same reason Invoke-TopazForensicCapture
+        wraps its own body: an UNEXPECTED exception here (a helper misbehaving
+        in a way its own defences did not anticipate) must degrade to a
+        logged WARN and a $true return, never propagate up through
+        Invoke-TopazRenderUpload into Stop-Sequence.ps1 and turn a
+        best-effort forensic aid into the reason a stop never happens at all
+        -- which would be a WORSE outcome than the anomaly it exists to
+        merely record.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object.
+    .PARAMETER Reason
+        'completed' | 'stalled' | 'maxlifetime'.
+    .PARAMETER OutputDirHasFiles
+        Whether OutputDir itself currently has at least one file. Purely an
+        input to Resolve-OutputAnomalyClass now -- it does NOT gate whether
+        this function runs its scan (that gating is on Reason alone; see
+        CORRECTION 1).
+    .OUTPUTS
+        [bool] always $true.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][ValidateSet('completed', 'stalled', 'maxlifetime')][string]$Reason,
+        [Parameter(Mandatory)][bool]$OutputDirHasFiles
+    )
+
+    $cfg = $Config
+
+    if ($Reason -ne 'completed') {
+        # 'stalled'/'maxlifetime' carry none of the "a real render definitely
+        # ran" guarantee ArmSec gives 'completed' (see Resolve-OutputAnomalyClass's
+        # own comment) -- a render may simply not have produced a deliverable
+        # YET. Unchanged original behaviour: skip the scan entirely.
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message "Skipping the misplaced-output recovery scan (reason=$Reason, not 'completed'; OutputDirHasFiles=$OutputDirHasFiles)."
+        return $true
+    }
+
+    $root = [System.IO.Path]::GetPathRoot($cfg.OutputDir)
+    Write-TopazLog -Component 'stop' -Level 'INFO' `
+        -Message "Reason='completed': scanning '$root' for recent render file(s) OUTSIDE OutputDir '$($cfg.OutputDir)' (OutputDirHasFiles=$OutputDirHasFiles) before this stop erases the volume. This scan runs EVERY completed stop now, not only when OutputDir is empty -- see CORRECTION 1 in this file's own MISPLACED-OUTPUT ANOMALY comment."
+
+    try {
+        $modifiedAfter = (Get-Date).AddMinutes(-$cfg.RecoveryMaxAgeMin)
+
+        $scan = Find-RenderRecoveryCandidates -OutputDir $cfg.OutputDir -Extensions $cfg.RenderFileExtensions `
+            -ModifiedAfter $modifiedAfter `
+            -MaxFiles $cfg.RecoveryScanMaxFiles -MaxDepth $cfg.RecoveryScanMaxDepth -MaxSeconds $cfg.RecoveryScanTimeoutSec
+
+        if ($scan.ScanFailed) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "RECOVERY SCAN FAILED: the best-effort volume scan itself could not run/complete. This is NOT the same fact as 'the scan completed and found nothing' -- treat the volume as UNEXAMINED, not confirmed clear."
+        }
+        if ($scan.Truncated) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "RECOVERY SCAN TRUNCATED: the file-count/time/depth bound was reached before the whole volume was examined (cap=$($cfg.RecoveryScanMaxFiles) files, $($cfg.RecoveryScanTimeoutSec)s, depth=$($cfg.RecoveryScanMaxDepth)). Additional candidates may exist beyond what is logged below -- this is NOT proof the volume holds nothing else."
+        }
+
+        # Log EVERY group the scan saw, distinctly -- not just whichever group
+        # ends up deciding the error class below (CORRECTION 2: "the operator must
+        # be able to see everything the scan saw and why each file was or was not
+        # acted on"). ExcludedByAge and SkippedInProgress are logged here,
+        # unconditionally, regardless of which branch runs next.
+        foreach ($f in $scan.ExcludedByAge) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "RECOVERY SCAN -- EXCLUDED BY AGE: '$($f.FullName)', $($f.Length) bytes, last write $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff')) (older than RecoveryMaxAgeMin=$($cfg.RecoveryMaxAgeMin) min). Matched a render extension but treated as pre-existing (e.g. source footage), not a recovery candidate."
+        }
+        foreach ($f in $scan.SkippedInProgress) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "RECOVERY SCAN -- SKIPPED, IN PROGRESS: '$($f.FullName)', $($f.Length) bytes as of this read, last write $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff')). Recent and extension-matched, but still LOCKED (a writer holds it open) -- treated as Topaz's normal live intermediate, not a recovery candidate, and not allowed to decide the error class."
+        }
+
+        $decision = Resolve-OutputAnomalyClass -Reason $Reason -OutputDirHasFiles $OutputDirHasFiles `
+            -CandidatesFound ($scan.Candidates.Count -gt 0)
+
+        if ($decision -eq 'ErrorClassA') {
+            # Best-effort forensic capture from Topaz's own session log -- only on
+            # an actual anomaly (see Invoke-TopazForensicCapture's own comment:
+            # that is what made the 2026-07-28 incident diagnosable at all). Not
+            # run on 'Normal', since that path now runs on every single completed
+            # stop and forensic capture is not free (bounded, but not zero-cost).
+            Invoke-TopazForensicCapture -Config $cfg
+
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "RENDER-OUTSIDE-OUTPUTDIR: found $($scan.Candidates.Count) candidate render file(s) OUTSIDE OutputDir on the same volume (OutputDirHasFiles=$OutputDirHasFiles -- this can be true or false; a misplaced SECOND file is just as real a loss as a first one, see CORRECTION 1). Attempting best-effort recovery upload; the instance WILL STOP after this regardless of whether the recovery succeeds (operator-chosen behaviour -- see Stop-Sequence.ps1)."
+
+            foreach ($c in $scan.Candidates) {
+                Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                    -Message "RENDER-OUTSIDE-OUTPUTDIR candidate: '$($c.FullName)', $($c.Length) bytes, last write $($c.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))."
+            }
+
+            # Invoke-TopazRecoveryUpload is itself defensively written (guard
+            # clauses instead of throwing on a missing rclone/config/target),
+            # but this call is still inside the OUTER try -- see this
+            # function's own .DESCRIPTION on why an unanticipated exception
+            # ANYWHERE in this block must never escape.
+            [void] (Invoke-TopazRecoveryUpload -Config $cfg -Candidates $scan.Candidates)
+
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "RENDER-OUTSIDE-OUTPUTDIR handling complete (see RECOVERY DISPOSITION line(s) above for the outcome per file). Proceeding to stop."
+        }
+        elseif ($decision -eq 'ErrorClassB') {
+            Invoke-TopazForensicCapture -Config $cfg
+
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "RENDER-PRODUCED-NO-OUTPUT: reason='completed' but OutputDir is empty and no candidate render file was found anywhere on the OutputDir volume (scanFailed=$($scan.ScanFailed), truncated=$($scan.Truncated)). This is the signature of a render that FAILED OUTRIGHT without ever writing a deliverable (cf. the pnat-1 export in the 2026-07-28 incident, which died and was never retried). Proceeding to stop."
+        }
+        else {
+            # 'Normal': the ordinary, healthy case -- OutputDir has its own
+            # file(s) (or genuinely nothing was ever expected outside it either
+            # way) and nothing anomalous was found elsewhere on the volume.
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "RECOVERY SCAN: no misplaced render file(s) found outside OutputDir (OutputDirHasFiles=$OutputDirHasFiles, excludedByAge=$($scan.ExcludedByAge.Count), skippedInProgress=$($scan.SkippedInProgress.Count)). Nothing anomalous."
+        }
+    }
+    catch {
+        # Best-effort, exactly like Invoke-TopazForensicCapture's own body:
+        # an UNANTICIPATED failure here (as opposed to the expected, already-
+        # handled anomalies above) must never propagate. Propagating would
+        # turn a forensic/recovery aid into an unhandled exception inside
+        # Invoke-TopazRenderUpload, which Stop-Sequence.ps1 -- and, through
+        # it, the watchdog's own handoff -- has no try/catch around. The
+        # operator's instruction is to STILL STOP either way; a crash here
+        # would be a worse failure than the anomaly this function exists to
+        # merely record.
+        Write-TopazLog -Component 'stop' -Level 'WARN' `
+            -Message "Misplaced-output recovery scan FAILED UNEXPECTEDLY (best-effort, ignored): $($_.Exception.Message). Proceeding to stop regardless."
+    }
+
+    return $true
+}
+
 function Invoke-TopazRenderUpload {
     <#
     .SYNOPSIS
@@ -1223,17 +2467,37 @@ function Invoke-TopazRenderUpload {
              verifies hashes, but the cost of being wrong here is a lost
              multi-hour render, which is worth one extra pass.
 
+        Both steps get ONE RETRY (2 attempts total, via the pure
+        Resolve-UploadRetryDecision) if either fails -- a transient Drive-side
+        blip used to refuse the stop on the very first failure, costing
+        instance uptime for something a retry would often clear. See that
+        function's own comment for why the attempt cap is a literal constant
+        here, not a Config.ps1 knob.
+
         `copy` (not `move` or `sync`) is intentional: the scratch volume is
         wiped by the stop anyway, so spending instance time deleting the
         source afterwards would be pure waste. It also means re-running this
         after a partial failure is cheap -- rclone skips files already present
         at the destination.
+
+        NEITHER AN EMPTY NOR A NON-EMPTY OutputDir IS UNCONDITIONALLY "SAFE TO
+        PROCEED" ANYMORE -- see Resolve-OutputAnomalyClass /
+        Invoke-TopazOutputAnomalyHandling, which this function now calls
+        UNCONDITIONALLY (CORRECTION 1, 2026-07-28: the misplaced-output scan
+        must run whether or not OutputDir has content, not only when it is
+        empty). That call always returns $true (the operator's explicit
+        instruction: never refuse to stop over a misplaced or missing
+        render), so it cannot ITSELF trigger Stop-Sequence.ps1's ephemeral
+        refusal below -- only OutputDir's OWN upload failing twice can.
     .PARAMETER Config
         The Get-TopazAutoStopConfig object.
     .PARAMETER Reason
-        'completed' | 'stalled' | 'maxlifetime' -- logged for context only.
+        'completed' | 'stalled' | 'maxlifetime' -- also decides whether the
+        misplaced-output scan runs at all (see Resolve-OutputAnomalyClass).
     .OUTPUTS
-        [bool] $true only if the upload transferred AND verified.
+        [bool] $true if the upload transferred AND verified (within 2
+        attempts), OR if OutputDir was empty (always -- see above). $false
+        only when OutputDir has files and BOTH upload attempts failed.
     #>
     [CmdletBinding()]
     param(
@@ -1265,9 +2529,21 @@ function Invoke-TopazRenderUpload {
     }
 
     $files = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
-    if ($files.Count -eq 0) {
+    $outputDirHasFiles = $files.Count -gt 0
+
+    if (-not $outputDirHasFiles) {
         Write-TopazLog -Component 'stop' -Level 'INFO' `
-            -Message "OutputDir '$($cfg.OutputDir)' is empty; nothing to upload. Safe to proceed."
+            -Message "OutputDir '$($cfg.OutputDir)' is empty; nothing to upload from OutputDir itself (reason=$Reason)."
+
+        # An empty OutputDir is NOT unconditionally benign: see
+        # Resolve-OutputAnomalyClass's own comment for why reason='completed'
+        # + empty (with nothing found elsewhere either) is a contradiction
+        # worth treating as an anomaly (the 2026-07-28 incident) rather than
+        # "safe to proceed". Invoke-TopazOutputAnomalyHandling always returns
+        # $true -- per the operator's explicit instruction this case never
+        # refuses the stop -- so this call cannot newly trigger
+        # Stop-Sequence.ps1's ephemeral-upload refusal below.
+        [void] (Invoke-TopazOutputAnomalyHandling -Config $cfg -Reason $Reason -OutputDirHasFiles $false)
         return $true
     }
 
@@ -1301,30 +2577,74 @@ function Invoke-TopazRenderUpload {
         '--stats', '1m'
     )
 
-    $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
-        -TimeoutSec $cfg.UploadTimeoutSec `
-        -Component 'stop' `
-        -SuccessMessage "rclone copy completed. See '$rcloneLog' for transfer detail." `
-        -FailureVerb 'rclone upload' `
-        -FailureContext "target=$($cfg.UploadTarget). The instance will NOT be stopped while renders remain unuploaded on ephemeral storage."
-
-    if (-not $copied) { return $false }
-
     # Independent verification pass. --one-way so pre-existing extra files at
     # the destination (previous sessions' renders) are not treated as errors.
     $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way')
 
-    $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
-        -TimeoutSec $cfg.UploadTimeoutSec `
-        -Component 'stop' `
-        -SuccessMessage "rclone check VERIFIED every file in '$($cfg.OutputDir)' is present and intact at '$($cfg.UploadTarget)'." `
-        -FailureVerb 'rclone verify' `
-        -FailureContext 'the upload could not be verified, so the renders are NOT safe to erase.'
+    # THE SINGLE UPLOAD RETRY. Previously a single copy+check failure returned
+    # $false straight away, which (with OutputIsEphemeral) refused the stop on
+    # the FIRST blip -- costing instance uptime for something a plain retry
+    # would often fix (a dropped connection mid-chunk, transient Drive-side
+    # rate limiting). $maxAttempts is a literal constant, not a Config.ps1
+    # knob -- see Resolve-UploadRetryDecision's own comment on why that bound
+    # is deliberately not operator-tunable. Each attempt redoes BOTH copy and
+    # check (a partial transfer is exactly the case a retry should fix, and
+    # re-running `check` alone against a partial copy would just re-confirm
+    # the same failure).
+    $maxAttempts = 2
+    $copied      = $false
+    $verified    = $false
 
-    if (-not $verified) { return $false }
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message "Upload attempt $attempt of $maxAttempts (rclone copy)."
+
+        $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
+            -TimeoutSec $cfg.UploadTimeoutSec `
+            -Component 'stop' `
+            -SuccessMessage "Upload attempt $attempt of ${maxAttempts}: rclone copy completed. See '$rcloneLog' for transfer detail." `
+            -FailureVerb "Upload attempt $attempt of $maxAttempts (rclone copy)" `
+            -FailureContext "target=$($cfg.UploadTarget)."
+
+        $verified = $false
+        if ($copied) {
+            Write-TopazLog -Component 'stop' -Level 'INFO' `
+                -Message "Upload attempt $attempt of $maxAttempts (rclone check)."
+
+            $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
+                -TimeoutSec $cfg.UploadTimeoutSec `
+                -Component 'stop' `
+                -SuccessMessage "Upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED every file in '$($cfg.OutputDir)' is present and intact at '$($cfg.UploadTarget)'." `
+                -FailureVerb "Upload attempt $attempt of $maxAttempts (rclone check)" `
+                -FailureContext "target=$($cfg.UploadTarget)."
+        }
+
+        if ($copied -and $verified) { break }
+
+        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
+            Write-TopazLog -Component 'stop' -Level 'WARN' `
+                -Message "Upload attempt $attempt of $maxAttempts FAILED (copied=$copied verified=$verified). Retrying once more (attempt $($attempt + 1) of $maxAttempts) in $($cfg.UploadRetryDelaySec)s."
+            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
+        }
+        else {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "Upload attempt $attempt of $maxAttempts FAILED (copied=$copied verified=$verified). Both attempts (1 initial + 1 retry) exhausted; the instance will NOT be stopped while renders remain unuploaded on ephemeral storage."
+        }
+    }
+
+    if (-not ($copied -and $verified)) { return $false }
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Upload verified: $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes) now safely in '$($cfg.UploadTarget)'. Safe to stop."
+
+    # CORRECTION 1 (2026-07-28): the misplaced-output scan runs here too, not
+    # only on the empty-OutputDir branch above -- OutputDir having its OWN
+    # correctly-uploaded file(s) says nothing about whether a SECOND,
+    # misplaced deliverable is ALSO sitting outside it (see
+    # Resolve-OutputAnomalyClass's own comment for the live counter-example).
+    # Always returns $true; cannot turn this success back into a refusal.
+    [void] (Invoke-TopazOutputAnomalyHandling -Config $cfg -Reason $Reason -OutputDirHasFiles $true)
+
     return $true
 }
 

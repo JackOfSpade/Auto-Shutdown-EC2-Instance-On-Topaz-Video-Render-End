@@ -39,10 +39,15 @@
 # .NOTES
 #   Run from an admin workstation with AWS CLI v2 configured.
 #   Requires env vars: INSTANCE_ID, AWS_REGION.
-#   Optional env vars: METRIC_NAMESPACE (default TopazRender/GPU),
-#   METRIC_NAME (default GPUUtilization) -- mirrors 02-create-iam-role.sh's
-#   and 03-create-idle-alarm.sh's own overrides; pass the SAME values you used
-#   there, or this script checks the wrong namespace/metric.
+#   Optional env var:  METRIC_NAMESPACE (default TopazRender/GPU) -- must
+#   match 02-create-iam-role.sh's and 03-create-idle-alarm.sh's own
+#   METRIC_NAMESPACE override, or this script checks the wrong namespace.
+#   METRIC_NAME is accepted for backward compatibility but is NOT used by
+#   [4/6]'s pass/fail logic: the role's cloudwatch:PutMetricData grant is
+#   scoped to the NAMESPACE only (CloudWatch metrics are not ARN-addressable),
+#   so it already covers every metric name published into it -- both the
+#   default RenderActive and the legacy GPUUtilization -- with no per-metric
+#   IAM distinction to check.
 #   Exit code: 0 only if every check reported OK or WARN (no FAIL). 1 if any
 #   check FAILed.
 #
@@ -67,9 +72,13 @@ Optional environment variables:
                     to be scoped to (default TopazRender/GPU). Must match
                     in-guest/Config.ps1's MetricNamespace and the value passed
                     to 02-create-iam-role.sh / 03-create-idle-alarm.sh.
-  METRIC_NAME       CloudWatch metric name within that namespace (default
-                    GPUUtilization). Mirrors 03-create-idle-alarm.sh's own
-                    override.
+  METRIC_NAME       Accepted for backward compatibility; NOT used by [4/6]'s
+                    pass/fail check. The role's PutMetricData grant is scoped
+                    to METRIC_NAMESPACE only, which already covers every
+                    metric name the box can publish into it (the default
+                    RenderActive and the legacy GPUUtilization alike), so
+                    naming one metric here would not make the check any more
+                    accurate.
 
 This script is READ-ONLY: it makes no create/put/modify/associate/enable/
 disable AWS API call. It only describes, gets, and lists.
@@ -80,8 +89,14 @@ EOF
 [[ -n "${INSTANCE_ID:-}" ]] || { echo "ERROR: INSTANCE_ID is not set." >&2; usage; }
 [[ -n "${AWS_REGION:-}"  ]] || { echo "ERROR: AWS_REGION is not set."  >&2; usage; }
 
+# METRIC_NAME has no meaningful default any more: which metric "matters" now
+# depends on IDLE_SIGNAL (render -> RenderActive, gpu -> GPUUtilization), a
+# choice this read-only script never asks for, and [4/6] below checks only
+# the NAMESPACE-scoped grant anyway (see the .NOTES/usage text above). Left
+# unset unless the caller overrides it, rather than defaulting to either
+# metric name and silently implying that one is the one that matters.
 METRIC_NAMESPACE="${METRIC_NAMESPACE:-TopazRender/GPU}"
-METRIC_NAME="${METRIC_NAME:-GPUUtilization}"
+METRIC_NAME="${METRIC_NAME:-}"
 # WHY per-instance name: mirrors 03-create-idle-alarm.sh's own ALARM_NAME
 # construction exactly -- a mismatch here would silently check the wrong alarm.
 ALARM_NAME="topaz-gpu-idle-autostop-${INSTANCE_ID}"
@@ -263,7 +278,7 @@ else
       report WARN "role ${ROLE_NAME} grants cloudwatch:PutMetricData but no policy text mentions namespace '${METRIC_NAMESPACE}' -- verify the condition scoping manually (aws iam get-role-policy --role-name ${ROLE_NAME} --policy-name <name>)."
     fi
   else
-    report FAIL "role ${ROLE_NAME} has policies attached but NONE grant cloudwatch:PutMetricData. The watchdog cannot publish the ${METRIC_NAMESPACE}/${METRIC_NAME} metric; the idle-alarm safety net has nothing to watch. Fix: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ./02-create-iam-role.sh"
+    report FAIL "role ${ROLE_NAME} has policies attached but NONE grant cloudwatch:PutMetricData scoped to namespace ${METRIC_NAMESPACE}. The watchdog cannot publish either metric it produces (RenderActive or GPUUtilization) into that namespace; the idle-alarm safety net has nothing to watch, on any IDLE_SIGNAL. Fix: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ./02-create-iam-role.sh"
   fi
 fi
 

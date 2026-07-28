@@ -148,8 +148,22 @@ foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
             -Message "Dependency '$tool' found on PATH."
     }
     else {
+        # WHY per-tool wording: the two tools are NOT equally load-bearing for
+        # the idle alarm any more. aws.exe absence breaks BOTH metrics
+        # Push-GpuMetric.ps1 publishes -- RenderActive (the default
+        # IDLE_SIGNAL=render signal) and GPUUtilization -- so the alarm has
+        # nothing to watch on any IDLE_SIGNAL. nvidia-smi.exe absence only
+        # costs the GPUUtilization metric (telemetry, plus the legacy
+        # IDLE_SIGNAL=gpu); RenderActive comes from a CIM worker query and
+        # does not touch nvidia-smi at all. A single shared message would
+        # either understate aws.exe's impact or overstate nvidia-smi.exe's.
+        $toolImpact = switch ($tool) {
+            'aws.exe' { "Push-GpuMetric.ps1 needs it to publish EITHER metric (RenderActive or GPUUtilization); without it the idle alarm has nothing to watch, on any IDLE_SIGNAL." }
+            'nvidia-smi.exe' { "Push-GpuMetric.ps1 needs it only for the GPUUtilization metric (telemetry, and the legacy IDLE_SIGNAL=gpu); the default IDLE_SIGNAL=render's RenderActive metric does not use it." }
+            default { "Push-GpuMetric.ps1 needs it." }
+        }
         Write-TopazLog -Component 'install' -Level 'WARN' `
-            -Message "Dependency '$tool' NOT found on PATH. Push-GpuMetric.ps1 needs it; install/add it before relying on the idle alarm."
+            -Message "Dependency '$tool' NOT found on PATH. $toolImpact Install/add it before relying on the idle alarm."
         $warningCount++
     }
 }

@@ -250,6 +250,86 @@ Then, for a `'completed'` decision only, it re-verifies once (see above) before
 invoking [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1) with
 `-Reason completed` or `-Reason stalled` (see [Phase 3](05-phase3-stop-sequence.md)).
 
+### Incremental per-render upload, and the blind window it introduces (CORRECTION 3, shipped 2026-07-28)
+
+Before this correction, the poll loop only ever logged an `OutputDir` file-count/byte-total
+snapshot once, at handoff (see "The file-unlock gate" above) - upload itself happened later,
+once, inside `Stop-Sequence.ps1`. On a multi-export queue that left a finished deliverable
+unprotected on the ephemeral scratch volume for however long the rest of the queue took to
+render - see [docs/16](16-render-loss-incident.md) for why that gap mattered concretely. Per the
+operator's instruction, `Watchdog.ps1` now uploads each render as soon as IT finishes, not after
+the whole queue drains. [Phase 3](05-phase3-stop-sequence.md) documents the upload mechanics
+being reused; this section documents the change from the poll loop's own perspective.
+
+**The eligibility rule.** `Resolve-IncrementalUploadEligibility` (pure; `Watchdog.ps1`) decides
+whether one candidate file in `OutputDir` is eligible for its own, early upload right now. Five
+conditions all gate it: not a temp file (`Test-TopazTempFile`), **unlocked**
+(`Test-FileUnlocked` - the same function the unlock gate above uses, moved into `Config.ps1` so
+both callers share one implementation), the size reported now still matching the size tracked as
+of the last poll, that size having held for at least `UploadStableSec` (default **30 s**, i.e. 2
+consecutive polls at the default `PollSec`) of consecutive polls, and the file not already having
+been uploaded earlier this session. Unlocked alone is not enough - a file can be briefly reported
+unlocked between writes - so unlocked-and-size-stable are required together, mirroring this
+file's own convention of never trusting a single signal where two are available (compare the
+stall detector's own byte-count-OR-I/O-counters union earlier in this document). The per-file
+stability bookkeeping (size-last-seen, seconds-stable) is computed each poll by the companion pure
+function `Get-NextUploadTrackingState`, which calls `Resolve-IncrementalUploadEligibility` with
+the freshly-updated numbers; both are independently unit-tested the same way `Resolve-RenderActive`
+and `Get-NextWatchdogState` already are. The main poll loop drives both through
+`Invoke-TopazIncrementalUploadPoll`, called **every poll, regardless of whether a render is
+currently active** - gating it on "active" would silently reopen the exact hole this correction
+closes, since the point is protecting a file that finished while the *next* queue item is already
+rendering.
+
+> **A crashed writer can still pass this rule once, before the real content is in - but the
+> mistake now self-corrects.** `Resolve-IncrementalUploadEligibility` treats "unlocked +
+> size-stable for `UploadStableSec`" as a proxy for "finished," but a worker that crashes
+> mid-export also releases its file handle and leaves the file at a stable, merely **incomplete**
+> size - and, per [docs/16 §I](16-render-loss-incident.md), a worker crashing mid-export and being
+> silently resumed through Topaz's own retry path is this box's documented, recurring behaviour,
+> not a hypothetical. The eligibility rule cannot tell that case apart from a genuinely finished
+> file, so the partial can still be uploaded and self-verified (both sides hold the same partial
+> bytes) before the resumed writer overwrites it with the correct content - this does NOT make
+> "unlocked + size-stable" a reliable "finished" signal. What no longer happens: identity (condition
+> 5) is keyed on `UploadedSize`/`UploadedWriteTimeUtc` - the size and write-time actually uploaded -
+> not the bare path alone (FINDING 2 of the 2026-07-28 adversarial review). Once the resumed writer
+> overwrites that path with the real content, its size and/or write-time stop matching what was
+> uploaded, so the path becomes eligible again the moment the new content restabilizes for
+> `UploadStableSec`, and is re-uploaded - logged distinctly, at WARN, with the greppable literal
+> `SUPERSEDED` - on the very next poll after that, instead of sitting "verified" until the final
+> `Stop-Sequence.ps1` sweep (potentially hours later on a multi-export queue). An unchanged file is
+> still skipped every poll, so this does not turn into a re-upload-every-poll loop. See
+> [Phase 3](05-phase3-stop-sequence.md)'s own note on the same mechanism for the full reasoning.
+
+**The blind window, stated honestly.** Uploading a multi-GB file takes real wall-clock time - on
+the order of 1-2 minutes for a multi-GB render at the throughput measured on this deployment
+([docs/16](16-render-loss-incident.md)) - and this poll loop is single-threaded, so the watchdog
+observes **nothing else** while an incremental upload is running (`Invoke-TopazIncrementalUpload`
+in `Config.ps1` runs the `rclone copy` + `rclone check` synchronously on the polling thread). That
+is accepted, not hidden: `DebounceSec` (300 s) and `StallSec` (1800 s) are both generous budgets,
+and the upload only ever starts at the moment a render has *just* finished - the point in the
+whole cycle where a brief blind spell is least likely to hide anything that matters. The window is
+bounded by the existing `UploadTimeoutSec` plumbing (the same bound the end-of-queue upload uses,
+see [Phase 3](05-phase3-stop-sequence.md)), so a wedged transfer cannot freeze the watchdog forever
+the way an unbounded call could. The call is placed **after** the idle/stall/arm state-machine
+update for the poll, never before or interleaved with it, precisely so a blocking upload cannot
+delay that safety-critical bookkeeping's read of the render-active signal.
+
+**Why not a background job.** Running the incremental upload in a `Start-Job`/runspace so the
+poll loop keeps observing during the transfer was considered and deliberately rejected: the added
+concurrency-control complexity in this pipeline's single most safety-critical loop - the one
+deciding whether it is safe to power the box off - was judged not worth it for a window this small
+and this well covered by `DebounceSec`/`StallSec`'s own margins. A simple, sequential,
+occasionally-blind loop that is easy to reason about beats a concurrent one that merely runs the
+completion-decision logic on a schedule while something else happens alongside it.
+
+A failed incremental upload is never fatal to the loop: it reuses `Resolve-UploadRetryDecision`'s
+one-retry policy, and on continued failure it just logs and leaves the file unmarked in the
+in-memory tracking table for the final `Stop-Sequence.ps1` sweep - still an unconditional
+catch-all - to pick up later. The whole pass is switchable via `UploadWhenReady` (default `$true`)
+without a code change, and is wrapped in its own try/catch so any unexpected failure degrades to a
+logged warning rather than taking down the poll loop.
+
 ## Why the tasks run as SYSTEM
 
 [`Register-ScheduledTasks.ps1`](../in-guest/Register-ScheduledTasks.ps1)
@@ -273,16 +353,20 @@ The two tasks:
   `-StartWhenAvailable`, `-MultipleInstances IgnoreNew`, and a
   restart-on-failure policy (`RestartCount 3`, one minute apart). It starts at
   boot and waits for the Topaz GUI before arming. The restart policy exists
-  because the watchdog is the **primary** stop path - the CloudWatch idle alarm
-  is a cost backstop, not a substitute - so a crashed watchdog process should not
-  stay dead silently for the rest of the render; the 15-minute sweep is a
-  **self-healing** layer on top of that restart policy, reviving the watchdog
-  within 15 minutes if it ever exhausts `RestartCount`'s retries and stays
-  dead. `MultipleInstances IgnoreNew` is what makes the sweep safe: it is a
-  no-op whenever the watchdog is already running, instead of stacking a second
-  copy that would independently decide to stop the box. (See the limitation
-  note below: a restart loses in-memory state, which is exactly what the idle
-  alarm then backstops.)
+  because the watchdog is the **primary, and on this project the *only*,**
+  stop path (see
+  [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
+  for why no out-of-band alarm is armed here to catch a crashed watchdog) - so
+  a crashed watchdog process should not stay dead silently for the rest of the
+  render; the 15-minute sweep is a **self-healing** layer on top of that
+  restart policy, reviving the watchdog within 15 minutes if it ever exhausts
+  `RestartCount`'s retries and stays dead. `MultipleInstances IgnoreNew` is
+  what makes the sweep safe: it is a no-op whenever the watchdog is already
+  running, instead of stacking a second copy that would independently decide
+  to stop the box. (See the limitation note below: a restart loses in-memory
+  state - on a deployment that arms the CloudWatch idle alarm, that alarm
+  backstops exactly this case, since it does not depend on any in-guest
+  process's memory; this project runs without that backstop, by decision.)
 - **`TopazAutoStop-GpuMetric`** - a `-Once` trigger with a 1-minute repetition for
   an effectively-infinite duration (~10000 days), so it runs
   `Push-GpuMetric.ps1` once per minute forever; `-MultipleInstances IgnoreNew`
@@ -316,9 +400,15 @@ orphaned worker was previously adopted, and it has forgotten whether it has ever
 seen an active render this session. Persisting that state across a stop/start
 cycle was considered and rejected - stale state surviving a restart would risk a
 false stop (e.g. replaying a stale `sawActivity = $true` straight into a fresh
-pre-render lull). The trade-off is deliberate: the out-of-band CloudWatch
-GPU-idle alarm ([Phase 4](06-phase4-safety-net.md)) is exactly the backstop for
-this case, since it does not depend on any in-guest process's memory.
+pre-render lull). The trade-off is deliberate: on a deployment that arms it,
+the out-of-band CloudWatch GPU-idle alarm ([Phase 4](06-phase4-safety-net.md))
+would be exactly the backstop for this case, since it does not depend on any
+in-guest process's memory. This project runs with that alarm deliberately
+unarmed (see
+[docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)),
+so a watchdog restart that loses state is, here, backstopped only by the
+15-minute self-healing sweep above and the restart-on-failure policy, not by
+any out-of-band layer.
 
 ## Logs
 

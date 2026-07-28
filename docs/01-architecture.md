@@ -19,9 +19,10 @@
   |           | hands off (-Reason completed|stalled)                       |
   |           v                                                             |
   |   +--------------------+                                                 |
-  |   | Stop-Sequence.ps1  |  optional S3 sync + SNS, then the StopStrategy  |
-  |   +---------+----------+  plan: Ec2ApiStop, falling back to             |
-  |             |             GuestShutdown ('Auto' is the default)         |
+  |   | Stop-Sequence.ps1  |  optional S3 sync, Google Drive upload (MANDATORY|
+  |   +---------+----------+  when OutputDir is ephemeral) + SNS, then the   |
+  |             |             StopStrategy plan: Ec2ApiStop, falling back to |
+  |             |             GuestShutdown ('Auto' is the default)          |
   +-------------+---------------------------------------------------------- +
                 v
    ec2:StopInstances (provably ends billing)   -->   INSTANCE STOPS
@@ -29,36 +30,60 @@
    the instance when InstanceInitiatedShutdownBehavior = stop
 
 
-  OUT-OF-BAND FALLBACK  (separate control plane; never shares fate w/ guest)
-  +-------------------------------+        +--------------------------------+
-  | Push-GpuMetric.ps1 (SYSTEM,   |  put   | CloudWatch alarm               |
-  | once/min) nvidia-smi -------> | metric | TopazRender/GPU GPUUtilization |
-  | TopazRender/GPU GPUUtilization| -----> | < 5% for 30 min  -> ec2:stop   |
-  +-------------------------------+        +--------------------------------+
+  OUT-OF-BAND FALLBACKS  (opt-in, NOT ARMED for this project -- see below)
+  +-------------------------------+         +------------------------------+
+  | Push-GpuMetric.ps1 (SYSTEM,   | put     | CloudWatch idle alarm        |
+  | once/min): CIM worker query   | metric  | (telemetry only by default;  |
+  | -> RenderActive (1/0);        | ----->  | NOT created/armed here --    |
+  | nvidia-smi -> GPUUtilization% |         | opt-in via ENABLE_IDLE_ALARM)|
+  +-------------------------------+         +------------------------------+
 
-  OPTIONAL HARD CAP  (last-resort cost guard, independent of everything above)
+  OPTIONAL HARD CAP  (last-resort cost guard -- NOT DEPLOYED for this project)
   +------------------------------------------------------------------------+
   | EventBridge schedule --> max-lifetime-stop Lambda --> ec2:StopInstances |
   | fires when instance age >= MAX_LIFETIME_HOURS, regardless of GPU load   |
   +------------------------------------------------------------------------+
 ```
 
-There are three independent ways the box can stop, ranked by how normal they are:
+**On this project, exactly one of the three mechanisms below is armed: the
+primary, in-guest one.** The operator decided on 2026-07-28 against any
+idle-based auto-stop (see [Phase 4](06-phase4-safety-net.md) and
+[Appendix B](09-appendix-b-boundaries.md)) and has not deployed the
+max-lifetime Lambda. They are kept documented here as capabilities this
+design supports, not as claims about this deployment's current state:
 
-1. **Primary (in-guest, event-driven):** `Watchdog.ps1` -> `Stop-Sequence.ps1`
-   -> the `StopStrategy` plan (`ec2:StopInstances` first, guest shutdown as
-   fallback, under the default `'Auto'`) -> instance stop. This is what fires
-   on every clean job.
-2. **Fallback (out-of-band, GPU-idle):** the CloudWatch alarm on the custom GPU
-   metric stops the box after 30 minutes of sustained sub-5% GPU. This fires
-   only when the primary path failed to.
-3. **Optional hard cap (out-of-band, wall-clock):** the `max-lifetime-stop`
-   Lambda stops the box once it has *run* longer than a ceiling, regardless of
-   GPU load. This catches a job that stays "stuck busy" and never goes idle.
+1. **Primary (in-guest, event-driven) - ARMED, the only sanctioned auto-stop:**
+   `Watchdog.ps1` -> `Stop-Sequence.ps1` (which verifies the Google Drive
+   upload) -> the `StopStrategy` plan (`ec2:StopInstances` first, guest
+   shutdown as fallback, under the default `'Auto'`) -> instance stop. This is
+   what fires on every clean job, and it is the *only* thing that stops this
+   box. See [Phase 3](05-phase3-stop-sequence.md) for the full upload picture,
+   including the ephemeral-upload interlock, the misplaced-output recovery
+   scan added after the 2026-07-28 render-loss incident
+   ([docs/16](16-render-loss-incident.md)), and the per-render incremental
+   upload (CORRECTION 3, shipped 2026-07-28).
+2. **Fallback (out-of-band, idle) - OPT-IN, NOT ARMED here.** The CloudWatch
+   alarm on the custom `TopazRender/GPU` metric, if created
+   (`ENABLE_IDLE_ALARM=1`), would stop the box after `IDLE_MINUTES` (default
+   30) of sustained idle - by default keyed on `RenderActive` (no encoder
+   worker process alive), with the legacy sub-5% `GPUUtilization` signal
+   available via `IDLE_SIGNAL=gpu` (see [Phase 4](06-phase4-safety-net.md)).
+   An idle signal cannot distinguish an abandoned box from an operator still
+   setting up or a queue between two items, and the GPU-keyed version of this
+   exact alarm came within five minutes of stopping a live, healthy render on
+   2026-07-27 - which is why it is off by default for this project.
+3. **Optional hard cap (out-of-band, wall-clock) - NOT DEPLOYED here.** The
+   `max-lifetime-stop` Lambda would stop the box once it has *run* longer than
+   a ceiling, regardless of GPU load, catching a job that stays "stuck busy"
+   and never goes idle.
 
-The three layers are intentionally uncorrelated in their failure modes. A crash
-that kills the primary path does not touch the alarm; a job that defeats the
-alarm (never idle) is still caught by the wall-clock cap.
+Layers 2 and 3 are intentionally uncorrelated in their failure modes when
+armed - a crash that kills the primary path does not touch the alarm, and a
+job that defeats the alarm (never idle) is still caught by the wall-clock cap.
+With both off, that redundancy does not exist: a dead watchdog, an unopened
+Topaz session, or a failed render is only ever noticed by a human. See
+[Appendix B](09-appendix-b-boundaries.md) for that trade-off recorded
+honestly, including the manual mitigations.
 
 ## Design principles (expanded)
 
@@ -115,20 +140,30 @@ Consequences:
   for how both legs were verified on this specific instance, and
   [Phase 3](05-phase3-stop-sequence.md) for the full ordering logic.
 
-### 2. The fallback is out-of-band
+### 2. The fallback is out-of-band, when it is armed at all - and for this project, it is not
 
 The GPU-idle alarm ([`03-create-idle-alarm.sh`](../control-plane/03-create-idle-alarm.sh))
-lives in CloudWatch and acts through `arn:aws:automate:<region>:ec2:stop`, a
-built-in alarm action that needs no IAM role and no code on the instance. It is
-fed by `Push-GpuMetric.ps1`, but even if that publisher dies, the alarm's
-`treat-missing-data notBreaching` keeps it from false-stopping on absent data.
+lives in CloudWatch and would act through `arn:aws:automate:<region>:ec2:stop`, a
+built-in alarm action that needs no IAM role and no code on the instance, fed
+by `Push-GpuMetric.ps1`, with `treat-missing-data notBreaching` keeping it from
+false-stopping on absent data if that publisher ever died. All of that remains
+true as a design - but the operator decided, on 2026-07-28, not to run it:
+an idle signal cannot tell "abandoned" apart from "still setting up" or
+"between two queue items", and the then-current GPU-keyed build of this exact
+alarm came within five minutes of stopping a live, healthy render the day
+before. `03-create-idle-alarm.sh` is therefore opt-in
+(`ENABLE_IDLE_ALARM=1`) rather than part of this project's own deployment
+sequence; see [Phase 4](06-phase4-safety-net.md) and
+[Appendix B](09-appendix-b-boundaries.md) for the full reasoning and the
+accepted cost of running without it.
 
 A rejected alternative, documented right in
 [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1): an in-guest fallback timer
 (`Start-Job` + `Stop-EC2Instance`). Such a job lives inside the very session
 being torn down; when the guest shuts down, the job dies with it and could never
-fire. Any reliable fallback **must** live outside the guest. See
-[Appendix A](08-appendix-a-corrections.md).
+fire. Any reliable fallback **must** live outside the guest - which is why, if
+one is ever re-armed, it belongs in the control plane rather than the guest.
+See [Appendix A](08-appendix-a-corrections.md).
 
 ### 3. Completion is event-driven, never a fixed timer
 
@@ -184,9 +219,9 @@ automated.
 | Turn guest shutdown into an instance stop | `InstanceInitiatedShutdownBehavior=stop` | Control plane (once) |
 | Detect render complete / stalled | `Watchdog.ps1` (SYSTEM task) | In-guest |
 | Perform the stop | `Stop-Sequence.ps1` -> `StopStrategy` plan (`ec2:StopInstances`, falling back to `Stop-Computer -Force`) | In-guest |
-| Publish GPU utilization | `Push-GpuMetric.ps1` (SYSTEM task) | In-guest |
-| Idle safety net | `topaz-gpu-idle-autostop-<instance-id>` alarm (per-instance) | Control plane |
-| Wall-clock cap | `topaz-max-lifetime-stop-<instance-id>` Lambda (per-instance) | Control plane (optional) |
+| Publish GPU/render telemetry (no alarm acts on it) | `Push-GpuMetric.ps1` (SYSTEM task) | In-guest |
+| Idle safety net (opt-in, NOT armed for this project - 2026-07-28 decision) | `topaz-gpu-idle-autostop-<instance-id>` alarm (per-instance) | Control plane |
+| Wall-clock cap (optional, NOT deployed for this project) | `topaz-max-lifetime-stop-<instance-id>` Lambda (per-instance) | Control plane (optional) |
 | Least-privilege identity | `topaz-render-instance-role` | Control plane |
 
 Continue to [Phase 0 - confirmations](02-phase0-confirmations.md).

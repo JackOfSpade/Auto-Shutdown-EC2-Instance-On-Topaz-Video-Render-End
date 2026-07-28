@@ -4,13 +4,24 @@
 #
 # .SYNOPSIS
 #   Create the IAM role + instance profile the EC2 box uses to publish its
-#   custom GPU metric (and, optionally, to stop itself).
+#   custom GPU metrics (and, optionally, to stop itself).
 #
 # .DESCRIPTION
 #   The watchdog running on the Windows instance needs exactly ONE permission
-#   to do its normal job: cloudwatch:PutMetricData, so it can publish the
-#   TopazRender/GPU GPUUtilization metric. This script creates a least-privilege
-#   role granting only that.
+#   to do its normal job: cloudwatch:PutMetricData, so it can publish its
+#   custom metrics into the TopazRender/GPU namespace -- RenderActive (1/0,
+#   the default idle-alarm signal) and GPUUtilization (telemetry, and the
+#   legacy idle-alarm signal). This script creates a least-privilege role
+#   granting only that.
+#
+#   The grant below is scoped to the NAMESPACE, not to any single metric
+#   NAME: CloudWatch metrics are not ARN-addressable, so a cloudwatch:namespace
+#   condition is the only enforcement PutMetricData's policy can use (see the
+#   WHY comment at step [2/6] below). That is load-bearing for RenderActive
+#   specifically -- it means this role needed NO change to start granting
+#   RenderActive alongside the pre-existing GPUUtilization; any metric name
+#   published inside METRIC_NAMESPACE just works. Only a different NAMESPACE
+#   (not a different metric name) requires re-running this script.
 #
 #   Optionally (env INCLUDE_EC2_STOP=1) it also attaches a tightly tag-scoped
 #   ec2:StopInstances policy, in case you want the instance to be able to stop
@@ -126,6 +137,10 @@ echo "    aws iam put-role-policy --role-name ${ROLE_NAME} --policy-name topaz-p
 # keeps this role scoped to the METRIC_NAMESPACE namespace, not the
 # (necessarily wildcard) Resource field. See the METRIC_NAMESPACE rendering
 # step above for why the RENDERED copy (not the checked-in file) is applied.
+# Because the condition is on the namespace and not a metric name, EVERY
+# metric name published inside METRIC_NAMESPACE is covered by this one grant
+# -- both GPUUtilization and RenderActive -- with no additional policy change
+# needed when a new metric name is added to the same namespace.
 # put-role-policy is idempotent by nature (it overwrites the named inline policy).
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -249,7 +264,7 @@ if ! run_idempotent "IncorrectState|already" aws ec2 associate-iam-instance-prof
   fi
 fi
 
-echo "==> Done. Instance ${INSTANCE_ID} can now publish the ${METRIC_NAMESPACE} metric."
+echo "==> Done. Instance ${INSTANCE_ID} can now publish any metric (RenderActive, GPUUtilization, ...) into the ${METRIC_NAMESPACE} namespace."
 if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
   echo "    (Optional ec2:StopInstances also granted, tag-scoped to AutoStopEligible=true.)"
 fi

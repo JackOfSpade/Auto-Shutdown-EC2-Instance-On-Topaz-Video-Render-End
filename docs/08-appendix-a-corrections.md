@@ -49,6 +49,35 @@ alarm keys on the **custom `TopazRender/GPU` `GPUUtilization` metric**. The
 correction is called out in a banner comment in
 [`03-create-idle-alarm.sh`](../control-plane/03-create-idle-alarm.sh).
 
+> **Update: this specific point has itself been superseded.**
+> `GPUUtilization` is no longer what the alarm keys on by default - it was
+> measured wrong in **both** directions on this box. A confirmed-healthy 4K
+> render read `GPUUtilization` under 5% for 25 consecutive one-minute samples
+> on 2026-07-27, five minutes short of breaching the 30-minute window, on a
+> box that was genuinely rendering. And a connected Amazon DCV session encodes
+> the remote display on the same GPU, holding `GPUUtilization` at 14-58% with
+> nothing rendering at all, so the alarm could never fire while anyone was
+> connected. Wrong in both directions is not a safety net. The alarm now
+> defaults (`IDLE_SIGNAL=render`) to the new `RenderActive` metric (is an
+> encoder worker process alive) instead; `GPUUtilization` is kept only as
+> telemetry, with the old sub-5% behavior still available via
+> `IDLE_SIGNAL=gpu`. See [docs/15 §K](15-third-end-to-end-run.md) for the
+> measured streak and [Phase 4](06-phase4-safety-net.md) for the full
+> reasoning.
+>
+> **Second update (2026-07-28): superseded again, more fundamentally.** Re-
+> keying the signal narrowed the false-stop hazard but did not remove it
+> structurally - no idle/presence signal can tell "abandoned" apart from "the
+> operator is mid-setup" or "the queue is between two items". The operator
+> decided, on 2026-07-28, to stop arming this alarm **at all** by default:
+> `control-plane/03-create-idle-alarm.sh` now refuses to create or update
+> anything unless explicitly passed `ENABLE_IDLE_ALARM=1`, and this box's own
+> alarm has been deleted. The sole sanctioned auto-stop for this project is
+> now watchdog-completion -> verified upload -> `ec2:StopInstances`. See
+> [Phase 4](06-phase4-safety-net.md) and
+> [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
+> for the accepted cost of running this way.
+
 ## 4. "Add an in-guest fallback timer (`Start-Job` + `Stop-EC2Instance`) as a backstop."
 
 **Wrong.** Such a job lives **inside the very session being torn down**; when the

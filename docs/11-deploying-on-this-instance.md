@@ -17,33 +17,48 @@ for a different box, substitute your own instance id / region / account /
 role name throughout - do not copy the literal values below onto another
 instance.
 
-> **Deliberately armed: the `TopazAutoStop-TimedStop` task.** This box has a
+> **UPDATE (2026-07-28): this callout is now historical.** The
+> `TopazAutoStop-TimedStop` task described below was cancelled on
+> **2026-07-27 00:47:20** (`timedstop.log`: `"Cancelled the timed stop:
+> removed task 'TopazAutoStop-TimedStop'."`), exactly per this callout's own
+> original instruction, once Section 3 verified both `StopStrategy` legs (see
+> Section 2). It does **not** exist on this box any more - do not expect it to
+> fire, and do not rely on `Get-ScheduledTask` finding it. Left in place below
+> for the historical record of why it was armed in the first place. **The
+> operator has separately decided (also 2026-07-28) against re-arming any
+> automatic backstop by default** - no idle alarm, no max-lifetime Lambda; see
+> [docs/09-appendix-b-boundaries.md §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
+> for that trade-off and its manual mitigations, one of which is deliberately
+> re-arming this same task for a single bounded session.
+>
+> **Original callout, as written before cancellation:** This box had a
 > one-shot wall-clock stop armed via
 > [`Register-TimedStop.ps1`](../in-guest/Register-TimedStop.ps1), at the
-> operator's explicit request, as a cost backstop while the real stop path is
-> still being fixed. It runs
+> operator's explicit request, as a cost backstop while the real stop path was
+> still being fixed. It ran
 > `Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun`, which bypasses
 > `DryRun` on purpose - a backstop that respected `DryRun` would not be one.
-> It fires on the clock regardless of whether a render is still running.
+> It would have fired on the clock regardless of whether a render was still
+> running.
 >
-> **It cannot terminate this instance.** `Stop-Sequence.ps1` only ever issues
-> `ec2:StopInstances` (currently denied here) and then `Stop-Computer -Force`.
-> A guest shutdown can only *terminate* an EC2 instance when
+> **It could not have terminated this instance.** `Stop-Sequence.ps1` only
+> ever issues `ec2:StopInstances` and then `Stop-Computer -Force`. A guest
+> shutdown can only *terminate* an EC2 instance when
 > `InstanceInitiatedShutdownBehavior` is `terminate`, and that attribute has
 > only two possible values. This box demonstrably survived an earlier manual
-> Windows shutdown, which rules `terminate` out - so the attribute is
-> effectively certain to be `stop`, and the worst case for this task is that
-> the guest powers off without the instance stopping (i.e. billing continues),
-> **not** data loss.
+> Windows shutdown, which rules `terminate` out - so the attribute was
+> effectively certain to be `stop`, and the worst case for this task would
+> have been the guest powering off without the instance stopping (i.e.
+> billing continues), **not** data loss.
 >
-> Inspect or cancel it with:
+> To re-arm it deliberately for a bounded session (see
+> [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)):
 > ```powershell
+> .\in-guest\Register-TimedStop.ps1
 > Get-ScheduledTask -TaskName 'TopazAutoStop-TimedStop' -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo
-> # to stand it down (e.g. once Section 3 is complete and the watchdog is armed):
+> # to stand it back down once you trust the watchdog to take over cleanly:
 > .\in-guest\Register-TimedStop.ps1 -Cancel
 > ```
-> Cancel it once Section 3 has given this box a real, verified stop path -
-> at that point the watchdog supersedes it.
 
 ## 1. In-guest status
 
@@ -60,15 +75,18 @@ registers two SYSTEM scheduled tasks:
 - `TopazAutoStop-GpuMetric` - runs `Push-GpuMetric.ps1` once a minute,
   forever.
 
-**Verified state on this box as of this writing:** both are installed and
-registered - `C:\topaz-autostop` exists, and:
+**Verified state on this box as of this writing (a snapshot from before the
+2026-07-27 `TimedStop` cancellation - see the updated callout above; the
+`TopazAutoStop-TimedStop` row below no longer reflects current reality):**
+both `Watchdog`/`GpuMetric` are installed and registered - `C:\topaz-autostop`
+exists, and:
 
 ```powershell
 > Get-ScheduledTask -TaskName 'TopazAutoStop-*' | Select-Object TaskName, State
 TaskName                  State
 --------                  -----
 TopazAutoStop-GpuMetric   Ready
-TopazAutoStop-TimedStop   Ready      # see the URGENT callout above
+TopazAutoStop-TimedStop   Ready      # historical -- cancelled 2026-07-27, see callout above
 TopazAutoStop-Watchdog    Running
 ```
 
@@ -241,19 +259,85 @@ this - it is out of that script's scope; verify with
 `aws iam list-role-policies --role-name <role>` /
 `aws iam get-role-policy --role-name <role> --policy-name topaz-ec2-stop`).
 
-### 3.4. Create the out-of-band idle alarm
+### 3.4. The out-of-band idle alarm - SKIPPED for this box (decided 2026-07-28)
+
+**Do not run this step as part of the normal deployment sequence any more.**
+The operator decided, on 2026-07-28, against any idle-based auto-stop for
+this project and has already deleted this box's alarm
+(`topaz-gpu-idle-autostop-i-029f35d589bec9b9c`). See
+[Phase 4](06-phase4-safety-net.md) and
+[docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
+for the full reasoning and the accepted cost. `00-verify-prerequisites.sh`'s
+check `5/6` is therefore **expected** to report `[WARN]` ("alarm ... does not
+exist yet") on this box from now on - that is the intended state, not a
+regression to fix.
+
+If you deliberately want to re-create it anyway (e.g. for a bounded,
+supervised session - see docs/09 §5's manual mitigations), the script now
+requires an explicit opt-in and refuses to run without it:
 
 ```bash
-./control-plane/03-create-idle-alarm.sh
+ENABLE_IDLE_ALARM=1 ./control-plane/03-create-idle-alarm.sh
 ```
 
-Creates `topaz-gpu-idle-autostop-i-029f35d589bec9b9c`, watching
-`TopazRender/GPU : GPUUtilization` for 30 minutes of sustained sub-5% GPU
-before calling the built-in `arn:aws:automate:us-west-2:ec2:stop` action.
-Re-run `00-verify-prerequisites.sh` and confirm check 5/6 reports `[OK]`
-(alarm exists, actions enabled).
+This creates `topaz-gpu-idle-autostop-i-029f35d589bec9b9c`, watching, by
+default (`IDLE_SIGNAL=render`), `TopazRender/GPU : RenderActive` (`--statistic
+Maximum`, `< 1`) for `IDLE_MINUTES` minutes (default **30**) of sustained idle
+- i.e. no encoder worker process alive - before calling the built-in
+`arn:aws:automate:us-west-2:ec2:stop` action. The legacy sub-5%
+`GPUUtilization` behavior is still available via `IDLE_SIGNAL=gpu`, but was
+measured wrong in both directions on this box (too low during a real render,
+too high while merely DCV-connected) - see [Phase 4](06-phase4-safety-net.md).
+Tear it back down when the supervised session is over (idempotent - safe even
+if it was never created):
 
-### 3.5. Re-verify everything
+```bash
+TEARDOWN=1 ./control-plane/03-create-idle-alarm.sh
+```
+
+> **Historical note, kept for context.** Before the 2026-07-28 decision, this
+> box's alarm had already been re-run once to move it from the old
+> `GPUUtilization` default onto `RenderActive` - see the 30-minute default
+> window referenced against this box's alarm in
+> [docs/15 §K](15-third-end-to-end-run.md), which documented a real
+> near-miss under the old signal. That re-key narrowed the false-stop hazard;
+> it is why the operator's 2026-07-28 decision was to remove the alarm
+> entirely rather than merely trust the narrower signal.
+
+### 3.5. Optional: grant on-box control-plane audit reads (skip unless you specifically want it)
+
+```bash
+./control-plane/05-grant-audit-reads.sh
+```
+
+**This is not part of the deployment sequence above - it is optional and
+opt-in.** The role attached to this box (`topaz-gpu-render-role`, per the
+table at the top of this doc) grants only what Section 3.3 put there:
+`cloudwatch:PutMetricData` and a tag-scoped `ec2:StopInstances`. That is
+correct for running the pipeline, but it also means this box cannot answer
+"what actually stopped me?" after the fact -
+[docs/09-appendix-b-boundaries.md §4](09-appendix-b-boundaries.md) records the
+exact `AccessDenied` reads a real forensic audit hit on this box's role
+(`cloudtrail:LookupEvents`, `cloudwatch:DescribeAlarms`/`DescribeAlarmHistory`,
+`lambda:ListFunctions`, `logs:DescribeLogGroups`, `iam:List*RolePolicies`).
+
+`05-grant-audit-reads.sh` auto-discovers the role attached to `INSTANCE_ID`
+(so it finds `topaz-gpu-render-role` on this box without any extra flag) and
+grants it a separate, READ-ONLY managed policy covering exactly those reads -
+nothing that can create, modify, delete, start, stop, or terminate anything.
+
+**Prefer the admin workstation instead, for a one-off investigation.** You are
+already running these control-plane commands from a workstation with broader
+credentials than this box will ever need - `aws cloudtrail lookup-events`,
+`aws cloudwatch describe-alarms`, `aws lambda list-functions`, etc. all work
+fine from here right now, at zero cost to this box's privilege and nothing to
+remember to revoke later. Reach for `05-grant-audit-reads.sh` only if you
+specifically want a post-mortem run **from the box itself** to be
+self-sufficient (e.g. no admin workstation reachable at post-mortem time).
+Skipping this step entirely is the default, least-privilege posture and does
+not block anything else in this runbook.
+
+### 3.6. Re-verify everything
 
 ```bash
 ./control-plane/00-verify-prerequisites.sh
@@ -323,10 +407,16 @@ Once armed (Section 4) and a render completes or stalls:
 5. If every action in the plan fails, `Stop-Sequence.ps1` logs an `ERROR`
    that the instance is still running and likely still being billed - see
    Section 6.
-6. Independently, the CloudWatch idle alarm from Section 3.4 and (if
-   deployed) the optional max-lifetime Lambda / in-guest
-   `Register-TimedStop.ps1` backstop remain live, out-of-band-ish backstops -
-   see [Phase 4](06-phase4-safety-net.md).
+6. **There is no independent backstop layer on this box.** Section 3.4's
+   CloudWatch idle alarm is deliberately not created, the max-lifetime Lambda
+   is not deployed, and the in-guest `Register-TimedStop.ps1` timed stop was
+   cancelled once this section's steps were verified. If steps 1-5 above all
+   fail to stop the instance, nothing else will - a human has to notice and
+   stop it by hand. See
+   [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
+   for that trade-off and its manual mitigations, and
+   [Phase 4](06-phase4-safety-net.md) for how to re-arm any of these layers
+   deliberately if you want one back for a specific session.
 
 ## 6. Troubleshooting
 
@@ -343,7 +433,8 @@ Once armed (Section 4) and a render completes or stalls:
 | A render produces NO output at all and the box stops anyway | **Disk full.** Topaz's final mux step runs `ffmpeg -c:v copy`, which writes a COMPLETE SECOND COPY of the output before replacing the original - so an export needs ~2x its output size free. When it fails, Topaz DELETES both files, leaving no trace in the output folder. The watchdog cannot tell a failed render from a successful one; it only sees the queue drain, and stops the box either way | Topaz's own log at `%APPDATA%\Topaz Labs LLC\Topaz Video\logs\*.tzlog` - search for `No space left on device` and `Conversion failed!`. Budget `frames x 3.64 MB x 2` free space for 4K DNxHR HQX |
 | Stop-Sequence runs but the box never actually stops | `DryRun` is still `$true` in the **installed** copy (`Install.ps1` not re-run after the edit) | `C:\topaz-autostop\logs\stop.log` for `"DRY RUN - would stop now"` - if present, the edit from Section 4 has not taken effect yet |
 | S3 sync / SNS publish logged as failed, but the box still stopped | Both are best-effort and never block the stop; check `NoRegionError` (region discovery via IMDS failed) or a permissions gap | `C:\topaz-autostop\logs\stop.log` for `WARN` lines naming the failed call |
-| GPU metric never appears in CloudWatch, idle alarm shows `INSUFFICIENT_DATA` forever | `TopazAutoStop-GpuMetric` task not registered, `nvidia-smi.exe`/`aws.exe` not on PATH for the SYSTEM account, or the role still lacks `PutMetricData` (Section 3.3) | `C:\topaz-autostop\logs\metric.log`; `00-verify-prerequisites.sh`'s `[4/6]` check |
+| GPU/RenderActive telemetry never appears in CloudWatch (no alarm is watching it by default - see 3.4) | `TopazAutoStop-GpuMetric` task not registered, `nvidia-smi.exe`/`aws.exe` not on PATH for the SYSTEM account, or the role still lacks `PutMetricData` (Section 3.3) | `C:\topaz-autostop\logs\metric.log`; `00-verify-prerequisites.sh`'s `[4/6]` check |
+| `00-verify-prerequisites.sh`'s `[5/6]` reports `[WARN]`: alarm does not exist | **Expected on this box since 2026-07-28** - the idle alarm is deliberately not created; see Section 3.4 | Not a defect; see [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box) |
 | `Install.ps1` reports errors | A source script is missing from `in-guest/`, or the install directory is not writable | `C:\topaz-autostop\logs\install.log` |
 | `Register-ScheduledTasks.ps1` throws "requires elevation" | Not run from an Administrator PowerShell | Re-run from an elevated shell; `C:\topaz-autostop\logs\register.log` |
 | Instance stops unexpectedly at a specific wall-clock time with no render running | The `TopazAutoStop-TimedStop` task (see the URGENT callout at the top of this doc) fired | `C:\topaz-autostop\logs\stop.log` (`-Reason maxlifetime`); `Get-ScheduledTaskInfo -TaskName TopazAutoStop-TimedStop` for when it last ran |

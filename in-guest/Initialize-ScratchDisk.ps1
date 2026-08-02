@@ -45,7 +45,13 @@
 [CmdletBinding()]
 param(
     # Set to skip the actual format and only report what WOULD happen.
-    [switch]$WhatIfOnly
+    [switch]$WhatIfOnly,
+
+    # Test/import seam for the pure existing-drive validation below. This is
+    # intentionally undocumented for operators; scheduled tasks never pass it.
+    # It lets Pester exercise the fail-closed predicate without loading Windows
+    # storage cmdlets or touching a disk.
+    [switch]$LibraryOnly
 )
 
 . "$PSScriptRoot\Config.ps1"
@@ -61,6 +67,84 @@ function Test-IsElevated {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-ExistingScratchDriveValidation {
+    <#
+    .SYNOPSIS
+        Pure: validates that an already-mounted scratch drive is the configured
+        EC2 instance-store volume, rather than merely any formatted volume using
+        the same drive letter.
+    .DESCRIPTION
+        Initialize-ScratchDisk.ps1 runs at every boot. The old early-return path
+        accepted any formatted D: volume and then created OutputDir on it. A
+        drive-letter collision with an EBS or data volume therefore silently
+        changed what the rest of the pipeline treated as ephemeral scratch.
+
+        This is intentionally stricter than a simple label check. It reuses
+        Test-IsScratchDiskCandidate's fail-closed origin checks (NVMe,
+        non-boot, non-system, non-EBS serial, known size in bounds). That helper
+        normally rejects formatted disks because it is selecting a disk to
+        FORMAT; here the disk is expected to be formatted already, so only its
+        provenance portion is reused. The volume's filesystem, drive letter,
+        label, and OutputDir root are independently checked here.
+
+        Returns a reason-bearing object so the operational path can refuse with
+        a precise remediation while tests can cover every branch without storage
+        cmdlets.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Volume,
+        [Parameter(Mandatory)]$Disk,
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][string]$ExpectedLabel,
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][int64]$MinBytes,
+        [Parameter(Mandatory)][int64]$MaxBytes
+    )
+
+    $letter = $DriveLetter.Trim().TrimEnd(':')
+    if ($letter -notmatch '^[A-Za-z]$') {
+        return [pscustomobject]@{ IsValid = $false; Reason = "ScratchDriveLetter '$DriveLetter' is not a single drive letter." }
+    }
+
+    # Do NOT use [System.IO.Path] here. The configuration deliberately carries
+    # Windows paths, but Pester also runs this pure helper on Linux where .NET
+    # treats 'D:\Renders' as an ordinary relative filename and returns no root.
+    # Parse the only accepted shape explicitly, accepting either slash spelling
+    # while requiring an anchored Windows drive root.
+    $expectedRoot = "${letter}:\"
+    $outputRootMatch = [regex]::Match($OutputDir, '^(?<drive>[A-Za-z]):[\\/]')
+    if (-not $outputRootMatch.Success -or
+        -not [string]::Equals($outputRootMatch.Groups['drive'].Value, $letter, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ IsValid = $false; Reason = "OutputDir '$OutputDir' is not rooted on configured scratch drive '$expectedRoot'." }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Volume.DriveLetter) -or
+        -not [string]::Equals(([string]$Volume.DriveLetter), $letter, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ IsValid = $false; Reason = "Mounted volume drive letter '$($Volume.DriveLetter)' does not match configured scratch drive '${letter}:'." }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Volume.FileSystemType) -or $Volume.FileSystemType -eq 'Unknown') {
+        return [pscustomobject]@{ IsValid = $false; Reason = "Mounted volume ${letter}: has no known filesystem." }
+    }
+
+    if (-not [string]::Equals(([string]$Volume.FileSystemLabel), $ExpectedLabel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ IsValid = $false; Reason = "Mounted volume ${letter}: has label '$($Volume.FileSystemLabel)', expected '$ExpectedLabel'." }
+    }
+
+    # Pass HasFormattedVolume=$false ONLY because this helper validates a volume
+    # that is already mounted. The shared predicate then supplies every
+    # provenance check used before formatting, without incorrectly rejecting the
+    # very filesystem this path is supposed to recognize.
+    if (-not (Test-IsScratchDiskCandidate -Disk $Disk -MinBytes $MinBytes -MaxBytes $MaxBytes -HasFormattedVolume $false)) {
+        return [pscustomobject]@{ IsValid = $false; Reason = "Backing disk $($Disk.Number) failed instance-store provenance checks (requires NVMe, non-boot, non-system, non-EBS serial, and configured size bounds)." }
+    }
+
+    return [pscustomobject]@{ IsValid = $true; Reason = $null }
+}
+
+if ($LibraryOnly) { return }
+
 if (-not (Test-IsElevated)) {
     Write-TopazLog -Component 'scratch' -Level 'ERROR' `
         -Message "Must run ELEVATED to partition a disk. Aborting."
@@ -74,16 +158,40 @@ if (-not (Test-IsElevated)) {
 
 $existing = Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue
 if ($existing -and $existing.FileSystemType -ne 'Unknown') {
+    try {
+        # Get-Volume tells us what is mounted at D:, but not whether D: belongs
+        # to the expected instance-store disk. Resolve its partition and backing
+        # disk before accepting the idempotent path; never format/relabel an
+        # existing mismatch, even if its name happens to look familiar.
+        $existingPartition = Get-Partition -DriveLetter $driveLetter -ErrorAction Stop
+        $existingDisk = Get-Disk -Number $existingPartition.DiskNumber -ErrorAction Stop
+    }
+    catch {
+        $message = "Could not resolve mounted ${driveLetter}: to its backing disk; refusing to treat it as scratch: $($_.Exception.Message)"
+        Write-TopazLog -Component 'scratch' -Level 'ERROR' -Message $message
+        throw "Initialize-ScratchDisk.ps1: $message"
+    }
+
+    $existingValidation = Get-ExistingScratchDriveValidation -Volume $existing -Disk $existingDisk `
+        -DriveLetter $driveLetter -ExpectedLabel $label -OutputDir $outputDir `
+        -MinBytes $cfg.ScratchMinBytes -MaxBytes $cfg.ScratchMaxBytes
+    if (-not $existingValidation.IsValid) {
+        $message = "Mounted ${driveLetter}: is NOT the configured instance-store scratch volume: $($existingValidation.Reason) Refusing to create '$outputDir', format, or relabel anything. Fix the drive-letter/label/config mismatch manually."
+        Write-TopazLog -Component 'scratch' -Level 'ERROR' -Message $message
+        throw "Initialize-ScratchDisk.ps1: $message"
+    }
+
     # Re-assert OutputDir even when the volume already exists: this script is
-    # the only thing that recreates it after a stop wipes the volume, and
-    # Topaz would otherwise be exporting into a path that is not there.
+    # the only thing that recreates it after a stop wipes the volume. This is
+    # safe only after the label, path root, and backing-disk provenance checks
+    # above confirmed it is the configured instance-store volume.
     if (-not (Test-Path -LiteralPath $outputDir)) {
-        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $outputDir -Force -ErrorAction Stop | Out-Null
         Write-TopazLog -Component 'scratch' -Level 'INFO' `
             -Message "Created output directory '$outputDir' on existing ${driveLetter}:."
     }
     Write-TopazLog -Component 'scratch' -Level 'INFO' `
-        -Message "Scratch drive ${driveLetter}: already present ($([math]::Round($existing.SizeRemaining/1GB,1)) GiB free of $([math]::Round($existing.Size/1GB,1)) GiB). Nothing to do."
+        -Message "Validated existing instance-store scratch drive ${driveLetter}: (Disk $($existingDisk.Number), label '$label', $([math]::Round($existing.SizeRemaining/1GB,1)) GiB free of $([math]::Round($existing.Size/1GB,1)) GiB). Nothing to do."
     return
 }
 

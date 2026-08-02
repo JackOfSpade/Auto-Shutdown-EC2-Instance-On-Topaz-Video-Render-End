@@ -668,6 +668,35 @@ Describe 'Get-NextWatchdogState' {
             $state.BytesChanged | Should -Be $false
             $state.LastIoBytes  | Should -Be 5000
         }
+
+        It 'unknown current or prior output bytes freeze the stall clock, while a known I/O delta still resets it' {
+            $unknownCurrent = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -LastBytes 1000 -Active $true -CurrentBytes $null `
+                -LastIoBytes 5000 -CurrentIoBytes 5000 `
+                -PollSec 10 -DebounceSec 120 -StallLimitSec 30
+
+            $unknownCurrent.StallSec  | Should -Be 20
+            $unknownCurrent.LastBytes | Should -Be 1000
+            $unknownCurrent.Verdict   | Should -Be 'continue'
+
+            $unknownPrior = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -LastBytes $null -Active $true -CurrentBytes 1000 `
+                -LastIoBytes 5000 -CurrentIoBytes 5000 `
+                -PollSec 10 -DebounceSec 120 -StallLimitSec 30
+
+            $unknownPrior.StallSec  | Should -Be 20
+            $unknownPrior.LastBytes | Should -Be 1000
+            $unknownPrior.Verdict   | Should -Be 'continue'
+
+            $ioProgress = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -LastBytes 1000 -Active $true -CurrentBytes $null `
+                -LastIoBytes 5000 -CurrentIoBytes 5200 `
+                -PollSec 10 -DebounceSec 120 -StallLimitSec 30
+
+            $ioProgress.StallSec    | Should -Be 0
+            $ioProgress.LastBytes   | Should -Be 1000
+            $ioProgress.LastIoBytes | Should -Be 5200
+        }
     }
 }
 
@@ -1347,6 +1376,24 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
     }
 
     Context 'a failure anywhere in the pass is caught, logged as a WARN, and never thrown into the caller -- the single most safety-critical loop in the project' {
+        It 'preserves existing Tracking and makes no upload call when strict enumeration fails, rather than pruning from a partial listing' {
+            $cfg = Get-PollTestConfig
+            $key = 'D:\Renders\already-uploaded.mov'
+            $script:Tracking[$key] = @{
+                SizeLastSeen         = [int64]1000
+                SecondsStable        = 30
+                UploadedSize         = [int64]1000
+                UploadedWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
+            }
+            Mock Get-TopazOutputFiles { throw 'simulated access failure' }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+
+            $script:Tracking.ContainsKey($key) | Should -Be $true
+            $script:Tracking[$key].UploadedSize | Should -Be 1000
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+
         It 'does not throw and logs a WARN when Get-ChildItem itself fails unexpectedly' {
             $cfg = Get-PollTestConfig
             Mock Get-ChildItem { throw 'simulated filesystem failure' }
@@ -1395,8 +1442,8 @@ Describe 'Resolve-StopDecision' {
 
 Describe 'Get-OutputBytes' {
 
-    It 'returns 0 for a nonexistent path' {
-        Get-OutputBytes -Path (Join-Path $TestDrive 'does-not-exist') | Should -Be 0
+    It 'returns $null for a nonexistent path' {
+        Get-OutputBytes -Path (Join-Path $TestDrive 'does-not-exist') | Should -Be $null
     }
 
     It 'returns 0 for an empty directory' {
@@ -1413,6 +1460,11 @@ Describe 'Get-OutputBytes' {
         [System.IO.File]::WriteAllBytes((Join-Path $dir 'b.bin'), (New-Object byte[] 250))
 
         Get-OutputBytes -Path $dir | Should -Be 350
+    }
+
+    It 'returns $null when strict enumeration fails, never a partial byte total' {
+        Mock Get-TopazOutputFiles { throw 'simulated access failure' }
+        Get-OutputBytes -Path 'D:\Renders' | Should -Be $null
     }
 }
 

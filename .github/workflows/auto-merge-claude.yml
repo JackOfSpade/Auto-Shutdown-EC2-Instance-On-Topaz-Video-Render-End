@@ -1,8 +1,9 @@
 name: Auto-merge branches to main
 
-# Merges ALL branches (any prefix — claude/*, jack/*, etc.) into main automatically,
-# but ONLY once their CI run is green. Full hands-off automation while ensuring a red
-# build never lands on main.
+# Merges one branch (any prefix — claude/*, jack/*, etc.) into main automatically
+# only after both that branch and the exact current main commit have green CI. Each
+# successful merge waits for CI on its resulting main commit before another branch
+# can land, so CI always validates the actual main history.
 #
 # Why trigger on `workflow_run` (CI completed) instead of `push`:
 #   Triggering when the "CI" workflow completes means (a) every drain happens with a
@@ -45,7 +46,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge all CI-green branches into main
+      - name: Merge one CI-green branch into main
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -53,12 +54,6 @@ jobs:
           # shellcheck source=scripts/auto_merge_decision.sh
           source scripts/auto_merge_decision.sh
 
-          # Drain EVERY un-merged branch (any prefix), not just the one whose CI just
-          # finished. The concurrency group (auto-merge-main) keeps only ONE run
-          # pending, so rapid CI completions from several sessions can drop a queued
-          # run. Processing all branches here means whichever run does execute also
-          # picks up any stranded stragglers — a dropped queued run can no longer lose
-          # a branch's work.
           if ! git fetch origin --prune; then
             echo "::warning::git fetch failed; the next CI completion re-triggers and drains."
             exit 0
@@ -66,9 +61,22 @@ jobs:
 
           git checkout -B main origin/main
 
+          # MAIN GATE. A branch's own green CI is insufficient if main changed
+          # since its CI ran: merging several individually green branches would
+          # create an untested combined main. Query the exact current origin/main
+          # SHA and fail closed on a missing, red, in-progress, or API-error run.
+          main_sha="$(git rev-parse origin/main)"
+          main_runs_json="$(gh api "$(ci_runs_api_path "$GITHUB_REPOSITORY" "$main_sha")" 2>/dev/null || echo "")"
+          main_ci_conclusion="$(ci_conclusion_from_json "$main_runs_json")"
+          if ! can_merge_next_branch "$main_ci_conclusion" 0; then
+            echo "::notice::Skipping merge cycle — CI for main ${main_sha:0:7} is '$main_ci_conclusion', not success."
+            exit 0
+          fi
+
           # Every remote branch is a candidate EXCEPT main itself (nothing to merge main
           # into) and the origin/HEAD symbolic ref (not a real branch).
           merged_branches=""
+          merged_count=0
           for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v -E '^origin/(main|HEAD)$' || true); do
             br="${ref#origin/}"
 
@@ -78,7 +86,13 @@ jobs:
               continue
             fi
 
-            # --- CI gate -------------------------------------------------------------
+            # A new branch can land only once per cycle. Already-contained
+            # branches above are cleanup only and can still be batched safely.
+            if ! can_merge_next_branch "$main_ci_conclusion" "$merged_count"; then
+              continue
+            fi
+
+            # --- candidate CI gate ---------------------------------------------------
             # Only merge a branch whose EXACT tip commit has a successful CI run. We
             # query the "CI" workflow runs for that precise SHA, so a commit pushed
             # after CI passed (new tip, no green run yet) is skipped until its own CI
@@ -95,9 +109,7 @@ jobs:
             # ci_conclusion_from_json search all of them for a "success" avoids parking
             # a genuinely green branch behind its own duplicate run.
             sha="$(git rev-parse "$ref")"
-            runs_json="$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=10" \
-              2>/dev/null || echo "")"
+            runs_json="$(gh api "$(ci_runs_api_path "$GITHUB_REPOSITORY" "$sha")" 2>/dev/null || echo "")"
             ci_conclusion="$(ci_conclusion_from_json "$runs_json")"
             if ! is_ci_green "$ci_conclusion"; then
               # ONE-SHOT, CONTENT-FREE RETRY. A red-CI branch would otherwise sit parked
@@ -121,6 +133,11 @@ jobs:
             # Fast-forward if possible, else a merge commit.
             if git merge --ff-only "$ref" || git merge --no-ff "$ref" -m "Auto-merge $br into main"; then
               merged_branches="$merged_branches $br"
+              merged_count=$((merged_count + 1))
+              # Subsequent passes through this loop can collect already-contained
+              # branches for safe cleanup, but can_merge_next_branch now blocks
+              # every other candidate until CI validates the new main SHA.
+              continue
             else
               git merge --abort || true
               if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then

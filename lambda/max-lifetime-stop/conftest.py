@@ -16,23 +16,18 @@ e.g. test_aws_target_region_honored_by_client_factory, which calls the real
 (unpatched) ``handler_module._ec2_client()`` and so gets no Stubber/explicit
 credentials to shield it.
 
-The fix: point botocore at empty config/credentials files (``/dev/null``) and
+The fix: point botocore at empty config/credentials files (``os.devnull``) and
 pin static throwaway credentials via env vars, so client construction never
 touches ``~/.aws/*`` or a real credential provider (env/SSO/IMDS/etc.) on
 any machine, hermetic-CI or a developer laptop alike.
 
-Deliberately NOT pinned: AWS_DEFAULT_REGION / AWS_REGION. Every test in
-test_handler.py that constructs a client either passes region_name
-explicitly (``_make_client()``) or sets AWS_TARGET_REGION itself
-(test_aws_target_region_honored_by_client_factory), so region resolution
-never falls through to AWS_DEFAULT_REGION/AWS_REGION in this suite as it
-stands. Pinning either here would be an untested, unrequested behavior
-change and could mask a future test that *does* want to exercise the
-"no AWS_TARGET_REGION -> falls back to the Lambda runtime's AWS_REGION"
-path -- so it is left alone. (test_handler.py's own `clean_env` autouse
-fixture separately clears AWS_TARGET_REGION between tests; it does not
-touch AWS_DEFAULT_REGION/AWS_REGION either.)
+AWS_DEFAULT_REGION / AWS_REGION are deliberately not set here. The handler
+test suite clears both ambient values before each test, then explicitly sets
+AWS_DEFAULT_REGION in its fallback-region test. That keeps default-region
+behavior hermetic without masking the fallback path.
 """
+
+import os
 
 import pytest
 
@@ -41,8 +36,8 @@ import pytest
 def hermetic_aws_env(monkeypatch):
     """Prevent boto3/botocore from reading the developer's real ~/.aws
     config or resolving real credentials, for every test in this suite."""
-    monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")

@@ -305,7 +305,8 @@ rendering.
 the order of 1-2 minutes for a multi-GB render at the throughput measured on this deployment
 ([docs/16](16-render-loss-incident.md)) - and this poll loop is single-threaded, so the watchdog
 observes **nothing else** while an incremental upload is running (`Invoke-TopazIncrementalUpload`
-in `Config.ps1` runs the `rclone copy` + `rclone check` synchronously on the polling thread). That
+in `Config.ps1` runs `rclone copyto` + a file-to-file `rclone check` synchronously on the polling
+thread). That
 is accepted, not hidden: `DebounceSec` (300 s) and `StallSec` (1800 s) are both generous budgets,
 and the upload only ever starts at the moment a render has *just* finished - the point in the
 whole cycle where a brief blind spell is least likely to hide anything that matters. The window is

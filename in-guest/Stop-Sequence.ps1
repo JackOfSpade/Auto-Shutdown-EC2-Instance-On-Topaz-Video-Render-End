@@ -6,18 +6,17 @@
 .DESCRIPTION
     Invoked by Watchdog.ps1 once the Topaz render queue is complete or stalled.
 
-    Because the instance's InstanceInitiatedShutdownBehavior is set to "stop"
-    at the AWS level, a plain in-guest shutdown STOPS the instance - there is
-    NO AWS API call and NO credentials involved in the stop itself. Optional
-    steps that DO use the AWS CLI (S3 sync, SNS publish) run first and are
-    strictly best-effort: a failure there must never block the power off.
+    The configured StopStrategy normally calls ec2:StopInstances against this
+    instance first, then can fall back to a guest shutdown. Optional AWS CLI
+    work (S3 sync and SNS) runs before the stop action and is best-effort; the
+    verified Google Drive upload is the exception when OutputDir is ephemeral.
 
     Order of operations:
-        1. (optional) aws s3 sync OutputDir -> S3SyncTarget   (BEFORE power off,
-           so finished artifacts are safe even if something later goes wrong).
-        2. (optional) aws sns publish a "render complete/stalled" notification.
-        3. If DryRun: log the decision and return WITHOUT powering off.
-        4. Otherwise: Stop-Computer -Force  (guest shutdown => instance stop).
+        1. (optional) aws s3 sync OutputDir -> S3SyncTarget.
+        2. Upload and verify OutputDir with rclone; this blocks an ephemeral stop.
+        3. (optional) aws sns publish a notification.
+        4. If effective DryRun: log the decision and return WITHOUT powering off.
+        5. Otherwise follow StopStrategy (EC2 API stop, guest shutdown, or both).
 
 .PARAMETER Reason
     Why we are stopping: 'completed' (queue drained) or 'stalled' (a worker was
@@ -48,10 +47,13 @@ param(
 
 # --- Load shared config + logging ------------------------------------------
 . "$PSScriptRoot\Config.ps1"
+# A timed hard-stop deliberately passes -IgnoreDryRun. Every downstream
+# message must describe the effective behavior, not merely Config.ps1's value.
 $cfg = Get-TopazAutoStopConfig
+$effectiveDryRun = $cfg.DryRun -and -not $IgnoreDryRun
 
 Write-TopazLog -Component 'stop' -Level 'INFO' `
-    -Message "Stop sequence invoked (reason=$Reason, dryRun=$($cfg.DryRun))."
+    -Message "Stop sequence invoked (reason=$Reason, effectiveDryRun=$effectiveDryRun, configuredDryRun=$($cfg.DryRun), ignoreDryRun=$IgnoreDryRun)."
 
 # ---------------------------------------------------------------------------
 # Best-effort: discover this instance's id + region (ONE IMDSv2 round trip)
@@ -153,6 +155,22 @@ if ($cfg.OutputIsEphemeral -and ($uploadOk -eq $false)) {
 }
 
 # ---------------------------------------------------------------------------
+# 1c. A completed render gets one final, fail-closed safety check after all
+#     potentially long upload/recovery work. This deliberately runs BEFORE
+#     SNS and the DryRun guard so neither can claim a stop that this interlock
+#     has refused. Stalled and timed hard-stop reasons retain their deliberate
+#     existing semantics; neither gets a new activity gate here.
+# ---------------------------------------------------------------------------
+
+if ($Reason -eq 'completed') {
+    if (-not (Test-TopazCompletedStopSafetyGate -Config $cfg)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message 'FINAL COMPLETION SAFETY GATE REFUSED the stop. The instance stays up and Watchdog.ps1 will re-arm rather than power off during a possible new or still-writing render.'
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 2. Optional SNS notification (best-effort; never blocks the stop).
 # ---------------------------------------------------------------------------
 
@@ -161,7 +179,7 @@ if (-not [string]::IsNullOrWhiteSpace($cfg.SnsTopicArn)) {
     # must not claim the box is stopping - that would be a false alarm to
     # whoever is subscribed to the topic. Get-TopazStopNotification reproduces
     # both branches' wording exactly.
-    $notification = Get-TopazStopNotification -Reason $Reason -InstanceId $instanceId -DryRun $cfg.DryRun
+    $notification = Get-TopazStopNotification -Reason $Reason -InstanceId $instanceId -DryRun $effectiveDryRun
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Publishing SNS notification to '$($cfg.SnsTopicArn)'."
@@ -182,7 +200,7 @@ else {
 # 3. Dry-run guard.
 # ---------------------------------------------------------------------------
 
-if ($cfg.DryRun -and -not $IgnoreDryRun) {
+if ($effectiveDryRun) {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "DRY RUN - would stop now (reason=$Reason). No stop performed."
     # $true, not $false: nothing FAILED here. The stop was deliberately

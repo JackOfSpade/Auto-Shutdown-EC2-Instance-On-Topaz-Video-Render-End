@@ -9,12 +9,8 @@ No network calls and no real AWS credentials are needed:
     or a credential provider chain.
   * ``handler._ec2_client`` (the handler's own client factory) is
     monkeypatched per-test to return that stubbed client.
-  * Ages are derived from the *real* wall clock
-    (``datetime.now(timezone.utc)``) by constructing ``LaunchTime`` values
-    relative to "now" at test-setup time, exactly as suggested in the task:
-    this avoids patching ``datetime`` entirely, since the handler always
-    reads a later "now" than the one used to build the fixture, which is
-    all that's needed to land reliably on either side of the ceiling.
+  * The exact max-lifetime boundary uses the handler's small ``_utc_now``
+    seam so it is deterministic rather than relying on wall-clock scheduling.
 """
 
 from __future__ import annotations
@@ -94,7 +90,14 @@ def _patch_client(monkeypatch, client):
 def clean_env(monkeypatch):
     """Start every test from a blank slate for the env vars the handler
     reads, regardless of whatever is ambient in the host environment."""
-    for key in ("TARGET_INSTANCE_ID", "INSTANCE_ID", "MAX_LIFETIME_HOURS", "AWS_TARGET_REGION"):
+    for key in (
+        "TARGET_INSTANCE_ID",
+        "INSTANCE_ID",
+        "MAX_LIFETIME_HOURS",
+        "AWS_TARGET_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -156,14 +159,12 @@ def test_running_just_under_ceiling_is_noop(monkeypatch):
 
 
 def test_running_age_at_boundary_stops_instance(monkeypatch):
-    """age_hours >= max_hours (not strictly >) must still stop. LaunchTime is
-    built exactly max_hours before test-setup "now"; by the time handler.py
-    reads its own (necessarily later) now(), the computed age has ticked
-    past the ceiling by a hair -- enough to exercise the `<` vs `>=` branch
-    without patching time."""
+    """age_hours >= max_hours (not strictly >) must still stop."""
     monkeypatch.setenv("TARGET_INSTANCE_ID", INSTANCE_ID)
     monkeypatch.setenv("MAX_LIFETIME_HOURS", "1")
-    launch_time = datetime.now(timezone.utc) - timedelta(hours=1)
+    now = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(handler_module, "_utc_now", lambda: now)
+    launch_time = now - timedelta(hours=1)
 
     client, stubber = _make_client()
     stubber.add_response(
@@ -548,6 +549,16 @@ def test_aws_target_region_honored_by_client_factory(monkeypatch):
     client = handler_module._ec2_client()
 
     assert client.meta.region_name == "us-west-2"
+
+
+def test_default_region_used_when_target_region_is_unset(monkeypatch):
+    """Without an explicit target region, defer to boto3's standard region
+    configuration. Lambda provides AWS_DEFAULT_REGION and AWS_REGION."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-2")
+
+    client = handler_module._ec2_client()
+
+    assert client.meta.region_name == "us-east-2"
 
 
 # ---------------------------------------------------------------------------

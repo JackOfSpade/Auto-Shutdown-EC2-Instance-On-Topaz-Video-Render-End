@@ -44,6 +44,67 @@ $cfg = Get-TopazAutoStopConfig
 $rclone     = $cfg.RclonePath
 $configPath = $cfg.RcloneConfigPath
 
+function Protect-RcloneConfigFile {
+    <#
+    .SYNOPSIS
+        Restrict the OAuth-token file to SYSTEM and Administrators, then verify it.
+    .DESCRIPTION
+        This is intentionally called BEFORE any network verification. A failed
+        `rclone about` or upload probe must not leave a newly-created refresh
+        token readable through its inherited ACLs.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "rclone config '$Path' was not created or is not a file."
+    }
+
+    $allowedSids = @('S-1-5-18', 'S-1-5-32-544') # SYSTEM, BUILTIN\\Administrators
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRuleAll($rule)
+    }
+
+    foreach ($sid in $allowedSids) {
+        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $identity, 'FullControl', 'None', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+
+    $verifiedAcl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if (-not $verifiedAcl.AreAccessRulesProtected) {
+        throw "ACL verification failed: '$Path' still inherits access rules from its parent."
+    }
+    $verifiedRules = @($verifiedAcl.Access)
+    if ($verifiedRules.Count -ne $allowedSids.Count) {
+        throw "ACL verification failed: '$Path' must have exactly $($allowedSids.Count) access rules, found $($verifiedRules.Count)."
+    }
+
+    $verifiedSids = @()
+    foreach ($rule in $verifiedRules) {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($allowedSids -notcontains $sid) {
+            throw "ACL verification failed: unexpected identity $sid can access '$Path'."
+        }
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+            $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl -or
+            $rule.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or
+            $rule.PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) {
+            throw "ACL verification failed: $sid must have an explicit Allow/FullControl rule on '$Path'."
+        }
+        $verifiedSids += $sid
+    }
+    foreach ($sid in $allowedSids) {
+        if (($verifiedSids | Where-Object { $_ -eq $sid }).Count -ne 1) {
+            throw "ACL verification failed: required identity $sid does not have exactly one rule on '$Path'."
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $rclone)) {
     throw "rclone not found at '$rclone'. Install it first, or fix RclonePath in Config.ps1."
 }
@@ -85,6 +146,11 @@ if (-not $VerifyOnly) {
 
     & $rclone config --config $configPath
 }
+
+# rclone config creates (or rewrites) the file above. Harden it immediately,
+# before listremotes/about/probe failures can leave the refresh token exposed.
+Protect-RcloneConfigFile -Path $configPath
+Write-Output "  [PASS] locked '$configPath' down to SYSTEM + Administrators"
 
 # ---------------------------------------------------------------------------
 # Verify. A remote that merely EXISTS is not proof it works, so actually touch
@@ -143,27 +209,6 @@ Write-Output "  [PASS] probe verified at the destination"
 
 & $rclone delete "$($cfg.UploadTarget)/topaz-upload-probe.txt" --config $configPath 2>&1 | Out-Null
 Write-Output "  [INFO] probe file removed from Drive"
-
-# ---------------------------------------------------------------------------
-# The config holds a refresh token. Restrict it to SYSTEM + Administrators.
-# ---------------------------------------------------------------------------
-
-try {
-    $acl = Get-Acl -LiteralPath $configPath
-    $acl.SetAccessRuleProtection($true, $false)   # drop inherited ACEs
-    foreach ($who in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $who, 'FullControl', 'None', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-    }
-    Set-Acl -LiteralPath $configPath -AclObject $acl
-    Write-Output "  [PASS] locked '$configPath' down to SYSTEM + Administrators"
-}
-catch {
-    Write-Output "  [WARN] could not tighten permissions on '$configPath': $($_.Exception.Message)"
-    Write-TopazLog -Component 'driveauth' -Level 'WARN' `
-        -Message "Could not tighten ACLs on '$configPath': $($_.Exception.Message). The file holds a Google refresh token and may still be readable by non-administrators."
-}
 
 # Persist the outcome. Until now this script -- the one-time step that
 # provisions the credential EVERY later automated upload depends on -- wrote

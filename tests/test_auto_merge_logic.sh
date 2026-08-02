@@ -97,6 +97,26 @@ assert_false "no success among duplicate runs: is_ci_green must SKIP the merge" 
 assert_false "is_ci_green must reject 'cancelled' (fail-closed lock-in)" is_ci_green "cancelled"
 assert_false "is_ci_green must reject 'skipped' (fail-closed lock-in)" is_ci_green "skipped"
 
+# ---- exact-main CI gate / one-merge-per-cycle -------------------------------------------------
+
+assert_eq "CI API path scopes the query to the supplied exact SHA" \
+  "$(ci_runs_api_path 'owner/repo' 'abc123')" \
+  "repos/owner/repo/actions/workflows/ci.yml/runs?head_sha=abc123&per_page=10"
+
+assert_true "green current main permits the first candidate merge" \
+  can_merge_next_branch "success" "0"
+assert_false "red current main blocks every candidate merge" \
+  can_merge_next_branch "failure" "0"
+assert_false "in-progress current main blocks every candidate merge" \
+  can_merge_next_branch "in_progress" "0"
+assert_false "missing current-main CI blocks every candidate merge" \
+  can_merge_next_branch "none" "0"
+assert_false "API error for current main blocks every candidate merge" \
+  can_merge_next_branch "error" "0"
+assert_false "a second candidate cannot merge in the same green-main cycle" \
+  can_merge_next_branch "success" "1"
+assert_false "an invalid merge count fails closed" can_merge_next_branch "success" "not-a-number"
+
 # ---- is_ancestor_of: already-merged + re-confirm-before-delete, against a scratch git repo --
 
 SCRATCH="$(mktemp -d)"

@@ -311,10 +311,12 @@ mechanism from the poll loop's own side):
   after its upload becomes eligible again - see below.
 - On eligibility, `Invoke-TopazIncrementalUploadPoll` (`Watchdog.ps1`) calls
   `Invoke-TopazIncrementalUpload` (`Config.ps1`), which uploads **that file alone** via a scoped
-  `rclone copy --include <file>` (the same shape `Invoke-TopazRecoveryUpload` already uses for a
-  recovery candidate), verifies it the same way the normal path above does, and marks the size and
-  write-time it uploaded so later polls skip it - unless the file's size or write-time later
-  differs from what was uploaded, in which case it becomes eligible again (see below).
+  `rclone copyto <local-file> <UploadTarget>/<relative-path>`, then verifies that exact file-to-file
+  destination with `rclone check --one-way`. This deliberately avoids an `--include` filter here:
+  rclone filters are glob patterns, whereas the literal destination preserves an output filename
+  containing filter metacharacters. It then marks the size and write-time it uploaded so later polls
+  skip it - unless the file's size or write-time later differs from what was uploaded, in which case
+  it becomes eligible again (see below).
 - A failed incremental attempt reuses the same one-retry policy
   (`Resolve-UploadRetryDecision`) and is **never fatal** to the monitoring loop: log it, leave the
   file unmarked, and let a later poll - or §3's end-of-queue upload, still an unconditional

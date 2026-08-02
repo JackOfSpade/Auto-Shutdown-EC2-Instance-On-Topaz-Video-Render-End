@@ -357,7 +357,7 @@ allowlisted in `ci.yml`); and `ruff` + `pytest` on
 locally with:
 
 ```bash
-pip install -r lambda/max-lifetime-stop/requirements-dev.txt && pytest lambda/ -q
+python -m pip install -r lambda/max-lifetime-stop/requirements-dev.txt && python -m pytest lambda/ -q
 ```
 
 Run the auto-merge decision tests locally with:
@@ -372,7 +372,14 @@ Run the control-plane validation tests locally with:
 bash tests/test_control_plane_validation.sh
 ```
 
-The Pester tests need PowerShell 7+ (`pwsh`), which is what CI runs them under;
+Run the max-lifetime deployment scheduler tests locally with:
+
+```bash
+bash tests/test_deploy_max_lifetime_scheduler.sh
+```
+
+The Pester tests need PowerShell 7+ (`pwsh`). CI intentionally pins Pester
+5.7.1 (never Pester 6+) because the suite uses Pester 5's CI interface:
 see [docs/10-testing-and-ci.md](docs/10-testing-and-ci.md) for how to run them
 locally, and for what the auto-merge-to-main workflow
 ([`.github/workflows/auto-merge-claude.yml`](.github/workflows/auto-merge-claude.yml))

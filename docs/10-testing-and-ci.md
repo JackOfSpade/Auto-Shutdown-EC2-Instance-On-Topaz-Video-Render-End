@@ -12,7 +12,7 @@ caught before it reaches an EC2 box that bills by the hour.
 
 | Area | Path | Lint | Tests |
 |------|------|------|-------|
-| Control plane | `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`, `tests/*.sh` | `shellcheck`, `actionlint` | `bash tests/test_auto_merge_logic.sh`, `bash tests/test_control_plane_validation.sh` |
+| Control plane | `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`, `tests/*.sh` | `shellcheck`, `actionlint` | `bash tests/test_auto_merge_logic.sh`, `bash tests/test_control_plane_validation.sh`, `bash tests/test_deploy_max_lifetime_scheduler.sh` |
 | In-guest pipeline | `in-guest/` | PSScriptAnalyzer | Pester (`in-guest/tests/`) |
 | Max-lifetime Lambda | `lambda/max-lifetime-stop/` | `ruff` | `pytest` |
 
@@ -37,7 +37,7 @@ caught before it reaches an EC2 box that bills by the hour.
   [`control-plane/lib/aws-idempotent.sh`](../control-plane/lib/aws-idempotent.sh),
   by sourcing the same files the production scripts source - no AWS
   credentials or network access needed.
-- **PSScriptAnalyzer** lints the PowerShell under `in-guest/` for style and
+- **PSScriptAnalyzer 1.25.0** lints the PowerShell under `in-guest/` for style and
   correctness issues. **Error/ParseError** severity always fails the build;
   **Warning** severity now also fails the build **unless** the specific rule is
   on an explicit, commented allowlist in
@@ -47,7 +47,7 @@ caught before it reaches an EC2 box that bills by the hour.
   rule (credential/secret handling, injection, etc.) is never allowlisted. This
   closes a gap where a real Warning-level finding could previously pass CI
   silently as long as it was not an Error/ParseError.
-- **Pester** runs the unit tests in [`in-guest/tests/`](../in-guest/tests/),
+- **Pester 5.x** runs the unit tests in [`in-guest/tests/`](../in-guest/tests/),
   which exercise `Resolve-RenderActive` (the pure completion-decision helper in
   [`in-guest/Config.ps1`](../in-guest/Config.ps1)) across all three
   `CompletionSignal` modes - see [Phase 2](04-phase2-watchdog.md). Because
@@ -62,7 +62,10 @@ caught before it reaches an EC2 box that bills by the hour.
   Windows-only wait-for-Topaz/monitoring loop whenever it is dot-sourced
   rather than run directly.
 - **`ruff`** lints the Lambda handler in
-  [`lambda/max-lifetime-stop/`](../lambda/max-lifetime-stop/).
+  [`lambda/max-lifetime-stop/`](../lambda/max-lifetime-stop/). CI installs the
+  committed `requirements-dev.txt`, which pins its reviewed Python test and
+  lint toolchain (including Ruff 0.15.22) rather than resolving new releases
+  on every run.
 - **`pytest`** runs [`test_handler.py`](../lambda/max-lifetime-stop/test_handler.py),
   which uses `botocore.stub.Stubber` to exercise the handler's
   running/stopped, over-ceiling/under-ceiling, and missing-instance branches
@@ -72,10 +75,13 @@ caught before it reaches an EC2 box that bills by the hour.
 ## The auto-merge-to-main workflow and its tests
 
 [`.github/workflows/auto-merge-claude.yml`](../.github/workflows/auto-merge-claude.yml)
-merges any branch into `main` automatically once its own `CI` run for that exact
-commit SHA is green (triggered on `workflow_run` completion of the `CI`
-workflow, plus a manual `workflow_dispatch` escape hatch). The CI-gate,
-retry, and ancestry predicates that decide "is this branch mergeable" are
+merges at most one branch into `main` automatically once both that branch and
+the exact current `main` commit have a green `CI` run (triggered on
+`workflow_run` completion of the `CI` workflow, plus a manual
+`workflow_dispatch` escape hatch). After it pushes that one merge, CI validates
+the resulting `main` SHA before a later workflow run can merge another branch.
+The CI-gate, retry, and ancestry predicates that decide "is this branch
+mergeable" are
 factored out into sourceable functions in
 [`scripts/auto_merge_decision.sh`](../scripts/auto_merge_decision.sh) - `git`
 plumbing (fetch/checkout/merge/push, the conflict-PR fallback, branch
@@ -87,6 +93,10 @@ Notable behavior encoded there:
 
 - **Fail-closed CI gate:** only an exact `"success"` conclusion counts as green;
   in-progress, failure, missing, or an API error all block the merge.
+- **Main-history gate and one-merge cycle:** the exact current `origin/main`
+  SHA must be green before any candidate is merged, and a successful candidate
+  ends the cycle. This prevents individually-green branches from forming an
+  untested combined `main`; already-contained branch cleanup can still batch.
 - **`per_page=10`, not `1`, when listing runs for a SHA:** a branch with an open
   PR gets **two** `CI` workflow runs per commit (one for the `push` event, one
   for the `pull_request` event), completing independently and in no guaranteed
@@ -107,15 +117,27 @@ it locally with:
 bash tests/test_auto_merge_logic.sh
 ```
 
+[`tests/test_deploy_max_lifetime_scheduler.sh`](../tests/test_deploy_max_lifetime_scheduler.sh)
+uses a fake AWS CLI to exercise the EventBridge Scheduler and classic
+CloudWatch Events fallback paths in the max-lifetime deployment script without
+AWS credentials or network access. Run it locally with:
+
+```bash
+bash tests/test_deploy_max_lifetime_scheduler.sh
+```
+
 ## Running the Lambda tests locally
 
 ```bash
-pip install -r lambda/max-lifetime-stop/requirements-dev.txt && pytest lambda/ -q
+python -m pip install -r lambda/max-lifetime-stop/requirements-dev.txt && python -m pytest lambda/ -q
 ```
 
 ## Running the Pester tests locally
 
 Pester 5 requires **PowerShell 7+ (`pwsh`)**, which is what CI runs it under.
+CI pins the reviewed Pester 5.7.1 release and verifies that the loaded module
+is major version 5, preventing an incompatible new major version from silently
+changing the test runner.
 If you have `pwsh` installed:
 
 ```powershell

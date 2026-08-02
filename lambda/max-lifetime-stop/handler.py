@@ -46,6 +46,15 @@ _NON_RUNNING_STATES = {"pending", "stopping", "stopped", "shutting-down", "termi
 DEFAULT_MAX_LIFETIME_HOURS = 12.0
 
 
+def _utc_now() -> datetime:
+    """Return the current UTC time.
+
+    Kept as a tiny seam so the safety-critical ceiling boundary can be tested
+    against a fixed instant instead of depending on wall-clock scheduling.
+    """
+    return datetime.now(timezone.utc)
+
+
 def _get_instance_id() -> str:
     """Resolve the target instance id from env (TARGET_INSTANCE_ID preferred).
 
@@ -137,7 +146,7 @@ def handler(event, context):
     at or beyond the configured max-lifetime ceiling. Returns a small decision dict."""
     instance_id = _get_instance_id()
     max_hours = _get_max_lifetime_hours()
-    now = datetime.now(timezone.utc)
+    now = _utc_now()
 
     logger.info(
         "max-lifetime-stop invoked: instance=%s ceiling=%.2fh now=%s",

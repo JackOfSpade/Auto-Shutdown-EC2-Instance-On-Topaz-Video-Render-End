@@ -51,6 +51,22 @@ is_ci_green() {
   [ "$1" = "success" ]
 }
 
+# ci_runs_api_path <repository> <sha> — print the GitHub Actions API path for
+# the CI runs belonging to exactly one commit. Keeping the SHA in this helper
+# makes the main gate and the candidate-branch gate use the same narrowly
+# scoped query rather than accidentally accepting a result for another commit.
+ci_runs_api_path() {
+  printf 'repos/%s/actions/workflows/ci.yml/runs?head_sha=%s&per_page=10\n' "$1" "$2"
+}
+
+# can_merge_next_branch <main-ci-conclusion> <merged-count> — true only while
+# the current main SHA is green and no new branch has landed in this cycle.
+# A successful branch merge changes main, so a second branch must wait for CI
+# on that new main SHA in a later workflow run. Invalid counts fail closed.
+can_merge_next_branch() {
+  is_ci_green "$1" && [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -eq 0 ]
+}
+
 # is_ancestor_of <maybe-ancestor-ref> <descendant-ref> — true (exit 0) if the first ref's commit is
 # reachable from the second, i.e. the first is already merged into the second. Used both for "already
 # contained in main, just clean up" and for the re-confirm-before-delete ancestry check (a branch whose

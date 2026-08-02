@@ -94,6 +94,15 @@ LAMBDA_ROLE_NAME="topaz-max-lifetime-lambda-role"
 HANDLER="handler.handler"
 RUNTIME="python3.12"
 SCHEDULE_EXPRESSION="rate(30 minutes)"
+# Keep the Scheduler definition declarative. `update-schedule` replaces the
+# schedule's mutable settings rather than patching individual fields, so the
+# create and update paths must use the same complete desired state. Without
+# that, a re-deploy after changing the cadence/function/role would silently
+# leave an old schedule invoking the wrong target or staying disabled.
+SCHEDULE_TIMEZONE="UTC"
+SCHEDULE_FLEXIBLE_TIME_WINDOW='{"Mode":"OFF"}'
+SCHEDULE_STATE="ENABLED"
+SCHEDULE_TARGET_INPUT='{}'
 
 IAM_DIR="${SCRIPT_DIR}/iam"
 LAMBDA_SRC_DIR="${SCRIPT_DIR}/../lambda/max-lifetime-stop"
@@ -222,22 +231,52 @@ create_classic_eventbridge_rule() {
     --targets "Id=1,Arn=${FUNCTION_ARN}"
 }
 
+reconcile_eventbridge_scheduler_schedule() {
+  # EventBridge Scheduler's update API is a full reconciliation operation, not
+  # a partial patch: expression, timezone, flexible window, target (including
+  # its input), and enabled state are all supplied on every update. Keeping the
+  # desired target JSON in one place prevents an existing schedule from drifting
+  # away from the create path on a later deployment.
+  local scheduler_target
+  scheduler_target="{\"Arn\":\"${FUNCTION_ARN}\",\"RoleArn\":\"${SCHEDULER_ROLE_ARN}\",\"Input\":\"${SCHEDULE_TARGET_INPUT}\"}"
+
+  echo "    aws scheduler create-schedule --region ${AWS_REGION} --name ${SCHEDULE_NAME} ..."
+  if run_idempotent "ConflictException|already exists" aws scheduler create-schedule \
+        --region "$AWS_REGION" \
+        --name "$SCHEDULE_NAME" \
+        --schedule-expression "$SCHEDULE_EXPRESSION" \
+        --schedule-expression-timezone "$SCHEDULE_TIMEZONE" \
+        --flexible-time-window "$SCHEDULE_FLEXIBLE_TIME_WINDOW" \
+        --target "$scheduler_target" \
+        --state "$SCHEDULE_STATE"; then
+    echo "    Created schedule ${SCHEDULE_NAME}."
+    return
+  fi
+
+  # run_idempotent only returns nonzero for a recognized idempotency conflict;
+  # all other failures exit the script after printing stderr. Reconcile the
+  # existing schedule instead of preserving a possibly stale target/cadence.
+  echo "    NOTE: schedule ${SCHEDULE_NAME} already exists; reconciling its desired state."
+  echo "    aws scheduler update-schedule --region ${AWS_REGION} --name ${SCHEDULE_NAME} ..."
+  aws scheduler update-schedule \
+    --region "$AWS_REGION" \
+    --name "$SCHEDULE_NAME" \
+    --schedule-expression "$SCHEDULE_EXPRESSION" \
+    --schedule-expression-timezone "$SCHEDULE_TIMEZONE" \
+    --flexible-time-window "$SCHEDULE_FLEXIBLE_TIME_WINDOW" \
+    --target "$scheduler_target" \
+    --state "$SCHEDULE_STATE"
+  echo "    Reconciled existing schedule ${SCHEDULE_NAME}."
+}
+
 echo "==> [5/5] Creating the invocation schedule (${SCHEDULE_EXPRESSION})"
 if aws scheduler create-schedule --help >/dev/null 2>&1; then
   echo "    Using EventBridge Scheduler."
-  echo "    aws scheduler create-schedule --region ${AWS_REGION} --name ${SCHEDULE_NAME} ..."
   # EventBridge Scheduler needs a role it can assume to invoke the Lambda.
   # Reuse the same lambda role's ARN only if it trusts scheduler; otherwise the
   # operator should supply SCHEDULER_ROLE_ARN. We note this rather than guess.
   if [[ -n "${SCHEDULER_ROLE_ARN:-}" ]]; then
-    if ! run_idempotent "ConflictException|already exists" aws scheduler create-schedule \
-          --region "$AWS_REGION" \
-          --name "$SCHEDULE_NAME" \
-          --schedule-expression "$SCHEDULE_EXPRESSION" \
-          --flexible-time-window '{"Mode":"OFF"}' \
-          --target "{\"Arn\":\"${FUNCTION_ARN}\",\"RoleArn\":\"${SCHEDULER_ROLE_ARN}\"}"; then
-      echo "    NOTE: schedule ${SCHEDULE_NAME} already exists; leaving as-is."
-    fi
+    reconcile_eventbridge_scheduler_schedule
   else
     echo "    NOTE: SCHEDULER_ROLE_ARN not set. EventBridge Scheduler needs an"
     echo "          invoke role. Falling back to a classic CloudWatch Events rule,"

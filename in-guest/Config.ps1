@@ -1219,6 +1219,77 @@ function Test-FileUnlocked {
     }
 }
 
+function Get-TopazOutputFiles {
+    <#
+    .SYNOPSIS
+        Strict recursive snapshot of an output directory's files.
+    .DESCRIPTION
+        The stop path must distinguish an empty OutputDir from one that could
+        not be read. `Get-ChildItem -ErrorAction SilentlyContinue` returns a
+        partial list after an access or I/O error, which can make an incomplete
+        upload/check look complete and lose files when instance-store storage is
+        stopped. This one helper is the only recursive OutputDir enumerator used
+        by the watchdog and upload paths: it either returns the complete
+        snapshot, or throws so the caller can fail closed.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container -ErrorAction Stop)) {
+        throw "Output directory '$Path' does not exist or is not a directory."
+    }
+
+    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction Stop
+}
+
+function Get-TopazStopSequenceExecutionTimeLimit {
+    <#
+    .SYNOPSIS
+        Worst-case scheduled-task runtime for one Stop-Sequence invocation.
+    .DESCRIPTION
+        Register-TimedStop.ps1 must not kill its own bounded upload before the
+        stop action runs. This derives the task limit from the same configured
+        operation timeouts Stop-Sequence actually uses: optional S3 sync, the
+        final upload and (when a recovery candidate exists) one recovery upload,
+        each with two rclone copy/check attempts and one retry delay, the one
+        completed-stop final rclone check, completed-render recovery scan and
+        bounded forensic capture, optional SNS, every action in the resolved
+        stop plan, and a five-minute process/setup margin. It intentionally
+        describes one invocation, not the task's repeating lifetime.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $seconds = [int64]300 # setup/teardown margin; all bounded operations below are explicit.
+
+    if (-not [string]::IsNullOrWhiteSpace($Config.S3SyncTarget)) {
+        $seconds += [int64]$Config.S3SyncTimeoutSec
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Config.UploadTarget)) {
+        # A final upload may be followed by one recovery upload. Each permits
+        # two attempts with separately bounded copy AND check invocations.
+        $seconds += ([int64]$Config.UploadTimeoutSec * 8) + ([int64]$Config.UploadRetryDelaySec * 2)
+        # Completed stops also perform one final check-only verification after
+        # the long upload work. Timed maxlifetime stops skip it, but this
+        # generic bound remains safe for every Stop-Sequence reason.
+        $seconds += [int64]$Config.UploadTimeoutSec
+    }
+    # Only a completed stop runs this path, but a scheduled-task limit must be
+    # safe for every Stop-Sequence reason. Recovery upload is one batch, not
+    # one timeout budget per candidate; its rclone call receives all candidates
+    # in a single include list.
+    $seconds += [int64]$Config.RecoveryScanTimeoutSec
+    $seconds += [int64]$Config.TopazForensicTimeoutSec
+    if (-not [string]::IsNullOrWhiteSpace($Config.SnsTopicArn)) {
+        $seconds += [int64]$Config.AwsCliTimeoutSec
+    }
+
+    $plan = Resolve-StopPlan -Strategy $Config.StopStrategy
+    if ($plan -contains 'Ec2ApiStop') { $seconds += [int64]$Config.AwsCliTimeoutSec }
+    $seconds += ([int64]$plan.Count * [int64]$Config.StopVerifySec)
+    return New-TimeSpan -Seconds $seconds
+}
+
 function Build-AwsCliArgs {
     <#
     .SYNOPSIS
@@ -1831,6 +1902,9 @@ function Find-RenderRecoveryCandidates {
             catch {
                 # One unreadable directory (permissions, a transient handle)
                 # should not sink the whole scan -- skip it and keep going.
+                # It DOES mean the result cannot honestly be described as a
+                # complete scan with no candidates, however.
+                $result.ScanFailed = $true
                 continue
             }
 
@@ -2159,8 +2233,8 @@ function Invoke-TopazIncrementalUpload {
     .DESCRIPTION
         REUSES THE SAME rclone copy + check PLUMBING AS THE OTHER TWO UPLOAD
         PATHS in this file (Invoke-TopazRenderUpload, Invoke-TopazRecoveryUpload),
-        scoped down with a single `--include` to exactly this file's path
-        relative to OutputDir. Source/destination are OutputDir ->
+        but uses literal file-to-file `copyto` / `check` arguments rather than
+        a glob-style `--include`. Source/destination are OutputDir ->
         UploadTarget -- the SAME pair the final Stop-Sequence.ps1 sweep uses
         (unlike Invoke-TopazRecoveryUpload's distinct ".../recovered"
         destination for files found OUTSIDE OutputDir) -- so that when the
@@ -2224,17 +2298,20 @@ function Invoke-TopazIncrementalUpload {
 
     # Path relative to OutputDir (not the volume root -- contrast
     # Invoke-TopazRecoveryUpload, whose candidates can live anywhere under the
-    # root). Forward slashes: rclone's --include matches POSIX-style paths
-    # regardless of the host OS.
+    # root). copyto/check receive this as a literal destination file path, not
+    # a --include filter: rclone filters are glob patterns, so a legitimate
+    # output name containing '[', '*', or '?' could otherwise select a different
+    # file and still get marked as uploaded.
     $outputRoot = $cfg.OutputDir.TrimEnd('\')
     $rel = $File.FullName.Substring($outputRoot.Length).TrimStart('\').Replace('\', '/')
+    $destination = "$($cfg.UploadTarget.TrimEnd('/'))/$rel"
 
     $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
     $common = @('--config', $cfg.RcloneConfigPath, '--log-file', $rcloneLog, '--log-level', 'INFO')
     $tuning = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
 
-    $copyArgs  = @('copy', $cfg.OutputDir, $cfg.UploadTarget) + $common + $tuning + @('--include', $rel)
-    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way', '--include', $rel)
+    $copyArgs  = @('copyto', $File.FullName, $destination) + $common + $tuning
+    $checkArgs = @('check', $File.FullName, $destination) + $common + @('--one-way')
 
     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
         -Message "Incremental upload: '$($File.FullName)' ($($File.Length) bytes) looks finished (unlocked + size-stable for $($cfg.UploadStableSec)s) -- uploading now instead of waiting for the whole queue to complete (CORRECTION 3)."
@@ -2528,7 +2605,14 @@ function Invoke-TopazRenderUpload {
         return $false
     }
 
-    $files = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+    try {
+        $files = @(Get-TopazOutputFiles -Path $cfg.OutputDir)
+    }
+    catch {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "Could not enumerate every file under OutputDir '$($cfg.OutputDir)': $($_.Exception.Message). Refusing to treat a partial listing as uploadable."
+        return $false
+    }
     $outputDirHasFiles = $files.Count -gt 0
 
     if (-not $outputDirHasFiles) {
@@ -2644,6 +2728,178 @@ function Invoke-TopazRenderUpload {
     # Resolve-OutputAnomalyClass's own comment for the live counter-example).
     # Always returns $true; cannot turn this success back into a refusal.
     [void] (Invoke-TopazOutputAnomalyHandling -Config $cfg -Reason $Reason -OutputDirHasFiles $true)
+
+    return $true
+}
+
+function Test-TopazOutputManifestUnchanged {
+    <#
+    .SYNOPSIS
+        Pure: verifies file identity snapshots have the same paths, sizes, and write times.
+    .DESCRIPTION
+        The completed-stop safety gate takes a strict snapshot before its final
+        rclone check and another after it. A filename alone cannot prove the
+        checked bytes are still current: an in-place rewrite can retain the
+        same path, and a same-size rewrite can retain the same length. The
+        LastWriteTimeUtc comparison closes both cases without hashing the
+        source a second time.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Before,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$After
+    )
+
+    try {
+        if ($Before.Count -ne $After.Count) { return $false }
+
+        $beforeByPath = @{}
+        foreach ($file in $Before) {
+            if ($null -eq $file -or [string]::IsNullOrWhiteSpace($file.FullName) -or
+                $null -eq $file.Length -or $null -eq $file.LastWriteTimeUtc -or
+                $beforeByPath.ContainsKey($file.FullName)) {
+                return $false
+            }
+            $beforeByPath[$file.FullName] = "$([int64]$file.Length)|$(([datetime]$file.LastWriteTimeUtc).Ticks)"
+        }
+
+        foreach ($file in $After) {
+            if ($null -eq $file -or -not $beforeByPath.ContainsKey($file.FullName) -or
+                $null -eq $file.Length -or $null -eq $file.LastWriteTimeUtc) {
+                return $false
+            }
+            $identity = "$([int64]$file.Length)|$(([datetime]$file.LastWriteTimeUtc).Ticks)"
+            if ($beforeByPath[$file.FullName] -ne $identity) { return $false }
+        }
+        return $true
+    }
+    catch {
+        # A malformed manifest must never be interpreted as unchanged.
+        return $false
+    }
+}
+
+function Test-TopazCompletedStopSafetyGate {
+    <#
+    .SYNOPSIS
+        Final fail-closed interlock immediately before a completed stop.
+    .DESCRIPTION
+        A long final upload can finish after the watchdog's handoff snapshot,
+        while an operator queues another render or a new file appears. This
+        gate checks the conservative, stateless worker signal and (for
+        ephemeral output) verifies every file is unlocked before one final
+        rclone `check --one-way`. It repeats both checks after rclone finishes
+        and compares strict pre/post manifests, because that check can itself
+        run for hours. It never copies: a changed or newly created source file
+        must refuse the stop and return control to the watchdog, rather than
+        extending this last race window with another multi-hour transfer.
+
+        The caller runs this only for Reason='completed'. Stalled and timed
+        hard-stop paths have deliberately different semantics and must retain
+        their existing bounded stop behavior.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object.
+    .OUTPUTS
+        [bool] $true only when the final state is safe to proceed. A worker
+        query failure is deliberately $false (unknown is not idle).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $cfg = $Config
+    function Test-WorkerIdle {
+        param([Parameter(Mandatory)][string]$Phase)
+        $workerPresent = Test-RenderWorkerPresent -WorkerNamesLike $cfg.WorkerNamesLike
+        if ($null -eq $workerPresent) {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): encoder-worker presence could not be queried. Unknown is not safe to stop; watchdog will re-arm."
+            return $false
+        }
+        if ($workerPresent) {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): an encoder worker is present. A new or resumed render may be active; watchdog will re-arm."
+            return $false
+        }
+        return $true
+    }
+
+    function Get-UnlockedOutputSnapshot {
+        param([Parameter(Mandatory)][string]$Phase)
+        try {
+            $files = @(Get-TopazOutputFiles -Path $cfg.OutputDir)
+        }
+        catch {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): could not enumerate every OutputDir file: $($_.Exception.Message)"
+            return [pscustomobject]@{ Safe = $false; Files = @() }
+        }
+
+        $locked = @($files | Where-Object { -not (Test-FileUnlocked -Path $_.FullName) })
+        if ($locked.Count -gt 0) {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): $($locked.Count) OutputDir file(s) are still locked: $($locked.FullName -join ', ')."
+            return [pscustomobject]@{ Safe = $false; Files = @() }
+        }
+        return [pscustomobject]@{ Safe = $true; Files = $files }
+    }
+
+    if (-not (Test-WorkerIdle -Phase 'before final rclone check')) {
+        return $false
+    }
+
+    $beforeSnapshot = $null
+    if ($cfg.OutputIsEphemeral) {
+        $beforeSnapshot = Get-UnlockedOutputSnapshot -Phase 'before final rclone check'
+        if (-not $beforeSnapshot.Safe) { return $false }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($cfg.UploadTarget)) {
+        if ($cfg.OutputIsEphemeral) {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message 'FINAL COMPLETION SAFETY GATE REFUSED: OutputDir is ephemeral but no UploadTarget exists for a final remote consistency check.'
+            return $false
+        }
+        # Persistent local output is an allowed no-upload configuration. The
+        # worker gate above still protects against a live render, but there is
+        # no remote destination against which a check could be meaningful.
+        Write-TopazLog -Component 'stop' -Level 'INFO' `
+            -Message 'FINAL COMPLETION SAFETY GATE: no UploadTarget is configured; remote consistency check is not applicable.'
+        return $true
+    }
+
+    if (-not (Test-Path -LiteralPath $cfg.RclonePath) -or -not (Test-Path -LiteralPath $cfg.RcloneConfigPath)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message 'FINAL COMPLETION SAFETY GATE REFUSED: rclone or its config is unavailable for the required final verification.'
+        return $false
+    }
+
+    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
+    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget,
+        '--config', $cfg.RcloneConfigPath,
+        '--log-file', $rcloneLog,
+        '--log-level', 'INFO',
+        '--one-way')
+
+    $checkOk = [bool](Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
+        -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `
+        -SuccessMessage "FINAL COMPLETION SAFETY GATE: rclone check verified the current OutputDir against '$($cfg.UploadTarget)'." `
+        -FailureVerb 'FINAL COMPLETION SAFETY GATE rclone check' `
+        -FailureContext "source=$($cfg.OutputDir), target=$($cfg.UploadTarget); refusing to stop so watchdog can re-arm.")
+    if (-not $checkOk) { return $false }
+
+    if (-not (Test-WorkerIdle -Phase 'after final rclone check')) {
+        return $false
+    }
+
+    if ($cfg.OutputIsEphemeral) {
+        $afterSnapshot = Get-UnlockedOutputSnapshot -Phase 'after final rclone check'
+        if (-not $afterSnapshot.Safe) { return $false }
+        if (-not (Test-TopazOutputManifestUnchanged -Before $beforeSnapshot.Files -After $afterSnapshot.Files)) {
+            Write-TopazLog -Component 'stop' -Level 'ERROR' `
+                -Message 'FINAL COMPLETION SAFETY GATE REFUSED: OutputDir changed while the final rclone check ran. Watchdog will re-arm rather than stop with unchecked output.'
+            return $false
+        }
+    }
 
     return $true
 }

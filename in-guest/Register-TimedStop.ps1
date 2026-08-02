@@ -171,15 +171,18 @@ $principalObj = New-ScheduledTaskPrincipal `
 
 # StartWhenAvailable matters: if the box happens to be asleep/busy at the
 # scheduled moment, we still want the stop to run as soon as it can rather
-# than being skipped outright. ExecutionTimeLimit is generous because
-# Stop-Sequence may spend StopVerifySec waiting for the API stop to land, and
-# may also be running an S3 sync first.
+# than being skipped outright. ExecutionTimeLimit is derived from every
+# bounded operation in Stop-Sequence -- especially the default four-hour
+# upload/check attempts and completed-stop final verification -- so Task
+# Scheduler cannot kill a legitimate transfer before the stop action is
+# reached.
+$executionTimeLimit = Get-TopazStopSequenceExecutionTimeLimit -Config $cfg
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    -ExecutionTimeLimit $executionTimeLimit
 
 try {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -226,6 +229,7 @@ try {
     Write-Output "  Retries     : every $RetryIntervalMinutes min if the stop is REFUSED"
     Write-Output "                (the upload interlock can refuse it; see stop.log)"
     Write-Output "  Action      : Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun"
+    Write-Output "  Max runtime : $executionTimeLimit per invocation (derived from configured sync/upload/stop bounds)"
     Write-Output "  StopStrategy: $($cfg.StopStrategy)  (plan: $((Resolve-StopPlan -Strategy $cfg.StopStrategy) -join ' -> '))"
     Write-Output ""
     Write-Output "  Cancel with :  .\Register-TimedStop.ps1 -Cancel"

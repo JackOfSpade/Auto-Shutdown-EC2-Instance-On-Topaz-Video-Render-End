@@ -431,8 +431,10 @@ function Get-WorkerIoBytes {
 function Get-OutputBytes {
     <#
     .SYNOPSIS
-        Total size (bytes) of all files under $Path, recursive. Returns 0 if
-        the folder is missing or empty.
+        Total size (bytes) of all files under $Path, recursive. Returns 0 for
+        a successfully-read empty folder, or $null when the folder cannot be
+        enumerated. Callers must preserve state on $null: partial enumeration
+        is not evidence of either progress or a stall.
     .PARAMETER Path
         Defaults to the configured OutputDir; overridable so this is
         independently unit-testable against a throwaway test directory with
@@ -440,11 +442,16 @@ function Get-OutputBytes {
     #>
     param([string]$Path = $cfg.OutputDir)
 
-    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    try {
+        $files = @(Get-TopazOutputFiles -Path $Path)
+    }
+    catch {
+        Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+            -Message "Could not enumerate OutputDir '$Path' for the progress signal: $($_.Exception.Message). Freezing byte-based stall bookkeeping this poll."
+        return $null
+    }
 
-    $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File `
-                -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
+    $sum = ($files | Measure-Object -Property Length -Sum).Sum
 
     if ($null -eq $sum) { return [int64]0 }
     return [int64]$sum
@@ -575,7 +582,7 @@ function Get-NextWatchdogState {
         [Parameter(Mandatory)][bool]$SawActivity,
         [int]$ActiveSec = 0,
         [int]$ArmSec = 0,
-        [Parameter(Mandatory)][int64]$LastBytes,
+        [AllowNull()]$LastBytes,
         [AllowNull()]$Active,
         [AllowNull()]$CurrentBytes,
         [AllowNull()]$LastIoBytes,
@@ -634,7 +641,9 @@ function Get-NextWatchdogState {
         # and a healthy next job growing back up from that lower base could
         # then sit under the old high-water mark for the whole StallSec
         # window and get killed as "stalled" mid-render.
-        $bytesProgressed = ($CurrentBytes -ne $LastBytes)
+        $bytesProgressed = ($null -ne $CurrentBytes) -and
+                           ($null -ne $LastBytes) -and
+                           ($CurrentBytes -ne $LastBytes)
 
         # The workers' cumulative I/O counters moved -> also healthy, and far
         # more reliable than the byte count above (see the CurrentIoBytes
@@ -651,6 +660,36 @@ function Get-NextWatchdogState {
         # single unreadable poll does not erase the baseline and manufacture
         # a false delta on the next one.
         $newIoBytes = if ($null -ne $CurrentIoBytes) { $CurrentIoBytes } else { $LastIoBytes }
+        $newBytes   = if ($null -ne $CurrentBytes) { $CurrentBytes } else { $LastBytes }
+
+        # A failed OutputDir enumeration is unknown, not an empty or unchanged
+        # folder. It must neither reset nor accrue the stall timer. A known
+        # worker-I/O delta still proves progress and is safe to use on its own.
+        if (($null -eq $CurrentBytes) -or ($null -eq $LastBytes)) {
+            if ($ioProgressed) {
+                return [pscustomobject]@{
+                    IdleSec      = $newIdleSec
+                    StallSec     = 0
+                    SawActivity  = $newSawActivity
+                    ActiveSec    = $newActiveSec
+                    LastBytes    = $newBytes
+                    LastIoBytes  = $newIoBytes
+                    BytesChanged = $true
+                    Verdict      = 'continue'
+                }
+            }
+
+            return [pscustomobject]@{
+                IdleSec      = $newIdleSec
+                StallSec     = $StallSec
+                SawActivity  = $newSawActivity
+                ActiveSec    = $newActiveSec
+                LastBytes    = $newBytes
+                LastIoBytes  = $newIoBytes
+                BytesChanged = $false
+                Verdict      = 'continue'
+            }
+        }
 
         if ($bytesProgressed -or $ioProgressed) {
             return [pscustomobject]@{
@@ -658,7 +697,7 @@ function Get-NextWatchdogState {
                 StallSec     = 0
                 SawActivity  = $newSawActivity
                 ActiveSec    = $newActiveSec
-                LastBytes    = $CurrentBytes
+                LastBytes    = $newBytes
                 LastIoBytes  = $newIoBytes
                 BytesChanged = $true
                 Verdict      = 'continue'
@@ -674,7 +713,7 @@ function Get-NextWatchdogState {
             StallSec     = $newStallSec
             SawActivity  = $newSawActivity
             ActiveSec    = $newActiveSec
-            LastBytes    = $LastBytes
+            LastBytes    = $newBytes
             LastIoBytes  = $newIoBytes
             BytesChanged = $false
             Verdict      = $verdict
@@ -1021,9 +1060,7 @@ function Invoke-TopazIncrementalUploadPoll {
     if ([string]::IsNullOrWhiteSpace($cfg.UploadTarget)) { return }
 
     try {
-        if (-not (Test-Path -LiteralPath $cfg.OutputDir)) { return }
-
-        $files    = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+        $files    = @(Get-TopazOutputFiles -Path $cfg.OutputDir)
         $seenKeys = @{}
 
         foreach ($f in $files) {
@@ -1474,7 +1511,12 @@ if ($MyInvocation.InvocationName -ne '.') {
             $lastIoBytes = $state.LastIoBytes
 
             if ($active) {
-                if (-not $state.BytesChanged) {
+                if ($null -eq $currentBytes -and -not $state.BytesChanged) {
+                    Write-TopazLog -Component 'watchdog' -Level 'WARN' `
+                        -Message "Render active (worker=$workerText gpu=$gpuText), but OutputDir could not be enumerated. Freezing byte-based stall bookkeeping this poll (workerIoBytes=$ioText)."
+                    $silentSec = 0
+                }
+                elseif (-not $state.BytesChanged) {
                     # Active but byte count unchanged -> accruing stall time (a
                     # healthy byte-delta reset logs nothing, same as before).
                     $armText = if ($sawActivity) { 'armed' } else { "arming ${activeSec}s/$($cfg.ArmSec)s" }
@@ -1559,19 +1601,23 @@ if ($MyInvocation.InvocationName -ne '.') {
             -Message "Reason='$reason'. Waiting up to $($cfg.UnlockTimeoutMin) min for output files to unlock."
 
         $deadline = (Get-Date).AddMinutes($cfg.UnlockTimeoutMin)
+        $preStopRefusalReason = $null
 
         while ($true) {
             $locked = @()
 
-            if (Test-Path -LiteralPath $cfg.OutputDir) {
-                $candidates = Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File `
-                    -ErrorAction SilentlyContinue |
+            try {
+                $candidates = @(Get-TopazOutputFiles -Path $cfg.OutputDir) |
                     Where-Object { -not (Test-TopazTempFile -Name $_.Name -TempMarker $cfg.TempMarker) }
+            }
+            catch {
+                $preStopRefusalReason = "could not enumerate every OutputDir file for the unlock gate: $($_.Exception.Message)"
+                break
+            }
 
-                foreach ($f in $candidates) {
-                    if (-not (Test-FileUnlocked -Path $f.FullName)) {
-                        $locked += $f.FullName
-                    }
+            foreach ($f in $candidates) {
+                if (-not (Test-FileUnlocked -Path $f.FullName)) {
+                    $locked += $f.FullName
                 }
             }
 
@@ -1583,11 +1629,28 @@ if ($MyInvocation.InvocationName -ne '.') {
 
             if ((Get-Date) -ge $deadline) {
                 Write-TopazLog -Component 'watchdog' -Level 'WARN' `
-                    -Message "Unlock wait timed out after $($cfg.UnlockTimeoutMin) min. Still locked: $($locked -join ', '). Proceeding with stop anyway."
+                    -Message "Unlock wait timed out after $($cfg.UnlockTimeoutMin) min. Still locked: $($locked -join ', ')."
+                if ($cfg.OutputIsEphemeral) {
+                    $preStopRefusalReason = 'output files remained locked at the unlock deadline on ephemeral storage'
+                }
                 break
             }
 
             Start-Sleep -Seconds $cfg.UnlockPollSec
+        }
+
+        if ($preStopRefusalReason) {
+            Write-TopazLog -Component 'watchdog' -Level 'ERROR' `
+                -Message "REFUSING TO STOP: $preStopRefusalReason. The instance stays up and monitoring re-arms rather than risk erasing unreadable or still-writing output."
+
+            $stallSec = Resolve-RefusalStallSec -Reason $reason `
+                -StallLimitSec $cfg.StallSec -DebounceSec $cfg.DebounceSec
+            $idleSec     = 0
+            $sawActivity = $true
+            $activeSec   = $cfg.ArmSec
+            $lastBytes   = Get-OutputBytes
+            $lastIoBytes = $null
+            continue outer
         }
 
         # ---------------------------------------------------------------------------
@@ -1616,7 +1679,22 @@ if ($MyInvocation.InvocationName -ne '.') {
         #     worth one extra line here.
         # ---------------------------------------------------------------------------
 
-        $handoffFiles    = @(Get-ChildItem -LiteralPath $cfg.OutputDir -Recurse -File -ErrorAction SilentlyContinue)
+        try {
+            $handoffFiles = @(Get-TopazOutputFiles -Path $cfg.OutputDir)
+        }
+        catch {
+            Write-TopazLog -Component 'watchdog' -Level 'ERROR' `
+                -Message "REFUSING TO STOP: could not enumerate every OutputDir file for the handoff snapshot: $($_.Exception.Message). The instance stays up and monitoring re-arms rather than claim a partial listing is final."
+
+            $stallSec = Resolve-RefusalStallSec -Reason $reason `
+                -StallLimitSec $cfg.StallSec -DebounceSec $cfg.DebounceSec
+            $idleSec     = 0
+            $sawActivity = $true
+            $activeSec   = $cfg.ArmSec
+            $lastBytes   = Get-OutputBytes
+            $lastIoBytes = $null
+            continue outer
+        }
         $handoffBytesSum = ($handoffFiles | Measure-Object -Property Length -Sum).Sum
         $handoffBytes    = if ($null -eq $handoffBytesSum) { [int64]0 } else { [int64]$handoffBytesSum }
 

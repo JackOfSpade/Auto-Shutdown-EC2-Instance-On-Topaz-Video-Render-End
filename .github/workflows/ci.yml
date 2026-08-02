@@ -31,6 +31,9 @@ jobs:
         # directory by a concurrent change; this step targets that fixed path deliberately.
         run: bash tests/test_control_plane_validation.sh
 
+      - name: Run max-lifetime deployment scheduler tests
+        run: bash tests/test_deploy_max_lifetime_scheduler.sh
+
       - name: Run actionlint
         # The shellcheck step above only globs standalone *.sh files — it never sees the bash embedded
         # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
@@ -54,11 +57,23 @@ jobs:
       - name: Install PSScriptAnalyzer + Pester
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
-          Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          # Versions are intentional: PSScriptAnalyzer 1.25.0 is the reviewed
+          # version used to establish the warning allowlist below. Pester 5.7.1
+          # is the reviewed v5 runner required by this suite's CI interface.
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
 
       - name: Run PSScriptAnalyzer (Error/ParseError + non-allowlisted Warnings fail the build)
         run: |
+          # Install-Module alone does not control module auto-loading when the
+          # runner also has another version available. Import and assert the
+          # exact reviewed analyzer before evaluating its diagnostics.
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force
+          $analyzerVersion = (Get-Module -Name PSScriptAnalyzer).Version.ToString()
+          if ($analyzerVersion -ne '1.25.0') {
+              throw "Expected PSScriptAnalyzer 1.25.0, but loaded $analyzerVersion."
+          }
+
           # This gate must catch real correctness/best-practice issues, not just parse errors, so
           # Warning severity fails the build too UNLESS the rule is explicitly allowlisted below.
           # Only add a rule here when the in-guest tree triggers it because of a DELIBERATE design
@@ -93,9 +108,13 @@ jobs:
 
       - name: Run Pester tests
         run: |
-          # Force Pester 5 explicitly: some runners ship the legacy Pester 3.4
-          # which would otherwise auto-load first and reject the v5 -CI syntax.
-          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          # Force the reviewed Pester 5.7.1: runners can ship legacy Pester 3.4,
+          # while PSGallery can publish a newer incompatible major release.
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
+          $pesterVersion = (Get-Module -Name Pester).Version.ToString()
+          if ($pesterVersion -ne '5.7.1') {
+              throw "Expected Pester 5.7.1, but loaded $pesterVersion."
+          }
           Invoke-Pester -Path in-guest/tests -CI
 
   python-lambda:
@@ -111,10 +130,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install ruff pytest boto3
+        run: python -m pip install -r lambda/max-lifetime-stop/requirements-dev.txt
 
       - name: Run ruff
-        run: ruff check lambda/
+        run: python -m ruff check lambda/
 
       - name: Run pytest
-        run: pytest lambda/ -q
+        run: python -m pytest lambda/ -q

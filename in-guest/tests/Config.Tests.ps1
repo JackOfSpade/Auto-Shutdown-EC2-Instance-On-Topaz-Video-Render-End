@@ -1934,6 +1934,179 @@ Describe 'Invoke-TopazRenderUpload (upload retry loop + unconditional anomaly-sc
             Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
         }
     }
+
+    Context 'OutputDir enumeration failure is fail-closed' {
+        It 'returns $false, logs an error, and never invokes rclone rather than uploading a partial listing' {
+            Mock Get-ChildItem { throw 'simulated access failure' }
+            Mock Invoke-TopazAwsCli { throw 'rclone must not run after enumeration failure' }
+
+            $cfg = Get-UploadTestConfig
+            $result = Invoke-TopazRenderUpload -Config $cfg -Reason 'completed'
+
+            $result | Should -Be $false
+            Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'ERROR' -and $Message -match 'Could not enumerate every file'
+            }
+        }
+    }
+}
+
+Describe 'Test-TopazCompletedStopSafetyGate' {
+    BeforeAll {
+        function Get-FinalSafetyGateTestConfig {
+            param(
+                [bool]$OutputIsEphemeral = $true,
+                [string]$UploadTarget = 'gdrive:temp'
+            )
+            [pscustomobject]@{
+                WorkerNamesLike   = @('neuroserver.exe', 'ffmpeg.exe')
+                OutputIsEphemeral = $OutputIsEphemeral
+                OutputDir         = 'D:\Renders'
+                UploadTarget      = $UploadTarget
+                RclonePath        = 'C:\fake\rclone.exe'
+                RcloneConfigPath  = 'C:\fake\rclone.conf'
+                LogDir            = 'C:\fake\logs'
+                UploadTimeoutSec  = 14400
+            }
+        }
+
+        function Get-FinalSafetyGateTestFile {
+            [pscustomobject]@{
+                FullName = 'D:\Renders\out.mov'
+                Name = 'out.mov'
+                Length = 123
+                LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
+            }
+        }
+    }
+
+    BeforeEach {
+        Mock Write-TopazLog { }
+        Mock Test-Path { $true }
+        Mock Test-RenderWorkerPresent { $false }
+        Mock Test-FileUnlocked { $true }
+        Mock Get-TopazOutputFiles { return @(Get-FinalSafetyGateTestFile) }
+        Mock Invoke-TopazAwsCli { return $true }
+    }
+
+    It 'refuses a present encoder worker without enumerating or invoking rclone' {
+        Mock Test-RenderWorkerPresent { $true }
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+
+        Should -Invoke Get-TopazOutputFiles -Times 0 -Exactly
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+
+    It 'refuses an unknown encoder-worker query without enumerating or invoking rclone' {
+        Mock Test-RenderWorkerPresent { $null }
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+
+        Should -Invoke Get-TopazOutputFiles -Times 0 -Exactly
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+
+    It 'on ephemeral storage refuses a strict-enumeration failure without checking a potentially partial set' {
+        Mock Get-TopazOutputFiles { throw 'simulated access failure' }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+
+    It 'on ephemeral storage refuses when any final OutputDir file remains locked' {
+        Mock Test-FileUnlocked { $false }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+
+    It 'runs exactly one final check -- never a copy -- after worker and unlock gates pass' {
+        $script:FinalGateArgs = $null
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:FinalGateArgs = $Arguments
+            return $true
+        }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $true
+
+        $script:FinalGateArgs[0] | Should -Be 'check'
+        $script:FinalGateArgs | Should -Contain '--one-way'
+        $script:FinalGateArgs | Should -Not -Contain 'copy'
+        Should -Invoke Invoke-TopazAwsCli -Times 1 -Exactly
+    }
+
+    It 'refuses when the final rclone check reports a changed or missing source file' {
+        Mock Invoke-TopazAwsCli { return $false }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+    }
+
+    It 'rechecks worker presence after the long rclone check and refuses a newly active or unreadable worker signal' {
+        $script:WorkerChecks = 0
+        Mock Test-RenderWorkerPresent {
+            $script:WorkerChecks++
+            if ($script:WorkerChecks -eq 1) { return $false }
+            return $true
+        }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+        Should -Invoke Invoke-TopazAwsCli -Times 1 -Exactly
+        Should -Invoke Get-TopazOutputFiles -Times 1 -Exactly
+    }
+
+    It 'refuses if the strict post-check manifest differs from the pre-check snapshot' {
+        $script:SnapshotCalls = 0
+        Mock Get-TopazOutputFiles {
+            $script:SnapshotCalls++
+            if ($script:SnapshotCalls -eq 1) { return @(Get-FinalSafetyGateTestFile) }
+            return @([pscustomobject]@{
+                FullName = 'D:\Renders\out.mov'
+                Name = 'out.mov'
+                Length = 124
+                LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
+            })
+        }
+
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig) | Should -Be $false
+        Should -Invoke Invoke-TopazAwsCli -Times 1 -Exactly
+        Should -Invoke Get-TopazOutputFiles -Times 2 -Exactly
+    }
+
+    It 'keeps a persistent no-upload configuration valid after the worker gate, because no remote destination exists to check' {
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig -OutputIsEphemeral $false -UploadTarget '') | Should -Be $true
+
+        Should -Invoke Get-TopazOutputFiles -Times 0 -Exactly
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+
+    It 'refuses an ephemeral no-upload configuration even when called outside Stop-Sequence''s earlier interlock' {
+        Test-TopazCompletedStopSafetyGate -Config (Get-FinalSafetyGateTestConfig -OutputIsEphemeral $true -UploadTarget '') | Should -Be $false
+
+        Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+    }
+}
+
+Describe 'Test-TopazOutputManifestUnchanged' {
+    It 'accepts matching path, length, and UTC write-time identities regardless of enumeration order' {
+        $first = [pscustomobject]@{ FullName = 'D:\Renders\a.mov'; Length = 100; LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z' }
+        $second = [pscustomobject]@{ FullName = 'D:\Renders\b.mov'; Length = 200; LastWriteTimeUtc = [datetime]'2026-07-28T10:01:00Z' }
+
+        Test-TopazOutputManifestUnchanged -Before @($first, $second) -After @($second, $first) | Should -Be $true
+    }
+
+    It 'refuses additions, size changes, and same-size write-time changes' {
+        $before = [pscustomobject]@{ FullName = 'D:\Renders\a.mov'; Length = 100; LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z' }
+        $samePathNewSize = [pscustomobject]@{ FullName = 'D:\Renders\a.mov'; Length = 101; LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z' }
+        $sameSizeNewTime = [pscustomobject]@{ FullName = 'D:\Renders\a.mov'; Length = 100; LastWriteTimeUtc = [datetime]'2026-07-28T10:00:01Z' }
+        $added = [pscustomobject]@{ FullName = 'D:\Renders\b.mov'; Length = 1; LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z' }
+
+        Test-TopazOutputManifestUnchanged -Before @($before) -After @($samePathNewSize) | Should -Be $false
+        Test-TopazOutputManifestUnchanged -Before @($before) -After @($sameSizeNewTime) | Should -Be $false
+        Test-TopazOutputManifestUnchanged -Before @($before) -After @($before, $added) | Should -Be $false
+    }
 }
 
 Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS A)' {
@@ -2388,7 +2561,7 @@ Describe 'Invoke-TopazIncrementalUpload (CORRECTION 3 -- upload each render as i
         }
         $cfg = Get-IncrementalTestConfig
         Invoke-TopazIncrementalUpload -Config $cfg -File $script:File | Should -Be $true
-        $script:CallSeq | Should -Be @('copy', 'check')
+        $script:CallSeq | Should -Be @('copyto', 'check')
         Should -Invoke Invoke-TopazAwsCli -Times 2 -Exactly
         Should -Invoke Start-Sleep -Times 0 -Exactly
     }
@@ -2401,11 +2574,11 @@ Describe 'Invoke-TopazIncrementalUpload (CORRECTION 3 -- upload each render as i
         }
         $cfg = Get-IncrementalTestConfig
         Invoke-TopazIncrementalUpload -Config $cfg -File $script:File | Should -Be $false
-        $script:CallSeq | Should -Be @('copy', 'copy')
+        $script:CallSeq | Should -Be @('copyto', 'copyto')
         Should -Invoke Invoke-TopazAwsCli -Times 2 -Exactly
     }
 
-    It 'uses OutputDir -> UploadTarget directly (NOT a "/recovered" sub-path) -- the same destination the final sweep uses, so re-runs skip it' {
+    It 'uses literal file-to-file copyto/check arguments at the same destination the final sweep uses' {
         Mock Invoke-TopazAwsCli {
             param($Arguments)
             $script:CallSeq.Add($Arguments -join ' ')
@@ -2413,7 +2586,48 @@ Describe 'Invoke-TopazIncrementalUpload (CORRECTION 3 -- upload each render as i
         }
         $cfg = Get-IncrementalTestConfig
         [void] (Invoke-TopazIncrementalUpload -Config $cfg -File $script:File)
-        ($script:CallSeq -join ' ') | Should -Match ([regex]::Escape('copy D:\Renders gdrive:temp'))
+        ($script:CallSeq -join ' ') | Should -Match ([regex]::Escape('copyto D:\Renders\finished.mov gdrive:temp/finished.mov'))
         ($script:CallSeq -join ' ') | Should -Not -Match 'recovered'
+    }
+
+    It 'preserves a filename containing rclone filter metacharacters as an exact destination path' {
+        $script:File = [pscustomobject]@{ FullName = 'D:\Renders\cut[final]*?.mov'; Name = 'cut[final]*?.mov'; Length = 12345 }
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:CallSeq.Add($Arguments -join ' ')
+            return $true
+        }
+
+        $cfg = Get-IncrementalTestConfig
+        Invoke-TopazIncrementalUpload -Config $cfg -File $script:File | Should -Be $true
+
+        ($script:CallSeq -join ' ') | Should -Match ([regex]::Escape('D:\Renders\cut[final]*?.mov gdrive:temp/cut[final]*?.mov'))
+        ($script:CallSeq -join ' ') | Should -Not -Match '--include'
+    }
+}
+
+Describe 'Get-TopazStopSequenceExecutionTimeLimit' {
+    It 'covers final and recovery uploads, retry delays, and every stop-plan verification wait' {
+        $cfg = [pscustomobject]@{
+            S3SyncTarget        = 's3://bucket/renders'
+            S3SyncTimeoutSec    = 1800
+            UploadTarget        = 'gdrive:temp'
+            UploadTimeoutSec    = 14400
+            UploadRetryDelaySec = 15
+            RecoveryScanTimeoutSec = 60
+            TopazForensicTimeoutSec = 10
+            SnsTopicArn         = 'arn:aws:sns:us-east-1:123456789012:topic'
+            AwsCliTimeoutSec    = 60
+            StopStrategy        = 'Auto'
+            StopVerifySec       = 300
+        }
+
+        $limit = Get-TopazStopSequenceExecutionTimeLimit -Config $cfg
+
+        # 5m margin + 30m S3 + final/recovery (each 2 attempts x copy+check
+        # x 4h, plus one retry) + final 4h check + 1m recovery scan + 10s
+        # forensic capture + 1m SNS + 1m EC2 API + 2 x 5m verification.
+        $limit.TotalSeconds | Should -Be (300 + 1800 + (9 * 14400) + (2 * 15) + 60 + 10 + 60 + 60 + (2 * 300))
+        $limit.TotalHours | Should -BeGreaterThan 36
     }
 }

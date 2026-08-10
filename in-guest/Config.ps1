@@ -1231,6 +1231,16 @@ function Get-TopazOutputFiles {
         stopped. This one helper is the only recursive OutputDir enumerator used
         by the watchdog and upload paths: it either returns the complete
         snapshot, or throws so the caller can fail closed.
+
+        Filters out directories via PSIsContainer rather than Get-ChildItem's
+        own -File switch. -File is a DYNAMIC parameter the FileSystem
+        provider only contributes once it resolves $Path, so it is unavailable
+        whenever that resolution fails -- including in unit tests, where
+        Get-ChildItem is mocked and $Path is a placeholder that never resolves
+        to any real provider. PSIsContainer needs no such resolution: it is a
+        plain property on the real DirectoryInfo/FileInfo objects (false for
+        files, filtered out here) and simply absent ($null, i.e. falsy, so
+        "-not" keeps the item) on the plain test doubles Pester returns.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -1239,7 +1249,7 @@ function Get-TopazOutputFiles {
         throw "Output directory '$Path' does not exist or is not a directory."
     }
 
-    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction Stop
+    Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction Stop | Where-Object { -not $_.PSIsContainer }
 }
 
 function Get-TopazStopSequenceExecutionTimeLimit {
@@ -1323,6 +1333,79 @@ function Build-AwsCliArgs {
     # would otherwise silently get a string back instead of an array.
     if ([string]::IsNullOrWhiteSpace($Region)) { return , $Base }
     return , ($Base + @('--region', $Region))
+}
+
+function Build-RcloneLogFileArgs {
+    <#
+    .SYNOPSIS
+        Appends '--log-file <path>' to $Base, or leaves it unchanged if the
+        path cannot be resolved.
+    .DESCRIPTION
+        Centralizes the rclone --log-file construction duplicated across
+        Invoke-TopazRecoveryUpload, Invoke-TopazIncrementalUpload,
+        Invoke-TopazRenderUpload, and Test-TopazCompletedStopSafetyGate.
+        Join-Path throws when LogDir names a drive PowerShell cannot resolve
+        on the current platform/provider (observed in CI: pwsh on a
+        non-Windows runner has no 'C:' PSDrive, so the default Windows LogDir
+        throws there even though the identical config works fine on the real
+        Windows guest). The rclone log file is pure observability -- exactly
+        like Write-TopazLog's own log file below -- so losing it must degrade
+        to "no --log-file" rather than crash a real upload/verification
+        attempt.
+    .PARAMETER Base
+        The rclone argument list before any --log-file is added.
+    .PARAMETER LogDir
+        The configured LogDir (Get-TopazAutoStopConfig's LogDir).
+    .OUTPUTS
+        $Base + @('--log-file', <path>), or $Base unchanged if the path could
+        not be resolved.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Base,
+        [Parameter(Mandatory)][string]$LogDir
+    )
+
+    try {
+        # -ErrorAction Stop: Join-Path's DriveNotFoundException is a
+        # NON-terminating error by default (an unresolvable drive letter
+        # leaves $rcloneLog simply unassigned rather than throwing) -- without
+        # Stop this catch never runs and $rcloneLog silently ends up $null,
+        # reproducing the exact "--log-file <nothing>" bug this function
+        # exists to prevent.
+        $rcloneLog = Join-Path $LogDir 'rclone.log' -ErrorAction Stop
+    }
+    catch {
+        return , $Base
+    }
+    return , ($Base + @('--log-file', $rcloneLog))
+}
+
+function Get-TopazWindowsPathRoot {
+    <#
+    .SYNOPSIS
+        Pure: the drive-letter root of a Windows absolute path (e.g. 'D:\'
+        for 'D:\Renders\file.mov'), or '' if $Path is not drive-letter-rooted.
+    .DESCRIPTION
+        [System.IO.Path]::GetPathRoot() is platform-aware, not a plain string
+        operation: on non-Windows .NET it does not recognize drive-letter
+        syntax at all and returns '' even for a well-formed 'D:\...' path --
+        unlike on the real Windows guest this pipeline runs on, where the
+        same call correctly returns 'D:\'. OutputDir/UploadTarget are always
+        Windows paths regardless of which OS is running the CODE (dev/CI on
+        a Mac/Linux runner vs. production on the Windows guest), so root
+        extraction here uses a fixed regex against the 'X:\' convention
+        instead of delegating to the executing platform's own path parser.
+    .PARAMETER Path
+        A Windows-style absolute path, e.g. $cfg.OutputDir.
+    .OUTPUTS
+        [string] The matched 'X:\' root, or '' if $Path has no such root.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($Path -match '^[A-Za-z]:\\') { return $Matches[0] }
+    return ''
 }
 
 function ConvertTo-TopazCliArgument {
@@ -1854,15 +1937,20 @@ function Find-RenderRecoveryCandidates {
     }
 
     try {
-        $root = [System.IO.Path]::GetPathRoot($OutputDir)
+        $root = Get-TopazWindowsPathRoot -Path $OutputDir
         if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
             $result.ScanFailed = $true
             return $result
         }
 
+        # Plain concatenation, not Join-Path: $root is already guaranteed to
+        # end in '\' (Get-TopazWindowsPathRoot's own contract), and Join-Path
+        # -- like [System.IO.Path]::GetPathRoot() above -- fails to resolve a
+        # drive-letter path when the executing platform has no such drive
+        # (any non-Windows dev/CI box; see Get-TopazWindowsPathRoot's comment).
         $excluded = @(
-            (Join-Path $root 'System Volume Information'),
-            (Join-Path $root '$RECYCLE.BIN'),
+            ($root + 'System Volume Information'),
+            ($root + '$RECYCLE.BIN'),
             $OutputDir
         ) | ForEach-Object { $_.TrimEnd('\').ToLowerInvariant() }
 
@@ -2139,7 +2227,7 @@ function Invoke-TopazRecoveryUpload {
         return [pscustomobject]@{ AnyUnrecovered = $true }
     }
 
-    $root     = [System.IO.Path]::GetPathRoot($cfg.OutputDir)
+    $root     = Get-TopazWindowsPathRoot -Path $cfg.OutputDir
     $destBase = "$($cfg.UploadTarget.TrimEnd('/'))/recovered"
 
     $includeArgs = New-Object System.Collections.Generic.List[string]
@@ -2149,8 +2237,8 @@ function Invoke-TopazRecoveryUpload {
         [void]$includeArgs.Add($rel)
     }
 
-    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
-    $common    = @('--config', $cfg.RcloneConfigPath, '--log-file', $rcloneLog, '--log-level', 'INFO')
+    $common    = Build-RcloneLogFileArgs -LogDir $cfg.LogDir `
+        -Base @('--config', $cfg.RcloneConfigPath, '--log-level', 'INFO')
     $tuning    = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
 
     $copyArgs  = @('copy', $root, $destBase) + $common + $tuning + $includeArgs
@@ -2306,8 +2394,8 @@ function Invoke-TopazIncrementalUpload {
     $rel = $File.FullName.Substring($outputRoot.Length).TrimStart('\').Replace('\', '/')
     $destination = "$($cfg.UploadTarget.TrimEnd('/'))/$rel"
 
-    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
-    $common = @('--config', $cfg.RcloneConfigPath, '--log-file', $rcloneLog, '--log-level', 'INFO')
+    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir `
+        -Base @('--config', $cfg.RcloneConfigPath, '--log-level', 'INFO')
     $tuning = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
 
     $copyArgs  = @('copyto', $File.FullName, $destination) + $common + $tuning
@@ -2424,7 +2512,7 @@ function Invoke-TopazOutputAnomalyHandling {
         return $true
     }
 
-    $root = [System.IO.Path]::GetPathRoot($cfg.OutputDir)
+    $root = Get-TopazWindowsPathRoot -Path $cfg.OutputDir
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Reason='completed': scanning '$root' for recent render file(s) OUTSIDE OutputDir '$($cfg.OutputDir)' (OutputDirHasFiles=$OutputDirHasFiles) before this stop erases the volume. This scan runs EVERY completed stop now, not only when OutputDir is empty -- see CORRECTION 1 in this file's own MISPLACED-OUTPUT ANOMALY comment."
 
@@ -2642,14 +2730,11 @@ function Invoke-TopazRenderUpload {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Uploading $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes), from '$($cfg.OutputDir)' to '$($cfg.UploadTarget)' (reason=$Reason). This MUST finish before the instance may stop."
 
-    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
-
     # --drive-chunk-size trades memory for throughput on large files; 4
     # transfers x 128M is ~512 MB of buffers, trivial on a 64 GB box and much
     # faster than the 8 MiB default for multi-GB renders.
-    $common = @(
+    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir -Base @(
         '--config', $cfg.RcloneConfigPath,
-        '--log-file', $rcloneLog,
         '--log-level', 'INFO'
     )
 
@@ -2873,12 +2958,11 @@ function Test-TopazCompletedStopSafetyGate {
         return $false
     }
 
-    $rcloneLog = Join-Path $cfg.LogDir 'rclone.log'
-    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget,
+    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir -Base @(
         '--config', $cfg.RcloneConfigPath,
-        '--log-file', $rcloneLog,
-        '--log-level', 'INFO',
-        '--one-way')
+        '--log-level', 'INFO'
+    )
+    $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way')
 
     $checkOk = [bool](Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
         -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `

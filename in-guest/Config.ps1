@@ -773,9 +773,15 @@ function Write-TopazLog {
     # failure is being watched live. Neither Write-Warning nor Write-Error
     # touches the output stream, so passing $line here cannot contaminate a
     # return value the way Write-Output would.
+    # -ErrorAction Continue on the ERROR branch is required, not redundant:
+    # Write-Error with no explicit -ErrorAction inherits the CALLER's ambient
+    # $ErrorActionPreference, and GitHub Actions' pwsh/powershell shell steps
+    # run with that set to 'Stop' -- turning this single log line into a
+    # terminating exception and crashing whatever called Write-TopazLog. That
+    # directly contradicts "logging must never take down the pipeline" above.
     switch ($Level) {
         'WARN'  { Write-Warning     $line }
-        'ERROR' { Write-Error       $line }
+        'ERROR' { Write-Error       $line -ErrorAction Continue }
         default { Write-Information $line -InformationAction Continue }
     }
 

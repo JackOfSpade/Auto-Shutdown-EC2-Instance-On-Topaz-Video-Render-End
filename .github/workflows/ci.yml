@@ -54,6 +54,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # act-local-CI only. GitHub's ubuntu-latest ships PowerShell preinstalled;
+      # act's runner image (catthehacker/ubuntu:act-latest) has no pwsh at all, so
+      # every step in this job — which defaults to `shell: pwsh` — died with exit
+      # 127 ("pwsh: executable file not found in $PATH") under the global
+      # `act push` pre-push hook. Since this repo's cloud Actions are disabled,
+      # skipping the job locally would leave the PowerShell code with no CI
+      # anywhere, so it is installed rather than skipped.
+      # `shell: bash` is REQUIRED here and is not redundant: the job-level default
+      # is pwsh, which is the very thing that does not exist yet.
+      # `env.ACT == 'true'` rather than a bare truthiness test, because GitHub
+      # treats ANY non-empty string (including "false") as true; the in-script
+      # re-check is a second guard so a misfiring `if:` degrades to a no-op.
+      - name: Install PowerShell (act-local CI only — GitHub's runner already has it)
+        if: ${{ env.ACT == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${ACT:-}" = "true" ] || exit 0
+          if ! command -v pwsh >/dev/null 2>&1; then
+            ver=7.4.6
+            # Match the CONTAINER's arch, not the host's. The pre-push hook runs act
+            # with --container-architecture linux/amd64, but a bare `act push` on an
+            # Apple Silicon host gets an arm64 container; downloading the wrong
+            # tarball fails with a rosetta/ld-linux elf error, not a clear message.
+            case "$(uname -m)" in
+              x86_64) arch=x64 ;;
+              aarch64 | arm64) arch=arm64 ;;
+              *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl -fsSLo /tmp/pwsh.tar.gz \
+              "https://github.com/PowerShell/PowerShell/releases/download/v${ver}/powershell-${ver}-linux-${arch}.tar.gz"
+            sudo mkdir -p /opt/microsoft/powershell/7
+            sudo tar -xzf /tmp/pwsh.tar.gz -C /opt/microsoft/powershell/7
+            sudo chmod +x /opt/microsoft/powershell/7/pwsh
+            sudo ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
+          fi
+          pwsh --version
+
       - name: Install PSScriptAnalyzer + Pester
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted

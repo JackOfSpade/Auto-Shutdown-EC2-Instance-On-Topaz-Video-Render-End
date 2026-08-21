@@ -139,7 +139,7 @@ The watchdog and stop tasks themselves run as **SYSTEM** (see
 [Phase 2](04-phase2-watchdog.md)), not as this interactive user - so the
 interactive account only needs to be able to run the Topaz GUI, nothing more.
 
-## 4. Ensure `nvidia-smi` and `aws` are on PATH
+## 4. Ensure `nvidia-smi` and `aws` are on PATH (and `rclone` at its configured path)
 
 The GPU metric publisher ([`Push-GpuMetric.ps1`](../in-guest/Push-GpuMetric.ps1))
 shells out to both `nvidia-smi.exe` (to read GPU utilization) and `aws.exe` (to
@@ -161,11 +161,35 @@ does opt into the idle alarm, it needs this publisher working. (The
 `nvidia-smi` visibility you confirmed in Phase 0 is the interactive-session
 view; make sure the executable is resolvable on PATH for the SYSTEM task too.)
 
+### `rclone` is checked too, and it outranks both
+
+`Install.ps1` also warns when `rclone.exe` or its config file is missing from
+the paths `Config.ps1` configures (`RclonePath`, `RcloneConfigPath`) - **not**
+from PATH, because the upload runs as SYSTEM, whose PATH differs from yours, so
+the pipeline resolves rclone by absolute path and passes `--config` explicitly.
+
+By impact, this warning outranks the two above. `nvidia-smi` missing costs
+telemetry; `aws` missing costs the idle alarm's signal. **rclone missing costs
+the ability to stop at all**: with the shipped `OutputIsEphemeral = $true`,
+`Invoke-TopazRenderUpload` returns `$false` the moment either path is absent,
+and [Phase 3](05-phase3-stop-sequence.md)'s ephemeral interlock then refuses
+every stop - correctly, since stopping would erase renders that were never
+uploaded - while the box keeps billing.
+
+It is a **warning and not an error** on purpose: authorising the Drive remote
+([`Set-GoogleDriveAuth.ps1`](../in-guest/Set-GoogleDriveAuth.ps1)) is
+interactive, needs a browser, and legitimately happens *after* `Install.ps1` on
+a fresh box. Failing the install for it would break the documented order.
+[`Test-Deployment.ps1`](../in-guest/Test-Deployment.ps1) is the gate that turns
+the same conditions into a **FAIL / NO-GO**, because by the time you are running
+the preflight you are about to arm the pipeline.
+
 ## Phase 1 exit checklist
 
 - [ ] `InstanceInitiatedShutdownBehavior` reads back as `stop`.
 - [ ] `topaz-render-instance-role` created and associated (PutMetricData only, unless you chose `INCLUDE_EC2_STOP=1`).
 - [ ] Interactive Topaz account is a throwaway local account; stored logon password treated as a secret and kept out of the AMI.
 - [ ] `nvidia-smi.exe` and `aws.exe` both resolvable on PATH.
+- [ ] `rclone.exe` present at `RclonePath` (its Drive remote is authorised later, in the in-guest phase - but without it no stop can ever complete on ephemeral output).
 
 Continue to [Phase 2 - the watchdog](04-phase2-watchdog.md).

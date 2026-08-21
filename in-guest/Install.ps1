@@ -11,7 +11,11 @@
     and is left to Register-ScheduledTasks.ps1, which this script points you to.
 
     As a convenience it warns (without failing) when nvidia-smi.exe or aws.exe
-    are not resolvable on PATH, since Push-GpuMetric.ps1 needs both.
+    are not resolvable on PATH, since Push-GpuMetric.ps1 needs both, and when
+    rclone or its config file is missing from the paths Config.ps1 configures,
+    since without those the stop sequence refuses every stop on ephemeral
+    output. All of these are advisory: they are legitimately installed after
+    this script runs.
 
 .NOTES
     Target : Windows PowerShell 5.1 on Windows Server (EC2 GPU instance).
@@ -79,7 +83,16 @@ $scripts = @(
 $optionalScripts = @(
     'Register-TimedStop.ps1',
     'Test-Deployment.ps1',
-    'Set-GoogleDriveAuth.ps1'
+    'Set-GoogleDriveAuth.ps1',
+    # Not needed to RUN the pipeline (it only creates the tasks), but it is the
+    # one tool the operator must re-run whenever a task is deleted, renamed, or
+    # has to be re-pointed after editing the installed Config.ps1 -- which the
+    # deployment doc documents as a recovery step. Leaving it out contradicted
+    # this script's own claim that the repo need not stay on disk: after
+    # deleting the checkout there was no way to re-register anything. The
+    # INSTALLED copy is also the more correct one to run, since it dot-sources
+    # the same Config.ps1 the tasks themselves will read.
+    'Register-ScheduledTasks.ps1'
 )
 
 # Tracked separately from $warningCount below: a missing source or failed
@@ -166,6 +179,50 @@ foreach ($tool in @('nvidia-smi.exe', 'aws.exe')) {
             -Message "Dependency '$tool' NOT found on PATH. $toolImpact Install/add it before relying on the idle alarm."
         $warningCount++
     }
+}
+
+# rclone is checked against its CONFIGURED PATHS, not PATH, because that is how
+# the pipeline resolves it: the upload runs as SYSTEM, whose PATH differs from
+# the interactive operator's, so Invoke-TopazRenderUpload uses $cfg.RclonePath
+# and --config $cfg.RcloneConfigPath explicitly.
+#
+# WHY THIS IS HERE AT ALL. By the ranking the per-tool text above uses, rclone
+# outranks both: with the shipped OutputIsEphemeral=$true, a missing rclone (or
+# an unauthorised remote) makes Invoke-TopazRenderUpload return $false, which
+# makes Stop-Sequence.ps1 REFUSE every stop, forever, while this script happily
+# logs "Install complete." That is the project's headline failure mode and it
+# went unmentioned.
+#
+# WARN, never ERROR. $errorCount drives `exit 1` below, and the documented
+# install order puts Set-GoogleDriveAuth.ps1 (interactive, needs a browser)
+# AFTER this script -- so a fresh box legitimately has neither file yet, and an
+# ERROR would make the documented sequence fail.
+$uploadIsMandatory = $cfg.OutputIsEphemeral -and -not [string]::IsNullOrWhiteSpace($cfg.UploadTarget)
+$uploadStakes = if ($uploadIsMandatory) {
+    "OutputDir '$($cfg.OutputDir)' is on EPHEMERAL storage with UploadTarget '$($cfg.UploadTarget)', so until this exists EVERY stop is REFUSED (the renders would be erased by the stop) and the instance keeps billing."
+}
+else {
+    "Renders will not be uploaded before a stop."
+}
+
+if (-not (Test-Path -LiteralPath $cfg.RclonePath)) {
+    Write-TopazLog -Component 'install' -Level 'WARN' `
+        -Message "rclone NOT found at the configured RclonePath '$($cfg.RclonePath)'. $uploadStakes Install rclone there (or fix RclonePath in Config.ps1), then run Set-GoogleDriveAuth.ps1."
+    $warningCount++
+}
+else {
+    Write-TopazLog -Component 'install' -Level 'INFO' `
+        -Message "rclone found at '$($cfg.RclonePath)'."
+}
+
+if (-not (Test-Path -LiteralPath $cfg.RcloneConfigPath)) {
+    Write-TopazLog -Component 'install' -Level 'WARN' `
+        -Message "rclone config NOT found at '$($cfg.RcloneConfigPath)': the Google Drive remote has not been authorised yet. $uploadStakes Run Set-GoogleDriveAuth.ps1 (elevated, from an interactive DCV session) to create it."
+    $warningCount++
+}
+else {
+    Write-TopazLog -Component 'install' -Level 'INFO' `
+        -Message "rclone config found at '$($cfg.RcloneConfigPath)'."
 }
 
 # ---------------------------------------------------------------------------

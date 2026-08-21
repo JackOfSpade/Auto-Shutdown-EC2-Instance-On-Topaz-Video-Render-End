@@ -184,31 +184,63 @@ $about | ForEach-Object { "         $_" }
 
 # Round-trip a tiny file into the ACTUAL upload target, so the destination
 # path and write permission are proven, not assumed.
+#
+# try/finally, because every failure branch below exits: without it each
+# `exit 1` (and every successful -VerifyOnly run) left another GUID-named
+# directory under %TEMP% on the C: drive, which -- unlike the scratch volume
+# -- is NOT wiped by a stop, so debugging Drive auth slowly littered the OS
+# disk. `exit` inside a try still runs finally in Windows PowerShell 5.1, so
+# this covers the exit paths as well as the fall-through.
 $probeDir  = Join-Path $env:TEMP ("topaz-probe-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
-$probeFile = Join-Path $probeDir 'topaz-upload-probe.txt'
-Set-Content -LiteralPath $probeFile -Value "topaz-autostop upload probe $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')" -Encoding UTF8
 
-& $rclone copy $probeDir $cfg.UploadTarget --config $configPath 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Output "  [FAIL] could not upload a probe file to '$($cfg.UploadTarget)'"
-    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
-        -Message "Drive auth FAILED: probe upload to '$($cfg.UploadTarget)' returned exit $LASTEXITCODE. The destination path or write permission is wrong."
-    exit 1
+try {
+    $probeFile = Join-Path $probeDir 'topaz-upload-probe.txt'
+    Set-Content -LiteralPath $probeFile -Value "topaz-autostop upload probe $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')" -Encoding UTF8
+
+    & $rclone copy $probeDir $cfg.UploadTarget --config $configPath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "  [FAIL] could not upload a probe file to '$($cfg.UploadTarget)'"
+        Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+            -Message "Drive auth FAILED: probe upload to '$($cfg.UploadTarget)' returned exit $LASTEXITCODE. The destination path or write permission is wrong."
+        exit 1
+    }
+    Write-Output "  [PASS] probe file uploaded to '$($cfg.UploadTarget)'"
+
+    & $rclone check $probeDir $cfg.UploadTarget --config $configPath --one-way 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "  [FAIL] probe uploaded but could not be VERIFIED at the destination"
+        Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
+            -Message "Drive auth FAILED: probe uploaded to '$($cfg.UploadTarget)' but 'rclone check --one-way' returned exit $LASTEXITCODE, so the upload could not be verified."
+        exit 1
+    }
+    Write-Output "  [PASS] probe verified at the destination"
+
+    # Every other rclone call in this script checks its exit code; this one used
+    # to pipe to Out-Null and then announce the removal unconditionally. A failed
+    # delete (revoked scope, rate limit, transient 5xx) then left
+    # topaz-upload-probe.txt sitting in the very folder every render is uploaded
+    # to, while the operator was told it had been cleaned up -- the one line in a
+    # script whose whole closing argument is that its outcome must be trustworthy
+    # after the fact. A failure here does NOT exit 1: authentication is already
+    # proven by this point, and a stray probe file is a tidiness problem.
+    & $rclone delete "$($cfg.UploadTarget)/topaz-upload-probe.txt" --config $configPath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "  [WARN] probe file could NOT be removed from '$($cfg.UploadTarget)' (rclone exit $LASTEXITCODE); delete 'topaz-upload-probe.txt' there manually."
+        Write-TopazLog -Component 'driveauth' -Level 'WARN' -ErrorAction Continue `
+            -Message "Drive auth: probe file 'topaz-upload-probe.txt' could NOT be deleted from '$($cfg.UploadTarget)' (rclone exit $LASTEXITCODE). Auth itself is proven; remove the stray file manually."
+    }
+    else {
+        Write-Output "  [INFO] probe file removed from Drive"
+    }
 }
-Write-Output "  [PASS] probe file uploaded to '$($cfg.UploadTarget)'"
-
-& $rclone check $probeDir $cfg.UploadTarget --config $configPath --one-way 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Output "  [FAIL] probe uploaded but could not be VERIFIED at the destination"
-    Write-TopazLog -Component 'driveauth' -Level 'ERROR' -ErrorAction Continue `
-        -Message "Drive auth FAILED: probe uploaded to '$($cfg.UploadTarget)' but 'rclone check --one-way' returned exit $LASTEXITCODE, so the upload could not be verified."
-    exit 1
+finally {
+    # -ErrorAction SilentlyContinue: a failed cleanup must never mask the
+    # verification result this script exists to report.
+    if ($probeDir -and (Test-Path -LiteralPath $probeDir)) {
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
-Write-Output "  [PASS] probe verified at the destination"
-
-& $rclone delete "$($cfg.UploadTarget)/topaz-upload-probe.txt" --config $configPath 2>&1 | Out-Null
-Write-Output "  [INFO] probe file removed from Drive"
 
 # Persist the outcome. Until now this script -- the one-time step that
 # provisions the credential EVERY later automated upload depends on -- wrote

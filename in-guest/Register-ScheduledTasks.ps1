@@ -1,14 +1,18 @@
 <#
 .SYNOPSIS
-    Registers the two SYSTEM scheduled tasks for the Topaz auto-stop pipeline.
+    Registers the three SYSTEM scheduled tasks for the Topaz auto-stop pipeline.
     Must be run ELEVATED. Idempotent.
 
 .DESCRIPTION
-    Creates (or re-creates) two scheduled tasks that run as the SYSTEM account:
+    Creates (or re-creates) three scheduled tasks that run as the SYSTEM account:
 
-        * Watchdog task   - runs Watchdog.ps1 at system startup, unlimited run
+        * Watchdog task    - runs Watchdog.ps1 at system startup, unlimited run
           time, so it is always watching for a completed/stalled render queue.
-        * GPU metric task - runs Push-GpuMetric.ps1 once per minute forever, to
+        * Scratch-disk task - runs Initialize-ScratchDisk.ps1 at system startup.
+          The instance store is WIPED on every stop and comes back RAW, so this
+          is what re-creates OutputDir; without it renders have nowhere to go
+          and the stop sequence correctly refuses to stop.
+        * GPU metric task  - runs Push-GpuMetric.ps1 once per minute forever, to
           feed the out-of-band CloudWatch idle alarm.
 
     SYSTEM is chosen because it holds SeShutdownPrivilege (needed for the guest
@@ -49,15 +53,29 @@ $watchdogScript = Join-Path $cfg.InstallDir 'Watchdog.ps1'
 $metricScript   = Join-Path $cfg.InstallDir 'Push-GpuMetric.ps1'
 $scratchScript  = Join-Path $cfg.InstallDir 'Initialize-ScratchDisk.ps1'
 
+# Not task targets themselves, but the two files WITHOUT WHICH THE TASKS CANNOT
+# RUN: every installed script dot-sources Config.ps1 by literal name on its
+# first line, and Watchdog.ps1 hands off with
+# `& (Join-Path $PSScriptRoot 'Stop-Sequence.ps1')`. Install.ps1 does not abort
+# on a failed copy -- it logs an ERROR, increments its error count and moves on
+# to the next file -- so InstallDir really can end up one file short while every
+# task registers fine and this script reports "All three tasks registered."
+# Checking the transitive dependencies too costs two Test-Paths and turns that
+# into an abort with the missing file named.
+$configScript = Join-Path $cfg.InstallDir 'Config.ps1'
+$stopScript   = Join-Path $cfg.InstallDir 'Stop-Sequence.ps1'
+
 # A missing installed script here means the task we are about to register
-# would point at a nonexistent file -- silently falling through to "Both
-# tasks registered." (the old behaviour) would tell the operator the
+# would point at (or immediately fail to load) a nonexistent file -- silently
+# falling through to "All three tasks registered." would tell the operator the
 # pipeline is live when it cannot actually run. Escalate the same way the
 # elevation check above does: throw and abort before registering anything.
 $missingScripts = @()
 if (-not (Test-Path -LiteralPath $watchdogScript)) { $missingScripts += $watchdogScript }
 if (-not (Test-Path -LiteralPath $metricScript)) { $missingScripts += $metricScript }
 if (-not (Test-Path -LiteralPath $scratchScript)) { $missingScripts += $scratchScript }
+if (-not (Test-Path -LiteralPath $configScript)) { $missingScripts += $configScript }
+if (-not (Test-Path -LiteralPath $stopScript)) { $missingScripts += $stopScript }
 if ($missingScripts.Count -gt 0) {
     $missingList = $missingScripts -join ', '
     Write-TopazLog -Component 'register' -Level 'ERROR' `
@@ -81,8 +99,8 @@ function Register-PipelineTask {
         same-name task, then register the supplied definition. Returns $true
         only once registration has been VERIFIED (Get-ScheduledTask finds the
         task afterwards); $false on any failure. Never throws -- the caller
-        registers two independent tasks and one failing must not prevent the
-        other attempt.
+        registers three independent tasks and one failing must not prevent the
+        other attempts.
     #>
     param(
         [Parameter(Mandatory)][string]$TaskName,
@@ -291,8 +309,8 @@ $metricRegistered = Register-PipelineTask `
     -Description 'Topaz auto-stop GPU metric publisher: pushes GPU utilization to CloudWatch every minute.'
 
 # ---------------------------------------------------------------------------
-# Done. Both registrations were attempted independently above (one failing
-# must not prevent the other attempt) -- report honestly which, if any,
+# Done. All three registrations were attempted independently above (one
+# failing must not prevent the others) -- report honestly which, if any,
 # failed rather than claiming success regardless of outcome.
 # ---------------------------------------------------------------------------
 

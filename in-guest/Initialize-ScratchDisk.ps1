@@ -44,13 +44,20 @@
 
 [CmdletBinding()]
 param(
-    # Set to skip the actual format and only report what WOULD happen.
+    # Set to skip the actual format and only report what WOULD happen. Honoured
+    # on BOTH provisioning paths: it never formats, never creates OutputDir, and
+    # never throws on a validation mismatch -- it reports. (It used to be
+    # consulted only on the format path, so on the common already-mounted case
+    # this "read-only" switch created a directory and could throw.)
     [switch]$WhatIfOnly,
 
-    # Test/import seam for the pure existing-drive validation below. This is
-    # intentionally undocumented for operators; scheduled tasks never pass it.
-    # It lets Pester exercise the fail-closed predicate without loading Windows
-    # storage cmdlets or touching a disk.
+    # Test/import seam for the validation helpers below. This is intentionally
+    # undocumented for operators; scheduled tasks never pass it. It lets Pester
+    # exercise every fail-closed predicate -- the existing-drive validation, the
+    # shared OutputDir root test, and Test-DiskHasFormattedVolume's error
+    # classification -- without loading Windows storage cmdlets or touching a
+    # disk. Every function defined ABOVE the `if ($LibraryOnly) { return }` line
+    # is therefore reachable from in-guest/tests/Initialize-ScratchDisk.Tests.ps1.
     [switch]$LibraryOnly
 )
 
@@ -65,6 +72,118 @@ function Test-IsElevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-TopazOutputDirRootedOnDrive {
+    <#
+    .SYNOPSIS
+        Pure: is OutputDir anchored at the root of the configured scratch drive?
+    .DESCRIPTION
+        Extracted so BOTH provisioning paths share one implementation. The
+        already-mounted path has always refused an OutputDir rooted elsewhere
+        (it would mean the pipeline's "ephemeral" output actually lives on a
+        volume this script never wipes, or on the OS disk); the FORMAT path did
+        not check at all, so the same configuration behaved in two contradictory
+        ways depending on whether the volume happened to be mounted this boot --
+        boot 1 formatted D:, created a directory on C:, and logged that the
+        output directory was on the wiped volume; boot 2 threw.
+
+        Do NOT use [System.IO.Path] here. The configuration deliberately carries
+        Windows paths, but Pester also runs this pure helper on Linux where .NET
+        treats 'D:\Renders' as an ordinary relative filename and returns no root.
+        Parse the only accepted shape explicitly, accepting either slash spelling
+        while requiring an anchored Windows drive root.
+    .PARAMETER OutputDir
+        The configured OutputDir, e.g. 'D:\Renders'.
+    .PARAMETER DriveLetter
+        The configured ScratchDriveLetter. Accepts 'D' or 'D:' (trimmed the same
+        way Get-ExistingScratchDriveValidation normalizes it).
+    .OUTPUTS
+        [bool] $true only when OutputDir is rooted on that drive.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$OutputDir,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DriveLetter
+    )
+
+    $letter = $DriveLetter.Trim().TrimEnd(':')
+    if ($letter -notmatch '^[A-Za-z]$') { return $false }
+
+    $outputRootMatch = [regex]::Match($OutputDir, '^(?<drive>[A-Za-z]):[\\/]')
+    if (-not $outputRootMatch.Success) { return $false }
+
+    return [string]::Equals($outputRootMatch.Groups['drive'].Value, $letter, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-DiskHasFormattedVolume {
+    <#
+    .SYNOPSIS
+        Does ANY partition on this disk carry a mountable filesystem? This is
+        the decisive data-safety check behind Test-IsScratchDiskCandidate, so
+        it fails CLOSED: any error is reported as $true ("assume it holds
+        data"), which disqualifies the disk rather than risking its contents.
+    .DESCRIPTION
+        Defined ABOVE the -LibraryOnly seam deliberately. Its entire contract is
+        error CLASSIFICATION -- deciding which failures mean "no filesystem" and
+        which mean "unknown, so keep away" -- and while it sat below the seam no
+        test could reach the most consequential predicate in this file. Its only
+        call site runs later, so the ordering costs nothing.
+    #>
+    param([Parameter(Mandatory)][uint32]$DiskNumber)
+
+    try {
+        $vols = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop |
+            Get-Volume -ErrorAction SilentlyContinue |
+            Where-Object { $_.FileSystemType -and $_.FileSystemType -ne 'Unknown' })
+        return ($vols.Count -gt 0)
+    }
+    catch {
+        # No partitions at all throws here on some builds -- that genuinely
+        # means no filesystem. Distinguish it from a real failure.
+        #
+        # STRUCTURED DATA FIRST, message text last. The old sole predicate was a
+        # regex against the English CIM message 'No MSFT_Partition objects
+        # found...', which Windows LOCALIZES. This is not an edge case: a wiped
+        # instance store comes back RAW with no partitions and therefore lands
+        # here on EVERY boot-after-stop, so on a non-English AMI (or after any
+        # Microsoft wording change) the disk would be classified as holding data
+        # and excluded, the candidate list would be empty, and the throw below
+        # would brick the scratch drive at every boot -- with nothing in the log
+        # to suggest a translated string was the cause.
+        #
+        # The widening is kept deliberately narrow because this predicate gates
+        # a DESTRUCTIVE operation. ObjectNotFound plus the CDXML query id only:
+        # a broad '-match NotFound' would also swallow FileNotFound/PathNotFound
+        # shaped ids from unrelated failures and call a disk whose volumes could
+        # not be read "empty", which is the one misclassification that formats
+        # somebody's data.
+        $noPartitionPredicate = $null
+        if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+            $noPartitionPredicate = 'ErrorCategory=ObjectNotFound'
+        }
+        elseif ($_.FullyQualifiedErrorId -match 'CmdletizationQuery_NotFound') {
+            $noPartitionPredicate = "FullyQualifiedErrorId='$($_.FullyQualifiedErrorId)'"
+        }
+        elseif ($_.Exception.Message -match 'No MSFT_Partition') {
+            $noPartitionPredicate = 'English message text (no structured match -- the fragile legacy predicate)'
+        }
+
+        if ($null -ne $noPartitionPredicate) {
+            # WARN, not INFO, even though this is the EXPECTED once-per-boot
+            # outcome for the wiped instance store: this line is the audit
+            # record of the classification that authorised a format, and naming
+            # which predicate fired is what lets a later post-mortem tell a
+            # category match from a text match without re-deriving it.
+            Write-TopazLog -Component 'scratch' -Level 'WARN' `
+                -Message "Disk $DiskNumber has no enumerable partitions ($noPartitionPredicate); classifying it as carrying NO filesystem, so it remains eligible for formatting."
+            return $false
+        }
+
+        Write-TopazLog -Component 'scratch' -Level 'WARN' `
+            -Message "Could not enumerate volumes on disk $DiskNumber ($($_.Exception.Message)); treating it as holding data and EXCLUDING it."
+        return $true
+    }
 }
 
 function Get-ExistingScratchDriveValidation {
@@ -107,15 +226,11 @@ function Get-ExistingScratchDriveValidation {
         return [pscustomobject]@{ IsValid = $false; Reason = "ScratchDriveLetter '$DriveLetter' is not a single drive letter." }
     }
 
-    # Do NOT use [System.IO.Path] here. The configuration deliberately carries
-    # Windows paths, but Pester also runs this pure helper on Linux where .NET
-    # treats 'D:\Renders' as an ordinary relative filename and returns no root.
-    # Parse the only accepted shape explicitly, accepting either slash spelling
-    # while requiring an anchored Windows drive root.
+    # Shared with the format path via Test-TopazOutputDirRootedOnDrive -- see
+    # that function for why the root test is a fixed regex rather than
+    # [System.IO.Path], and why both paths must apply the same one.
     $expectedRoot = "${letter}:\"
-    $outputRootMatch = [regex]::Match($OutputDir, '^(?<drive>[A-Za-z]):[\\/]')
-    if (-not $outputRootMatch.Success -or
-        -not [string]::Equals($outputRootMatch.Groups['drive'].Value, $letter, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-TopazOutputDirRootedOnDrive -OutputDir $OutputDir -DriveLetter $letter)) {
         return [pscustomobject]@{ IsValid = $false; Reason = "OutputDir '$OutputDir' is not rooted on configured scratch drive '$expectedRoot'." }
     }
 
@@ -177,6 +292,14 @@ if ($existing -and $existing.FileSystemType -ne 'Unknown') {
         -MinBytes $cfg.ScratchMinBytes -MaxBytes $cfg.ScratchMaxBytes
     if (-not $existingValidation.IsValid) {
         $message = "Mounted ${driveLetter}: is NOT the configured instance-store scratch volume: $($existingValidation.Reason) Refusing to create '$outputDir', format, or relabel anything. Fix the drive-letter/label/config mismatch manually."
+        # -WhatIfOnly is documented as "report what WOULD happen"; an operator
+        # running it on a live box mid-render must get a report, not a
+        # terminating error out of an inspection command.
+        if ($WhatIfOnly) {
+            Write-TopazLog -Component 'scratch' -Level 'WARN' -Message "WHAT-IF: $message"
+            Write-Output "WHAT-IF: would REFUSE to touch anything. $message"
+            return
+        }
         Write-TopazLog -Component 'scratch' -Level 'ERROR' -Message $message
         throw "Initialize-ScratchDisk.ps1: $message"
     }
@@ -185,10 +308,20 @@ if ($existing -and $existing.FileSystemType -ne 'Unknown') {
     # the only thing that recreates it after a stop wipes the volume. This is
     # safe only after the label, path root, and backing-disk provenance checks
     # above confirmed it is the configured instance-store volume.
+    #
+    # -WhatIfOnly used to be consulted only much further down, on the format
+    # path -- so on the COMMON case (the volume is already mounted, which is
+    # the state the boot task leaves behind) a supposedly read-only inspection
+    # ran this New-Item and mutated the filesystem. Gate it here too.
     if (-not (Test-Path -LiteralPath $outputDir)) {
-        New-Item -ItemType Directory -Path $outputDir -Force -ErrorAction Stop | Out-Null
-        Write-TopazLog -Component 'scratch' -Level 'INFO' `
-            -Message "Created output directory '$outputDir' on existing ${driveLetter}:."
+        if ($WhatIfOnly) {
+            Write-Output "WHAT-IF: would create output directory '$outputDir' on the existing, validated ${driveLetter}:."
+        }
+        else {
+            New-Item -ItemType Directory -Path $outputDir -Force -ErrorAction Stop | Out-Null
+            Write-TopazLog -Component 'scratch' -Level 'INFO' `
+                -Message "Created output directory '$outputDir' on existing ${driveLetter}:."
+        }
     }
     Write-TopazLog -Component 'scratch' -Level 'INFO' `
         -Message "Validated existing instance-store scratch drive ${driveLetter}: (Disk $($existingDisk.Number), label '$label', $([math]::Round($existing.SizeRemaining/1GB,1)) GiB free of $([math]::Round($existing.Size/1GB,1)) GiB). Nothing to do."
@@ -199,32 +332,6 @@ if ($existing -and $existing.FileSystemType -ne 'Unknown') {
 # Select the instance-store disk. See the .NOTES block above -- every one of
 # these conditions is load-bearing.
 # ---------------------------------------------------------------------------
-
-function Test-DiskHasFormattedVolume {
-    <#
-    .SYNOPSIS
-        Does ANY partition on this disk carry a mountable filesystem? This is
-        the decisive data-safety check behind Test-IsScratchDiskCandidate, so
-        it fails CLOSED: any error is reported as $true ("assume it holds
-        data"), which disqualifies the disk rather than risking its contents.
-    #>
-    param([Parameter(Mandatory)][uint32]$DiskNumber)
-
-    try {
-        $vols = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop |
-            Get-Volume -ErrorAction SilentlyContinue |
-            Where-Object { $_.FileSystemType -and $_.FileSystemType -ne 'Unknown' })
-        return ($vols.Count -gt 0)
-    }
-    catch {
-        # No partitions at all throws here on some builds -- that genuinely
-        # means no filesystem. Distinguish it from a real failure.
-        if ($_.Exception.Message -match 'No MSFT_Partition|ObjectNotFound') { return $false }
-        Write-TopazLog -Component 'scratch' -Level 'WARN' `
-            -Message "Could not enumerate volumes on disk $DiskNumber ($($_.Exception.Message)); treating it as holding data and EXCLUDING it."
-        return $true
-    }
-}
 
 $candidates = @(Get-Disk | Where-Object {
         Test-IsScratchDiskCandidate -Disk $_ `
@@ -244,6 +351,19 @@ if ($candidates.Count -gt 1) {
     Write-TopazLog -Component 'scratch' -Level 'ERROR' `
         -Message "AMBIGUOUS: $($candidates.Count) disks matched the instance-store filter ($desc). Refusing to format any of them. Resolve manually."
     throw "Initialize-ScratchDisk.ps1: ambiguous disk selection ($($candidates.Count) matches)."
+}
+
+# The SAME root test the already-mounted path applies, before anything
+# destructive happens. Without it this path formatted ScratchDriveLetter and
+# then created OutputDir on whatever drive OutputDir actually named, logging
+# "output directory '<x>' created (only this directory is uploaded)" and the
+# console block below -- both of which assert OutputDir lives on the volume
+# that gets wiped -- when it did not. Refusing here makes one configuration
+# behave one way instead of two contradictory ways depending on boot order.
+if (-not (Test-TopazOutputDirRootedOnDrive -OutputDir $outputDir -DriveLetter $driveLetter)) {
+    $rootMessage = "OutputDir '$outputDir' is not rooted on configured scratch drive '${driveLetter}:'. Formatting would create the render directory on a DIFFERENT volume while every later log line, the upload, and the ephemeral stop interlock all assume it is on the wiped one. Refusing to format anything. Fix OutputDir/ScratchDriveLetter in Config.ps1."
+    Write-TopazLog -Component 'scratch' -Level 'ERROR' -Message $rootMessage
+    throw "Initialize-ScratchDisk.ps1: $rootMessage"
 }
 
 $disk = $candidates[0]

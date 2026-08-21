@@ -64,16 +64,21 @@ instance.
 
 **Design (per [Phase 2](04-phase2-watchdog.md)):**
 [`Install.ps1`](../in-guest/Install.ps1) copies `Config.ps1`, `Watchdog.ps1`,
-`Stop-Sequence.ps1`, and `Push-GpuMetric.ps1` (plus the optional operator
-tools `Register-TimedStop.ps1` / `Test-Deployment.ps1`, when present) into
+`Stop-Sequence.ps1`, `Push-GpuMetric.ps1`, and `Initialize-ScratchDisk.ps1`
+(plus the optional operator tools `Register-TimedStop.ps1` /
+`Test-Deployment.ps1` / `Set-GoogleDriveAuth.ps1` /
+`Register-ScheduledTasks.ps1`, when present) into
 `C:\topaz-autostop`, then (from an **elevated** PowerShell)
 [`Register-ScheduledTasks.ps1`](../in-guest/Register-ScheduledTasks.ps1)
-registers two SYSTEM scheduled tasks:
+registers three SYSTEM scheduled tasks:
 
 - `TopazAutoStop-Watchdog` - runs `Watchdog.ps1` at startup, unlimited run
   time, restarts up to 3 times 1 minute apart if it crashes.
 - `TopazAutoStop-GpuMetric` - runs `Push-GpuMetric.ps1` once a minute,
   forever.
+- `TopazAutoStop-ScratchInit` - runs `Initialize-ScratchDisk.ps1` at startup:
+  the instance-store scratch drive comes back RAW after every stop, and
+  renders have nowhere to go until it is re-created.
 
 **Verified state on this box as of this writing (a snapshot from before the
 2026-07-27 `TimedStop` cancellation - see the updated callout above; the
@@ -369,7 +374,7 @@ refreshed and the scheduled tasks must pick up the change:
 ```powershell
 .\in-guest\Install.ps1                    # re-copies Config.ps1 (+ the others) into C:\topaz-autostop
 # from an ELEVATED PowerShell:
-.\in-guest\Register-ScheduledTasks.ps1    # re-registers the two SYSTEM tasks
+.\in-guest\Register-ScheduledTasks.ps1    # re-registers the three SYSTEM tasks
 ```
 
 `Register-ScheduledTasks.ps1` unregisters and re-creates each task by name,

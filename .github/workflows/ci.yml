@@ -96,15 +96,42 @@ jobs:
         # push. tests/ is included because the harnesses run on the same machine.
         # The ERE anchors the ^ / , operator immediately after the parameter name
         # (with an optional array subscript) so ordinary commas inside `${x:-a,b}`
-        # or `${x//,/;}` are not false positives. It does match the syntax written
-        # inside a comment, which is deliberate — the cheapest way to keep the rule
-        # legible is to let prose about it live in docs/, not in these scripts.
+        # or `${x//,/;}` are not false positives. Whole-line comments are filtered
+        # OUT of the matches: the fix sites deliberately keep a rationale comment
+        # naming the forbidden expansion right where the temptation to regress
+        # lives (e.g. "tr, not ${VAR^^}: ..." in 00-verify-prerequisites.sh), and
+        # a lint that forbids explaining itself would push that rationale out of
+        # the scripts. Only pure `# ...` lines are exempt — the expansion after
+        # code on a line, even ahead of a trailing comment, still fails.
         run: |
           set -euo pipefail
-          if grep -rEn --include='*.sh' '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(\^\^?|,,?)[^}]*\}' control-plane scripts tests; then
+          matches="$(grep -rEn --include='*.sh' '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(\^\^?|,,?)[^}]*\}' control-plane scripts tests | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+          if [ -n "$matches" ]; then
+            echo "$matches"
             echo "::error::bash 4 only: the case-modification expansions shown above (\${var^^} / \${var,,}) are a parse error on macOS /bin/bash 3.2, which is where these scripts run. Use tr '[:lower:]' '[:upper:]' instead."
             exit 1
           fi
+
+      - name: Assert operator-run scripts are executable
+        # docs/11 tells the operator to invoke the numbered control-plane scripts
+        # as `./control-plane/NN-*.sh`, and the bash suites the same way. Two of
+        # the six numbered scripts were committed 644 once already (fixed
+        # 2026-08-21): every doc'd invocation died with "permission denied" while
+        # CI stayed green, because CI always ran them via `bash <file>`. Git
+        # preserves the executable bit through clone/checkout, so asserting it
+        # here keeps the committed modes from silently diverging again.
+        run: |
+          set -euo pipefail
+          bad=0
+          for f in control-plane/[0-9]*.sh tests/test_*.sh; do
+            [ -f "$f" ] || continue
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::not executable — the documented ./$f invocation fails with 'permission denied'. Fix with: chmod +x $f && git add $f"
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ]
+          echo "All operator-run scripts carry their executable bit."
 
       - name: Validate IAM policy JSON
         # control-plane/iam/*.json is handed verbatim to AWS via `file://` by

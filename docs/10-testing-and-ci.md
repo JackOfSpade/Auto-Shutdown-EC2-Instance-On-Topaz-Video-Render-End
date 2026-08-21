@@ -158,7 +158,11 @@ run for the merge commit it pushes (GitHub raises no workflow events for a
   [`lambda/max-lifetime-stop/`](../lambda/max-lifetime-stop/). CI installs the
   committed `requirements-dev.txt`, which pins its reviewed Python test and
   lint toolchain (including Ruff 0.15.22) rather than resolving new releases
-  on every run.
+  on every run. The ruleset itself is committed too:
+  [`lambda/max-lifetime-stop/pyproject.toml`](../lambda/max-lifetime-stop/pyproject.toml)
+  selects a substantive family set (`E,W,F,I,B,UP,RUF,DTZ,RET,SIM` - `DTZ`'s
+  naive-datetime ban is the load-bearing one for a handler whose whole job is
+  tz-aware clock arithmetic) instead of ruff's near-empty default selection.
 - **`pytest`** runs [`test_handler.py`](../lambda/max-lifetime-stop/test_handler.py),
   which uses `botocore.stub.Stubber` to exercise the handler's
   running/stopped, over-ceiling/under-ceiling, and missing-instance branches
@@ -171,8 +175,11 @@ run for the merge commit it pushes (GitHub raises no workflow events for a
 merges at most one branch into `main` automatically once both that branch and
 the exact current `main` commit have a green `CI` run (triggered on
 `workflow_run` completion of the `CI` workflow, plus a manual
-`workflow_dispatch` escape hatch). After it pushes that one merge, CI validates
-the resulting `main` SHA before a later workflow run can merge another branch.
+`workflow_dispatch` escape hatch). After it pushes that one merge, it
+explicitly dispatches a CI run for the resulting `main` SHA (`gh workflow run
+ci.yml --ref main` - a `GITHUB_TOKEN` push creates no workflow run on its own,
+which is why `ci.yml` carries a `workflow_dispatch` trigger), and that run
+must be green before a later workflow run can merge another branch.
 The CI-gate, retry, and ancestry predicates that decide "is this branch
 mergeable" are
 factored out into sourceable functions in

@@ -780,7 +780,9 @@ function Get-TopazAutoStopConfig {
         # every stop.
         ScratchTaskName  = 'TopazAutoStop-ScratchInit'
 
-        # One-shot wall-clock hard stop registered by Register-TimedStop.ps1.
+        # Wall-clock hard stop registered by Register-TimedStop.ps1: fires
+        # once at the deadline, then repeats every RetryIntervalMinutes while
+        # the stop is refused (a one-shot task would strand a refused stop).
         # This is the in-guest equivalent of the optional max-lifetime Lambda,
         # for deployments where the control plane cannot be reached to deploy
         # that Lambda. It is a COST BACKSTOP, not a substitute for the

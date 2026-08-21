@@ -72,6 +72,11 @@ can_merge_next_branch() {
 # contained in main, just clean up" and for the re-confirm-before-delete ancestry check (a branch whose
 # tip advanced after the merge decision was made must NOT look like an ancestor, so it must NOT be
 # deleted).
+# git's exit status is passed through DELIBERATELY UN-NORMALIZED: 0 = ancestor, 1 = not an ancestor,
+# and 128 = the ref could not be resolved at all. Both callers treat every non-zero the same safe
+# way ("not contained" / "do not delete"), so an unresolvable ref — e.g. one that vanished mid-run —
+# must keep failing rather than being folded into a boolean that could read as "already merged".
+# Do not add a `|| true` or an `[ $? -ne 1 ]` here; tests/test_auto_merge_logic.sh pins the 128 case.
 is_ancestor_of() {
   git merge-base --is-ancestor "$1" "$2"
 }

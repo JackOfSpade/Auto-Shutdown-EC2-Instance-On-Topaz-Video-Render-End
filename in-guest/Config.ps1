@@ -15,16 +15,81 @@
     in Phase 0 (output directory, GUI process name, worker process name,
     scratch-file naming). The rest are sensible defaults you can tune later.
 
-    Besides configuration this file exposes a few helpers used by more than one
-    script, so the logic lives once:
-        Write-TopazLog        - timestamped console + file logging
-        Get-Ec2Identity       - IMDSv2 instance-id + region (best-effort)
-        Get-GpuUtilizationMax - highest GPU utilization across ALL GPUs
+    Besides configuration this file exposes every helper used by more than one
+    script, so the logic lives once. The file is long (3000+ lines), single by
+    contract -- every in-guest script dot-sources it by the literal name above,
+    so it must not be split -- and therefore navigated by the SECTION banners
+    below, which appear in the file in this order. Config.Tests.ps1 asserts this
+    index and the file's actual function definitions match exactly, so an added,
+    renamed or deleted function cannot leave it stale.
+
+    SECTION 1 - CONFIGURATION, VALIDATION AND THE PURE STOP PLAN
+        Assert-ValidCompletionSignal - rejects a typo'd CompletionSignal at load
+        Assert-ValidStopStrategy - rejects a typo'd StopStrategy at load
+        Resolve-StopPlan - pure: ordered stop actions for a StopStrategy
+        Build-WorkerWqlFilter - pure: WQL filter over WorkerNamesLike
+        Get-TopazAutoStopConfig - THE operator settings object
+
+    SECTION 2 - LOGGING
+        Write-TopazLog - timestamped console + rotating per-component log file
+
+    SECTION 3 - EC2 IDENTITY (IMDSv2, all best-effort)
+        Get-Ec2ImdsToken - IMDSv2 session token, or $null
+        Convert-AzToRegion - pure: 'us-east-1a' -> 'us-east-1'
+        Get-Ec2Identity - instance-id + region, or placeholders
+
+    SECTION 4 - RENDER-ACTIVITY SIGNALS
+        Get-GpuUtilizationMax - highest utilization across ALL GPUs
+        Test-RenderWorkerPresent - is an encoder worker process alive?
+        Resolve-RenderActive - pure: combine those two per CompletionSignal
+
+    SECTION 5 - FILESYSTEM PROBES AND THE STOP TASK'S TIME BOUND
+        Test-TopazTempFile - pure: does a name look like Topaz scratch?
+        Test-FileUnlocked - can the file be opened with FileShare.None?
+        Get-TopazOutputFiles - fail-closed recursive OutputDir snapshot
+        Get-TopazStopSequenceExecutionTimeLimit - worst-case stop runtime
+
+    SECTION 6 - EXTERNAL-PROCESS PLUMBING (aws CLI / rclone)
+        Build-AwsCliArgs - pure: append --region only when it is known
+        Build-RcloneLogFileArgs - append --log-file, or degrade quietly
+        Get-TopazRcloneCommonArgs - the shared --config/--log-level/--log-file base
+        Get-TopazRcloneTuningArgs - pure: the shared transfer tuning flags
+        Get-TopazWindowsPathRoot - pure: 'D:\' from 'D:\Renders\x.mov'
+        ConvertTo-TopazCliArgument - pure: CommandLineToArgvW-correct quoting
+        Invoke-TopazAwsCli - THE bounded external-process launcher
+
+    SECTION 7 - PURE DECISIONS (no I/O, fully unit-testable)
+        Test-IsScratchDiskCandidate - is this disk safe to reformat?
+        Resolve-UploadRetryDecision - should the caller attempt again?
+        Resolve-OutputAnomalyClass - Normal / ErrorClassA / ErrorClassB
+
+    SECTION 8 - MISPLACED-OUTPUT RECOVERY SCAN AND FORENSICS
+        Find-RenderRecoveryCandidates - bounded scan for renders outside OutputDir
+        Invoke-TopazForensicCapture - Topaz's own *.tzlog failure lines
+
+    SECTION 9 - UPLOAD AND VERIFY
+        Invoke-TopazRcloneVerifiedTransfer - THE copy+check+retry loop, once
+        Invoke-TopazRecoveryUpload - per-candidate upload of misplaced renders
+        Invoke-TopazIncrementalUpload - one OutputDir file, as it finishes
+        Invoke-TopazOutputAnomalyHandling - orchestration; never refuses a stop
+        Invoke-TopazRenderUpload - the final OutputDir sweep; CAN refuse a stop
+
+    SECTION 10 - FINAL COMPLETION SAFETY GATE AND STOP NOTIFICATION
+        Test-TopazOutputManifestUnchanged - pure: did OutputDir change under us?
+        Test-TopazCompletedStopSafetyGate - the last fail-closed interlock
+        Get-TopazStopNotification - pure: SNS subject/message for a stop reason
 
 .NOTES
     Dot-sourcing this file has no side effects, so it is safe to load from any
-    script (watchdog, stop sequence, metric publisher, installer, tests).
+    script (watchdog, stop sequence, metric publisher, installer, tests). It
+    contains function DEFINITIONS only -- nothing executes at load time -- so
+    the order functions appear in is a navigability concern, not a correctness
+    one.
 #>
+
+# ===========================================================================
+# SECTION 1 - CONFIGURATION, VALIDATION AND THE PURE STOP PLAN
+# ===========================================================================
 
 function Assert-ValidCompletionSignal {
     <#
@@ -601,6 +666,32 @@ function Get-TopazAutoStopConfig {
         # seconds, checked BETWEEN directories (see Find-RenderRecoveryCandidates).
         RecoveryScanTimeoutSec = 60
 
+        # Wall-clock budget (seconds) for the WHOLE recovery UPLOAD phase --
+        # every candidate and every attempt together -- checked BETWEEN
+        # candidates in Invoke-TopazRecoveryUpload, never mid-transfer.
+        #
+        # WHY A PHASE BUDGET RATHER THAN A PER-FILE TIMEOUT. Recovery now runs
+        # one literal `rclone copyto` + `check` PER CANDIDATE (a batched copy
+        # narrowed by `--include` silently transferred nothing for any filename
+        # containing a glob metacharacter, and reported it as verified -- see
+        # Invoke-TopazRecoveryUpload). Per-file work means the invocation count
+        # scales with the candidate count, and
+        # Get-TopazStopSequenceExecutionTimeLimit has to hand Task Scheduler a
+        # single FINITE ExecutionTimeLimit: budgeting RecoveryScanMaxFiles (200)
+        # x UploadTimeoutSec (4h) per file would produce a "limit" measured in
+        # months, which is no limit at all and defeats the point of setting one.
+        #
+        # 90 minutes is sized against the worst deliverable this box produces:
+        # a ~52 GB 4K render at the measured ~55-65 MiB/s is ~15 minutes, and at
+        # the pessimistic ~100 Mbps Drive figure UploadTimeoutSec was sized
+        # against, ~70. Because the budget is only ever checked BETWEEN
+        # candidates, the FIRST candidate is always attempted in full no matter
+        # what this is set to -- this bounds the tail, not the common case (one
+        # misplaced file). A candidate the budget never reached is logged NOT
+        # RECOVERED with that stated explicitly as the reason, which is a
+        # different fact from a transfer that was tried and failed.
+        RecoveryUploadTimeoutSec = 5400
+
         # OPERATOR SETTING: the folder Topaz itself writes its own *.tzlog
         # session logs into, for THIS box's interactive Windows account (NOT
         # the SYSTEM account Stop-Sequence.ps1 runs as -- SYSTEM has no way to
@@ -709,6 +800,10 @@ function Get-TopazAutoStopConfig {
     return $config
 }
 
+# ===========================================================================
+# SECTION 2 - LOGGING
+# ===========================================================================
+
 function Write-TopazLog {
     <#
     .SYNOPSIS
@@ -719,6 +814,19 @@ function Write-TopazLog {
         Short tag used for the log file name, e.g. 'watchdog', 'stop', 'metric'.
     .PARAMETER Level
         INFO (default), WARN, or ERROR.
+    .NOTES
+        THIS FUNCTION MUST WORK BEFORE THE CONFIG IS KNOWN TO BE VALID. It used
+        to open with an unguarded `$cfg = Get-TopazAutoStopConfig`, which runs
+        Assert-ValidCompletionSignal / Assert-ValidStopStrategy /
+        Build-WorkerWqlFilter -- so a single typo'd CompletionSignal made every
+        log call rethrow that validation error before it could write anything.
+        The three Assert-Valid* guards exist to "fail loudly at script start";
+        loudly on the error stream of a scheduled task that redirects nothing
+        means SILENTLY as far as the operator is concerned, because the one
+        subsystem that could have recorded the reason was itself taken down by
+        it. The config is now read defensively, AFTER the console/stream line
+        has already been emitted, and only for LogDir (the only field this
+        function ever used).
     #>
     [CmdletBinding()]
     param(
@@ -726,8 +834,6 @@ function Write-TopazLog {
         [Parameter(Mandatory)][string]$Component,
         [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
     )
-
-    $cfg = Get-TopazAutoStopConfig
 
     # Millisecond precision AND an explicit UTC offset. Both are load-bearing
     # for post-mortems, and both were learned from real analysis friction:
@@ -785,30 +891,72 @@ function Write-TopazLog {
         default { Write-Information $line -InformationAction Continue }
     }
 
+    # The log DIRECTORY is the only thing this function needs from the config,
+    # and it is read here -- after the stream line above is already out -- so a
+    # config that fails validation still produces a console/CI record instead of
+    # rethrowing out of the logger (see .NOTES). The literal fallback is
+    # DELIBERATELY DUPLICATED from the shipped LogDir default in
+    # Get-TopazAutoStopConfig above: duplicating one path string is the price of
+    # having the post-mortem survive the exact failure it most needs to record.
+    # Config.Tests.ps1 pins the two together so they cannot drift apart.
+    $logDir = 'C:\topaz-autostop\logs'
     try {
-        if (-not (Test-Path -LiteralPath $cfg.LogDir)) {
-            New-Item -ItemType Directory -Path $cfg.LogDir -Force | Out-Null
+        $logDir = (Get-TopazAutoStopConfig).LogDir
+    }
+    catch {
+        # Deliberately swallowed, and deliberately NOT re-logged: a broken
+        # config is precisely the case the fallback above exists for, and the
+        # caller has already had the message on the stream. Warning about it
+        # here would fire on EVERY line of an otherwise-usable log.
+    }
+
+    try {
+        # Every step below is -ErrorAction Stop, which is not cosmetic. These
+        # cmdlets fail NON-terminating on an unresolvable drive (e.g. a LogDir
+        # on a scratch volume Initialize-ScratchDisk.ps1 has not provisioned
+        # yet, or the shipped 'C:' LogDir under pwsh on a non-Windows CI
+        # runner). Without Stop, execution ran on with $logFile silently $null:
+        # New-Item, Join-Path and Test-Path each emitted their own ErrorRecord
+        # into the CALLER's error stream, rotation was skipped without a word,
+        # and the only error the catch below ever saw was Add-Content's
+        # downstream "Cannot bind argument to parameter 'LiteralPath' because it
+        # is null" -- four error records per log line, and a warning naming the
+        # symptom rather than the drive/permission failure that caused it.
+        # Build-RcloneLogFileArgs documents the same Join-Path trap.
+        if ([string]::IsNullOrWhiteSpace($logDir)) {
+            throw "LogDir is null or empty, so there is nowhere to write '$Component.log'."
         }
-        $logFile = Join-Path $cfg.LogDir ("{0}.log" -f $Component)
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+        }
+        $logFile = Join-Path $logDir ("{0}.log" -f $Component) -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($logFile)) {
+            throw "Could not resolve a log file path under LogDir '$logDir'."
+        }
 
         # Simple size-based rotation: once the live log exceeds 5MB, roll it
         # to a single ".log.1" backup (replacing any previous one) instead of
         # letting it grow unbounded for the life of the instance.
         if (Test-Path -LiteralPath $logFile) {
-            $existing = Get-Item -LiteralPath $logFile
+            $existing = Get-Item -LiteralPath $logFile -ErrorAction Stop
             if ($existing.Length -gt 5MB) {
-                $rotatedFile = Join-Path $cfg.LogDir ("{0}.log.1" -f $Component)
-                Move-Item -LiteralPath $logFile -Destination $rotatedFile -Force
+                $rotatedFile = Join-Path $logDir ("{0}.log.1" -f $Component) -ErrorAction Stop
+                Move-Item -LiteralPath $logFile -Destination $rotatedFile -Force -ErrorAction Stop
             }
         }
 
-        Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+        Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 -ErrorAction Stop
     }
     catch {
-        # Logging must never take down the pipeline.
+        # Logging must never take down the pipeline. ONE warning, naming the
+        # FIRST real failure rather than a downstream symptom of it.
         Write-Warning "Failed to write log file: $($_.Exception.Message)"
     }
 }
+
+# ===========================================================================
+# SECTION 3 - EC2 IDENTITY (IMDSv2, all best-effort)
+# ===========================================================================
 
 function Get-Ec2ImdsToken {
     <#
@@ -927,6 +1075,10 @@ function Get-Ec2Identity {
 
     return $result
 }
+
+# ===========================================================================
+# SECTION 4 - RENDER-ACTIVITY SIGNALS
+# ===========================================================================
 
 function Get-GpuUtilizationMax {
     <#
@@ -1135,6 +1287,10 @@ function Resolve-RenderActive {
     }
 }
 
+# ===========================================================================
+# SECTION 5 - FILESYSTEM PROBES AND THE STOP TASK'S TIME BOUND
+# ===========================================================================
+
 function Test-TopazTempFile {
     <#
     .SYNOPSIS
@@ -1179,9 +1335,21 @@ function Test-TopazTempFile {
 function Test-FileUnlocked {
     <#
     .SYNOPSIS
-        $true if the file can be opened for read with no sharing (i.e. nothing
-        else holds a write/append handle on it), otherwise $false.
+        $true if the file can be opened with FileShare.None -- i.e. NO other
+        process holds ANY handle on it at all, not merely no writer.
     .DESCRIPTION
+        READ THE SYNOPSIS LITERALLY: FileShare.None fails while any other
+        handle is open, INCLUDING a read-only one. On a Windows Server render
+        box that is routine -- Windows Defender scanning a just-closed multi-GB
+        .mov, Explorer's shell extension generating a thumbnail, the operator
+        watching the file in a player over DCV -- and each of those makes this
+        return $false with no writer anywhere in sight. That is the DELIBERATE
+        conservative direction: the cost of a false "locked" is some uptime
+        (the watchdog re-arms and retries), while the cost of a false
+        "unlocked" is a truncated upload of a file that is about to be erased.
+        Callers must word their messages accordingly -- "locked" here does not
+        entitle anyone to say "a writer still has it".
+
         MOVED HERE FROM Watchdog.ps1 (2026-07-28) so it can be shared with the
         recovery scan (Find-RenderRecoveryCandidates, below) and the
         incremental per-file upload pass (Invoke-TopazIncrementalUploadPoll in
@@ -1200,11 +1368,14 @@ function Test-FileUnlocked {
         volume root cannot tell that live intermediate apart from a genuinely
         finished, misplaced deliverable -- both are recent files with a
         render-shaped extension. Locked-ness is the signal that can: a file
-        still being written holds an exclusive (or at least a
-        write-incompatible) handle, so this probe fails for it and succeeds
-        the instant the writer closes it. See Find-RenderRecoveryCandidates's
-        own comment for how this keeps an in-progress render from being
-        misread as recovery evidence.
+        still being written holds a handle this exclusive open cannot coexist
+        with, so this probe fails for it and succeeds once every handle on it
+        is closed. (The converse does not hold, per the SYNOPSIS: a scanner's
+        read handle produces the same $false, which is why a "still locked"
+        finding is reported as "something holds a handle", never as "a writer
+        is still active".) See Find-RenderRecoveryCandidates's own comment for
+        how this keeps an in-progress render from being misread as recovery
+        evidence.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
@@ -1266,9 +1437,9 @@ function Get-TopazStopSequenceExecutionTimeLimit {
         Register-TimedStop.ps1 must not kill its own bounded upload before the
         stop action runs. This derives the task limit from the same configured
         operation timeouts Stop-Sequence actually uses: optional S3 sync, the
-        final upload and (when a recovery candidate exists) one recovery upload,
-        each with two rclone copy/check attempts and one retry delay, the one
-        completed-stop final rclone check, completed-render recovery scan and
+        final upload and (when a recovery candidate exists) the recovery upload
+        phase, each with two rclone copy/check attempts and one retry delay, the
+        one completed-stop final rclone check, completed-render recovery scan and
         bounded forensic capture, optional SNS, every action in the resolved
         stop plan, and a five-minute process/setup margin. It intentionally
         describes one invocation, not the task's repeating lifetime.
@@ -1282,18 +1453,29 @@ function Get-TopazStopSequenceExecutionTimeLimit {
         $seconds += [int64]$Config.S3SyncTimeoutSec
     }
     if (-not [string]::IsNullOrWhiteSpace($Config.UploadTarget)) {
-        # A final upload may be followed by one recovery upload. Each permits
-        # two attempts with separately bounded copy AND check invocations.
+        # A final upload may be followed by the recovery upload phase. Each
+        # permits two attempts with separately bounded copy AND check
+        # invocations (4 x UploadTimeoutSec + one retry delay apiece).
+        #
+        # The recovery phase is now ONE rclone copyto+check pair PER CANDIDATE,
+        # not one batch (Invoke-TopazRecoveryUpload: a batched copy narrowed by
+        # `--include` reported success for files it had never transferred). It
+        # is bounded in AGGREGATE by RecoveryUploadTimeoutSec, added below, and
+        # that bound is checked BETWEEN candidates -- so the *8 here is still
+        # the right allowance for the recovery side: it covers the one
+        # candidate that may already be in flight when the budget expires,
+        # whatever the candidate count.
         $seconds += ([int64]$Config.UploadTimeoutSec * 8) + ([int64]$Config.UploadRetryDelaySec * 2)
         # Completed stops also perform one final check-only verification after
         # the long upload work. Timed maxlifetime stops skip it, but this
         # generic bound remains safe for every Stop-Sequence reason.
         $seconds += [int64]$Config.UploadTimeoutSec
+        # The recovery-upload phase's own aggregate wall-clock budget: every
+        # candidate after the one covered by the allowance above shares this.
+        $seconds += [int64]$Config.RecoveryUploadTimeoutSec
     }
     # Only a completed stop runs this path, but a scheduled-task limit must be
-    # safe for every Stop-Sequence reason. Recovery upload is one batch, not
-    # one timeout budget per candidate; its rclone call receives all candidates
-    # in a single include list.
+    # safe for every Stop-Sequence reason.
     $seconds += [int64]$Config.RecoveryScanTimeoutSec
     $seconds += [int64]$Config.TopazForensicTimeoutSec
     if (-not [string]::IsNullOrWhiteSpace($Config.SnsTopicArn)) {
@@ -1305,6 +1487,10 @@ function Get-TopazStopSequenceExecutionTimeLimit {
     $seconds += ([int64]$plan.Count * [int64]$Config.StopVerifySec)
     return New-TimeSpan -Seconds $seconds
 }
+
+# ===========================================================================
+# SECTION 6 - EXTERNAL-PROCESS PLUMBING (aws CLI / rclone)
+# ===========================================================================
 
 function Build-AwsCliArgs {
     <#
@@ -1385,6 +1571,74 @@ function Build-RcloneLogFileArgs {
         return , $Base
     }
     return , ($Base + @('--log-file', $rcloneLog))
+}
+
+function Get-TopazRcloneCommonArgs {
+    <#
+    .SYNOPSIS
+        The rclone arguments EVERY invocation in this pipeline passes:
+        --config, --log-level, and (when it can be resolved) --log-file.
+    .DESCRIPTION
+        This exact four-element base was written out verbatim at four call
+        sites (the three upload paths plus Test-TopazCompletedStopSafetyGate),
+        each wrapping it in its own Build-RcloneLogFileArgs call. That is the
+        duplication that let the recovery path drift away from its siblings
+        until it carried a silent data-loss reporting bug (see
+        Invoke-TopazRecoveryUpload's own comment on the `--include` glob
+        hazard): four copies means four places to remember, and one that is
+        forgotten looks exactly like the other three.
+        Named "...Args" (plural) for the same reason Build-AwsCliArgs is: it
+        returns an argument LIST, and "Arg" would misdescribe the value.
+        PSUseSingularNouns is allowlisted in CI for exactly this case.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object (needs .RcloneConfigPath and .LogDir).
+    .OUTPUTS
+        [string[]] the shared argument list.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    # Unary comma for the same reason Build-AwsCliArgs uses one: a returned
+    # array must not collapse to a scalar for a caller that concatenates it.
+    return , (Build-RcloneLogFileArgs -LogDir $Config.LogDir -Base @(
+        '--config', $Config.RcloneConfigPath,
+        '--log-level', 'INFO'
+    ))
+}
+
+function Get-TopazRcloneTuningArgs {
+    <#
+    .SYNOPSIS
+        Pure: the throughput-tuning arguments shared by every rclone TRANSFER
+        (copy/copyto) in this pipeline. No I/O.
+    .DESCRIPTION
+        --drive-chunk-size trades memory for throughput on large files; 4
+        transfers x 128M is ~512 MB of buffers, trivial on a 64 GB box and much
+        faster than the 8 MiB default for multi-GB renders. --retries /
+        --low-level-retries are rclone's OWN internal retries, which are a
+        different and complementary bound to this file's outer
+        Resolve-UploadRetryDecision attempt cap.
+
+        Deliberately NOT applied to `check`: a verification pass transfers
+        nothing, so transfer/chunk tuning would be noise in the argument list
+        the post-mortem reader has to scan.
+
+        Named "...Args" (plural) for the same reason Build-AwsCliArgs is: it
+        returns an argument LIST, and "Arg" would misdescribe the value.
+        PSUseSingularNouns is allowlisted in CI for exactly this case.
+    .OUTPUTS
+        [string[]] the shared tuning argument list.
+    #>
+    [CmdletBinding()]
+    param()
+
+    return , @(
+        '--transfers', '4',
+        '--drive-chunk-size', '128M',
+        '--retries', '3',
+        '--low-level-retries', '10',
+        '--stats', '1m'
+    )
 }
 
 function Get-TopazWindowsPathRoot {
@@ -1582,6 +1836,10 @@ function Invoke-TopazAwsCli {
         if ($proc) { $proc.Dispose() }
     }
 }
+
+# ===========================================================================
+# SECTION 7 - PURE DECISIONS (no I/O, fully unit-testable)
+# ===========================================================================
 
 function Test-IsScratchDiskCandidate {
     <#
@@ -1806,6 +2064,10 @@ function Resolve-OutputAnomalyClass {
     if (-not $OutputDirHasFiles) { return 'ErrorClassB' }
     return 'Normal'
 }
+
+# ===========================================================================
+# SECTION 8 - MISPLACED-OUTPUT RECOVERY SCAN AND FORENSICS
+# ===========================================================================
 
 function Find-RenderRecoveryCandidates {
     <#
@@ -2159,6 +2421,139 @@ function Invoke-TopazForensicCapture {
     }
 }
 
+# ===========================================================================
+# SECTION 9 - UPLOAD AND VERIFY
+# ===========================================================================
+
+function Invoke-TopazRcloneVerifiedTransfer {
+    <#
+    .SYNOPSIS
+        Runs ONE bounded rclone transfer + independent verification, with this
+        pipeline's single retry policy, and reports what actually happened.
+        The ONE implementation of that loop; all three upload paths use it.
+    .DESCRIPTION
+        THE LOOP USED TO EXIST THREE TIMES. Invoke-TopazRenderUpload,
+        Invoke-TopazRecoveryUpload and Invoke-TopazIncrementalUpload each
+        carried their own `$maxAttempts = 2`, their own copy-then-check pair,
+        their own Resolve-UploadRetryDecision call and their own Start-Sleep --
+        ~90 near-identical lines. That duplication is not a style complaint: it
+        is how the recovery path kept a glob-based `--include` scope for weeks
+        after the incremental path had already been fixed to use literal paths
+        for exactly the reason the recovery path needed it too (see
+        Invoke-TopazRecoveryUpload's own comment). One copy of the loop means a
+        lesson learned once is applied everywhere.
+
+        WHAT DELIBERATELY STAYS IN THE CALLERS: the ARGUMENT SHAPE (a whole
+        directory vs. one literal file) and the TERMINAL POLICY (refuse the
+        stop / log a per-file disposition / leave a file unmarked for a later
+        poll). Those are where the three paths genuinely differ, and collapsing
+        them would erase distinctions this pipeline's safety rests on -- see
+        Invoke-TopazRecoveryUpload's "THE DELIBERATE ASYMMETRY" note.
+
+        $maxAttempts LIVES HERE NOW, as a literal constant, and is the only one
+        left in the file. See Resolve-UploadRetryDecision's own comment for why
+        the bound is deliberately not an operator-tunable Config.ps1 knob.
+    .PARAMETER Config
+        Get-TopazAutoStopConfig object (needs .RclonePath and .UploadRetryDelaySec).
+    .PARAMETER CopyArgs
+        The full rclone argument list for the transfer (`copy` or `copyto`).
+    .PARAMETER CheckArgs
+        The full rclone argument list for the independent verification pass.
+        Only run when the transfer itself succeeded: re-running `check` against
+        a failed copy would merely re-confirm the same failure.
+    .PARAMETER Component
+        Write-TopazLog component tag ('stop' or 'watchdog').
+    .PARAMETER Label
+        Message prefix identifying the calling path, e.g. 'Upload',
+        'Recovery upload', 'Incremental upload'. Every line this helper emits
+        begins "<Label> attempt N of M", which is the greppable shape the
+        post-mortem (and the tests) rely on.
+    .PARAMETER Subject
+        Human-readable description of WHAT is being transferred, e.g.
+        "'D:\Renders' -> 'gdrive:temp'". Interpolated verbatim, never used as a
+        format string -- a render filename may legitimately contain braces.
+    .PARAMETER TimeoutSec
+        Bound on EACH rclone invocation (passed straight to Invoke-TopazAwsCli).
+    .PARAMETER FailureContext
+        Optional extra text appended to Invoke-TopazAwsCli's WARN lines.
+    .OUTPUTS
+        [pscustomobject]@{
+            Copied   = [bool]  # the last attempt's transfer succeeded
+            Verified = [bool]  # the last attempt's independent check succeeded
+            Attempts = [int]   # attempts actually run (1..MaxAttempts)
+        }
+        Callers decide what those facts MEAN; this function never decides
+        whether a stop may proceed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string[]]$CopyArgs,
+        [Parameter(Mandatory)][string[]]$CheckArgs,
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [string]$FailureContext = ''
+    )
+
+    $cfg = $Config
+
+    # 2 = one initial attempt plus one retry. A transient Drive-side blip (rate
+    # limiting, a dropped TCP connection mid-chunk) used to cost a whole
+    # refused stop; an unbounded loop would instead burn instance-hours against
+    # a permanently broken credential with nobody watching.
+    $maxAttempts = 2
+    $copied      = $false
+    $verified    = $false
+    $attempt     = 0
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-TopazLog -Component $Component -Level 'INFO' `
+            -Message "$Label attempt $attempt of $maxAttempts (rclone copy): $Subject."
+
+        $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $CopyArgs `
+            -TimeoutSec $TimeoutSec -Component $Component `
+            -SuccessMessage "$Label attempt $attempt of ${maxAttempts}: rclone copy completed for $Subject." `
+            -FailureVerb "$Label attempt $attempt of $maxAttempts (rclone copy) for $Subject" `
+            -FailureContext $FailureContext
+
+        # Each attempt redoes BOTH steps: a partial transfer is exactly the
+        # case a retry should fix, and `check` alone against a partial copy
+        # would just re-confirm the same failure.
+        $verified = $false
+        if ($copied) {
+            Write-TopazLog -Component $Component -Level 'INFO' `
+                -Message "$Label attempt $attempt of $maxAttempts (rclone check): $Subject."
+
+            $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $CheckArgs `
+                -TimeoutSec $TimeoutSec -Component $Component `
+                -SuccessMessage "$Label attempt $attempt of ${maxAttempts}: rclone check VERIFIED $Subject." `
+                -FailureVerb "$Label attempt $attempt of $maxAttempts (rclone check) for $Subject" `
+                -FailureContext $FailureContext
+        }
+
+        if ($copied -and $verified) { break }
+
+        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
+            Write-TopazLog -Component $Component -Level 'WARN' `
+                -Message "$Label attempt $attempt of $maxAttempts FAILED for $Subject (copied=$copied verified=$verified). Retrying once more (attempt $($attempt + 1) of $maxAttempts) in $($cfg.UploadRetryDelaySec)s."
+            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
+        }
+    }
+
+    # A `break` leaves $attempt at the attempt that succeeded; running the loop
+    # to completion leaves it one PAST the cap, which would misreport "3
+    # attempts" on a 2-attempt policy.
+    $attemptsRun = [math]::Min($attempt, $maxAttempts)
+
+    return [pscustomobject]@{
+        Copied   = [bool]$copied
+        Verified = [bool]$verified
+        Attempts = [int]$attemptsRun
+    }
+}
+
 function Invoke-TopazRecoveryUpload {
     <#
     .SYNOPSIS
@@ -2169,17 +2564,70 @@ function Invoke-TopazRecoveryUpload {
         Invoke-TopazRenderUpload's ephemeral interlock, the caller proceeds to
         stop regardless of what this function achieves.
     .DESCRIPTION
-        REUSES THE SAME rclone copy + check PLUMBING AS THE NORMAL UPLOAD
-        PATH, scoped down with `--include` filters to exactly the candidate
-        files' paths relative to the OutputDir volume's root, rather than
-        shelling out to rclone afresh or writing a per-file copyto loop. This
-        is the "simplest approach that reuses existing, already-tested code"
-        the task calls for: `copy`/`check` (not `copyto`, not a bespoke
-        per-file command) with the SAME argument shape Invoke-TopazRenderUpload
-        already uses, just with the source widened to the volume root and
-        `--include` narrowing it back down to only the discovered candidates
-        (each candidate can live in a different directory; a single `--include`
-        list handles that without needing a common parent folder).
+        ONE LITERAL `copyto` + `check` PAIR PER CANDIDATE -- NOT ONE BATCHED
+        `copy` NARROWED BY `--include`. This function originally widened the
+        source to the OutputDir volume's ROOT and narrowed it back down with
+        one `--include <path relative to the root>` per candidate, on the
+        reasoning that a single include list handles candidates living in
+        different directories without needing a common parent folder. That
+        reasoning was right about the scoping and catastrophically wrong about
+        the mechanism: rclone filter patterns are GLOBS, so a deliverable named
+        'cut[final].mov' (or anything containing '*', '?', '[' or '{')
+        produced an include pattern that matched NOTHING on disk. `rclone copy`
+        with a filter that selects zero files exits 0, and `rclone check
+        --one-way` with the same filter compares zero source files and exits 0
+        too -- so the batch reported success and EVERY candidate was logged
+        'RECOVERY DISPOSITION: uploaded+verified' for a file that had never
+        been transferred, moments before the stop erased the volume holding it.
+        The unanchored patterns could also match at any depth on the volume,
+        i.e. select a DIFFERENT file and still mark this one uploaded.
+        Invoke-TopazIncrementalUpload had already learned this exact lesson and
+        says so in its own comment; the recovery path -- the one that runs when
+        a render is ALREADY known to be misplaced -- had not. A literal
+        `copyto <file> <destination>` passes the name through untouched, so
+        there is no pattern left to mis-parse.
+
+        THE VERIFY PASS COMPARES AGAINST THE DESTINATION'S PARENT DIRECTORY,
+        deliberately: `check <local file> <remote DIRECTORY> --one-way`. A FILE
+        source makes rclone resolve the parent Fs plus a leaf filter that
+        applies to BOTH sides, so the comparison stays exactly as narrow as a
+        file-to-file check while both arguments keep a shape this repo has
+        actually seen rclone accept. A `check` DESTINATION that resolves to an
+        existing FILE (the shape Invoke-TopazIncrementalUpload uses, added
+        2026-07-28) has never been run against real rclone on this deployment,
+        and the recovery path is the worst possible place to discover that it
+        is rejected: a rejected check turns a genuinely-saved file into
+        'uploaded-but-unverified' in the one record the operator keeps.
+
+        THE DISPOSITION IS NOW A TRUE PER-FILE VERDICT. It was previously a
+        BATCH verdict replicated across every candidate: `rclone copy` exits
+        nonzero if ANY file in the batch failed, so four candidates where three
+        transferred cleanly and one hit a per-file Drive rejection produced
+        four identical 'NOT RECOVERED ... PERMANENTLY DESTROYED' lines -- three
+        of them false, about files sitting safely at the destination. This
+        function's whole purpose is that the disposition of every file is
+        unambiguous in the log (docs/05), so each candidate now gets its own
+        copy, its own check and its own verdict.
+
+        BOUNDED IN AGGREGATE, NOT PER FILE. Per-candidate transfers multiply
+        the rclone invocation count by the candidate count, and
+        Get-TopazStopSequenceExecutionTimeLimit has to hand Task Scheduler a
+        FINITE ExecutionTimeLimit -- RecoveryScanMaxFiles (200) x UploadTimeoutSec
+        (4h) would be a limit measured in months, i.e. no limit at all. So the
+        whole phase shares one wall-clock budget (Config's
+        RecoveryUploadTimeoutSec), checked BETWEEN candidates exactly the way
+        Find-RenderRecoveryCandidates checks its own bound between directories.
+        Never mid-transfer: the candidate in flight always finishes its own
+        bounded attempts, and the FIRST candidate is therefore always attempted
+        in full. A candidate the budget never reached is reported NOT RECOVERED
+        with that stated as the reason -- "we ran out of time before trying" is
+        a different fact from "rclone tried and failed", and the operator needs
+        to be able to tell them apart. A missing or zero budget (an installed
+        Config.ps1 predating the knob, or an operator who deleted the line)
+        therefore degrades to "attempt the first candidate, report the rest as
+        never attempted", which is exactly what
+        Get-TopazStopSequenceExecutionTimeLimit's arithmetic assumes in that
+        case -- it adds nothing for a budget that is not there.
 
         THE DELIBERATE ASYMMETRY WITH THE NORMAL PATH. A normal-path upload
         failing twice REFUSES to stop (Stop-Sequence.ps1's ephemeral
@@ -2236,80 +2684,87 @@ function Invoke-TopazRecoveryUpload {
     $root     = Get-TopazWindowsPathRoot -Path $cfg.OutputDir
     $destBase = "$($cfg.UploadTarget.TrimEnd('/'))/recovered"
 
-    $includeArgs = New-Object System.Collections.Generic.List[string]
-    foreach ($c in $Candidates) {
-        $rel = $c.FullName.Substring($root.Length).Replace('\', '/')
-        [void]$includeArgs.Add('--include')
-        [void]$includeArgs.Add($rel)
-    }
-
-    $common    = Build-RcloneLogFileArgs -LogDir $cfg.LogDir `
-        -Base @('--config', $cfg.RcloneConfigPath, '--log-level', 'INFO')
-    $tuning    = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
-
-    $copyArgs  = @('copy', $root, $destBase) + $common + $tuning + $includeArgs
-    $checkArgs = @('check', $root, $destBase) + $common + @('--one-way') + $includeArgs
+    $common = Get-TopazRcloneCommonArgs -Config $cfg
+    $tuning = Get-TopazRcloneTuningArgs
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
-        -Message "Attempting best-effort recovery upload of $($Candidates.Count) candidate file(s) from '$root' -> '$destBase'."
+        -Message "Attempting best-effort recovery upload of $($Candidates.Count) candidate file(s) from '$root' -> '$destBase' (one literal rclone copyto + check per file; the whole phase is bounded by RecoveryUploadTimeoutSec=$($cfg.RecoveryUploadTimeoutSec)s)."
 
-    # Same MAX-ONE-RETRY policy as the normal upload path, via the SAME pure
-    # Resolve-UploadRetryDecision helper -- it can only help a transient blip,
-    # and the hard cap matters here too: this runs on every anomalous
-    # completion, and an unbounded loop here would burn instance hours against
-    # a broken credential just as readily as it would on the normal path.
-    $maxAttempts  = 2
-    $lastCopied   = $false
-    $lastVerified = $false
+    $deadline       = (Get-Date).AddSeconds($cfg.RecoveryUploadTimeoutSec)
+    $anyUnrecovered = $false
+    $index          = 0
 
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        Write-TopazLog -Component 'stop' -Level 'INFO' `
-            -Message "Recovery upload attempt $attempt of $maxAttempts (rclone copy)."
+    foreach ($c in $Candidates) {
+        $index++
+        # Cooperative bound, checked between candidates only -- see
+        # .DESCRIPTION. A file the budget never reached must NOT be reported
+        # with the same words as one rclone genuinely failed to copy.
+        #
+        # The FIRST candidate is exempt by construction ($index -gt 1), not by
+        # luck: the common case is exactly one misplaced deliverable, and a
+        # misconfigured (or zero, or absent) RecoveryUploadTimeoutSec must
+        # never turn the whole feature into a no-op that reports every file
+        # unrecovered without having tried. Its own rclone calls stay bounded
+        # by UploadTimeoutSec regardless.
+        if ($index -gt 1 -and (Get-Date) -ge $deadline) {
+            $anyUnrecovered = $true
+            Write-RecoveryDisposition -File $c -Disposition 'NOT RECOVERED' `
+                -Detail "The recovery-upload phase ran out of its RecoveryUploadTimeoutSec=$($cfg.RecoveryUploadTimeoutSec)s budget before reaching this file, so rclone was NEVER RUN for it (this is not the same fact as a failed transfer). $notRecoveredDetail"
+            continue
+        }
 
-        $lastCopied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
-            -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `
-            -SuccessMessage "Recovery upload attempt $attempt of ${maxAttempts}: rclone copy completed." `
-            -FailureVerb "Recovery upload attempt $attempt of $maxAttempts (rclone copy)" `
+        # Path relative to the OutputDir volume's ROOT (contrast
+        # Invoke-TopazIncrementalUpload, whose files are all under OutputDir),
+        # so a candidate found in a subdirectory keeps that subdirectory at the
+        # destination rather than colliding with a same-named file elsewhere.
+        # The fallback covers the case Get-TopazWindowsPathRoot cannot resolve
+        # a drive-letter root, or a candidate that somehow sits outside it:
+        # flattening to the leaf name is far better than pasting 'D:' into a
+        # remote path.
+        $leaf = $c.FullName.Substring($c.FullName.LastIndexOf('\') + 1)
+        $rel  = $leaf
+        if (-not [string]::IsNullOrWhiteSpace($root) -and $c.FullName.Length -gt $root.Length -and
+            ($c.FullName.Substring(0, $root.Length) -ieq $root)) {
+            $rel = $c.FullName.Substring($root.Length).Replace('\', '/').TrimStart('/')
+        }
+        if ([string]::IsNullOrWhiteSpace($rel)) { $rel = $leaf }
+
+        $destination = "$destBase/$rel"
+
+        # The verify pass targets the destination's PARENT DIRECTORY with a
+        # FILE source, which keeps the comparison to that one leaf on both
+        # sides -- see .DESCRIPTION for why not the file path itself. $destBase
+        # always contains at least one '/', so LastIndexOf can never be -1
+        # here, but the guard costs nothing and a $destination of '' would
+        # otherwise become a check against the whole remote.
+        $slash      = $destination.LastIndexOf('/')
+        $destParent = if ($slash -gt 0) { $destination.Substring(0, $slash) } else { $destBase }
+
+        $copyArgs  = @('copyto', $c.FullName, $destination) + $common + $tuning
+        $checkArgs = @('check', $c.FullName, $destParent) + $common + @('--one-way')
+
+        $transfer = Invoke-TopazRcloneVerifiedTransfer -Config $cfg `
+            -CopyArgs $copyArgs -CheckArgs $checkArgs `
+            -Component 'stop' -Label 'Recovery upload' `
+            -Subject "'$($c.FullName)' -> '$destination'" `
+            -TimeoutSec $cfg.UploadTimeoutSec `
             -FailureContext "target=$destBase."
 
-        $lastVerified = $false
-        if ($lastCopied) {
-            Write-TopazLog -Component 'stop' -Level 'INFO' `
-                -Message "Recovery upload attempt $attempt of $maxAttempts (rclone check)."
-
-            $lastVerified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
-                -TimeoutSec $cfg.UploadTimeoutSec -Component 'stop' `
-                -SuccessMessage "Recovery upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED every candidate file." `
-                -FailureVerb "Recovery upload attempt $attempt of $maxAttempts (rclone check)" `
-                -FailureContext "target=$destBase."
+        if ($transfer.Copied -and $transfer.Verified) {
+            Write-RecoveryDisposition -File $c -Disposition 'uploaded+verified' -Detail "-> '$destination'."
         }
-
-        if ($lastCopied -and $lastVerified) { break }
-
-        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
-            Write-TopazLog -Component 'stop' -Level 'WARN' `
-                -Message "Recovery upload attempt $attempt of $maxAttempts failed (copied=$lastCopied verified=$lastVerified). Retrying once more in $($cfg.UploadRetryDelaySec)s."
-            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
-        }
-    }
-
-    $anyUnrecovered = $false
-    foreach ($c in $Candidates) {
-        if ($lastCopied -and $lastVerified) {
-            Write-RecoveryDisposition -File $c -Disposition 'uploaded+verified' -Detail "-> '$destBase'."
-        }
-        elseif ($lastCopied) {
-            # rclone copy succeeded (and validates its own transfer hash) but
+        elseif ($transfer.Copied) {
+            # rclone copyto succeeded (and validates its own transfer hash) but
             # the independent `check` pass did not confirm it -- a real,
             # distinct middle state between "safe" and "lost", per the task.
             $anyUnrecovered = $true
             Write-RecoveryDisposition -File $c -Disposition 'uploaded-but-unverified' `
-                -Detail "-> '$destBase', but rclone check could not confirm it after $maxAttempts attempt(s). Treat as UNCONFIRMED, not safe."
+                -Detail "-> '$destination', but rclone check could not confirm it after $($transfer.Attempts) attempt(s). Treat as UNCONFIRMED, not safe."
         }
         else {
             $anyUnrecovered = $true
             Write-RecoveryDisposition -File $c -Disposition 'NOT RECOVERED' `
-                -Detail "Both recovery upload attempts failed to even copy it. $notRecoveredDetail"
+                -Detail "All $($transfer.Attempts) recovery upload attempt(s) failed to even copy it. $notRecoveredDetail"
         }
     }
 
@@ -2326,9 +2781,12 @@ function Invoke-TopazIncrementalUpload {
         IT FINISHES, not only after the whole queue drains.
     .DESCRIPTION
         REUSES THE SAME rclone copy + check PLUMBING AS THE OTHER TWO UPLOAD
-        PATHS in this file (Invoke-TopazRenderUpload, Invoke-TopazRecoveryUpload),
-        but uses literal file-to-file `copyto` / `check` arguments rather than
-        a glob-style `--include`. Source/destination are OutputDir ->
+        PATHS in this file (Invoke-TopazRenderUpload, Invoke-TopazRecoveryUpload)
+        -- literally the same retry loop, Invoke-TopazRcloneVerifiedTransfer --
+        and uses literal file-to-file `copyto` / `check` arguments rather than
+        a glob-style `--include`. It was the first path to do so; the recovery
+        path has since been corrected to match, for the reason set out in its
+        own comment. Source/destination are OutputDir ->
         UploadTarget -- the SAME pair the final Stop-Sequence.ps1 sweep uses
         (unlike Invoke-TopazRecoveryUpload's distinct ".../recovered"
         destination for files found OUTSIDE OutputDir) -- so that when the
@@ -2361,9 +2819,26 @@ function Invoke-TopazIncrementalUpload {
         this specific loop is not worth it for a window this small and this
         well covered by DebounceSec/StallSec's own margins.
 
-        Uses the SAME single-retry policy as the other two upload paths
-        (Resolve-UploadRetryDecision, 2 attempts total, one retry after
-        UploadRetryDelaySec) -- not a bespoke retry count for this path.
+        Uses the SAME single-retry policy as the other two upload paths, from
+        the SAME implementation of it (Invoke-TopazRcloneVerifiedTransfer: 2
+        attempts total, one retry after UploadRetryDelaySec, via the pure
+        Resolve-UploadRetryDecision) -- not a bespoke retry count for this path.
+
+        A NOTE ON THE `check` DESTINATION SHAPE. This path checks the literal
+        file-to-file destination (`check <local file> <remote FILE>`), while
+        Invoke-TopazRecoveryUpload checks against the destination's PARENT
+        DIRECTORY. That asymmetry is knowingly left in place: a `check`
+        destination resolving to an existing FILE has not yet been exercised
+        against real rclone on this deployment (it postdates every recorded
+        end-to-end run in docs/13-15), and changing THIS path's shape blind
+        would trade one unverified shape for another. The failure mode if
+        rclone rejects it is loud in the watchdog log and non-destructive --
+        every poll logs 'Incremental upload FAILED' and the final
+        Stop-Sequence.ps1 sweep still uploads the file -- which is why the
+        recovery path, whose failure mode is a misleading disposition line
+        about a file that is about to be erased, got the conservative shape
+        first. Verify the round trip against real rclone and record it in
+        docs/05 before changing either.
     .PARAMETER Config
         Get-TopazAutoStopConfig object.
     .PARAMETER File
@@ -2400,9 +2875,8 @@ function Invoke-TopazIncrementalUpload {
     $rel = $File.FullName.Substring($outputRoot.Length).TrimStart('\').Replace('\', '/')
     $destination = "$($cfg.UploadTarget.TrimEnd('/'))/$rel"
 
-    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir `
-        -Base @('--config', $cfg.RcloneConfigPath, '--log-level', 'INFO')
-    $tuning = @('--transfers', '4', '--drive-chunk-size', '128M', '--retries', '3', '--low-level-retries', '10', '--stats', '1m')
+    $common = Get-TopazRcloneCommonArgs -Config $cfg
+    $tuning = Get-TopazRcloneTuningArgs
 
     $copyArgs  = @('copyto', $File.FullName, $destination) + $common + $tuning
     $checkArgs = @('check', $File.FullName, $destination) + $common + @('--one-way')
@@ -2410,43 +2884,24 @@ function Invoke-TopazIncrementalUpload {
     Write-TopazLog -Component 'watchdog' -Level 'INFO' `
         -Message "Incremental upload: '$($File.FullName)' ($($File.Length) bytes) looks finished (unlocked + size-stable for $($cfg.UploadStableSec)s) -- uploading now instead of waiting for the whole queue to complete (CORRECTION 3)."
 
-    $maxAttempts = 2
-    $copied      = $false
-    $verified    = $false
+    # Same copy/verify/retry loop as the other two upload paths, from the one
+    # shared implementation (Invoke-TopazRcloneVerifiedTransfer). What stays
+    # HERE is this path's own terminal policy: $false is never fatal.
+    $transfer = Invoke-TopazRcloneVerifiedTransfer -Config $cfg `
+        -CopyArgs $copyArgs -CheckArgs $checkArgs `
+        -Component 'watchdog' -Label 'Incremental upload' `
+        -Subject "'$($File.FullName)' -> '$destination'" `
+        -TimeoutSec $cfg.UploadTimeoutSec `
+        -FailureContext "target=$($cfg.UploadTarget)."
 
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
-            -TimeoutSec $cfg.UploadTimeoutSec -Component 'watchdog' `
-            -SuccessMessage "Incremental upload attempt $attempt of ${maxAttempts}: rclone copy of '$($File.Name)' completed." `
-            -FailureVerb "Incremental upload attempt $attempt of $maxAttempts (rclone copy) for '$($File.Name)'" `
-            -FailureContext "target=$($cfg.UploadTarget)."
-
-        $verified = $false
-        if ($copied) {
-            $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
-                -TimeoutSec $cfg.UploadTimeoutSec -Component 'watchdog' `
-                -SuccessMessage "Incremental upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED '$($File.Name)'." `
-                -FailureVerb "Incremental upload attempt $attempt of $maxAttempts (rclone check) for '$($File.Name)'" `
-                -FailureContext "target=$($cfg.UploadTarget)."
-        }
-
-        if ($copied -and $verified) { break }
-
-        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
-            Write-TopazLog -Component 'watchdog' -Level 'WARN' `
-                -Message "Incremental upload attempt $attempt of $maxAttempts failed for '$($File.Name)' (copied=$copied verified=$verified). Retrying once more in $($cfg.UploadRetryDelaySec)s."
-            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
-        }
-    }
-
-    if ($copied -and $verified) {
+    if ($transfer.Copied -and $transfer.Verified) {
         Write-TopazLog -Component 'watchdog' -Level 'INFO' `
             -Message "Incremental upload verified: '$($File.FullName)' ($($File.Length) bytes) safely in '$($cfg.UploadTarget)'. Marked as already-uploaded for this session; the final Stop-Sequence sweep will see it already present and skip it."
         return $true
     }
 
     Write-TopazLog -Component 'watchdog' -Level 'WARN' `
-        -Message "Incremental upload FAILED for '$($File.FullName)' after $maxAttempts attempt(s) (copied=$copied verified=$verified). NOT fatal -- left unmarked so a later poll or the final Stop-Sequence sweep retries it."
+        -Message "Incremental upload FAILED for '$($File.FullName)' after $($transfer.Attempts) attempt(s) (copied=$($transfer.Copied) verified=$($transfer.Verified)). NOT fatal -- left unmarked so a later poll or the final Stop-Sequence sweep retries it."
     return $false
 }
 
@@ -2549,7 +3004,7 @@ function Invoke-TopazOutputAnomalyHandling {
         }
         foreach ($f in $scan.SkippedInProgress) {
             Write-TopazLog -Component 'stop' -Level 'INFO' `
-                -Message "RECOVERY SCAN -- SKIPPED, IN PROGRESS: '$($f.FullName)', $($f.Length) bytes as of this read, last write $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff')). Recent and extension-matched, but still LOCKED (a writer holds it open) -- treated as Topaz's normal live intermediate, not a recovery candidate, and not allowed to decide the error class."
+                -Message "RECOVERY SCAN -- SKIPPED, IN PROGRESS: '$($f.FullName)', $($f.Length) bytes as of this read, last write $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff')). Recent and extension-matched, but still LOCKED -- some process holds a handle on it, most likely Topaz still writing its live intermediate, though a READ handle from an antivirus scan or a thumbnailer looks identical to this probe (see Test-FileUnlocked). Treated as an in-progress write, not a recovery candidate, and not allowed to decide the error class."
         }
 
         $decision = Resolve-OutputAnomalyClass -Reason $Reason -OutputDirHasFiles $OutputDirHasFiles `
@@ -2665,6 +3120,16 @@ function Invoke-TopazRenderUpload {
     .PARAMETER Reason
         'completed' | 'stalled' | 'maxlifetime' -- also decides whether the
         misplaced-output scan runs at all (see Resolve-OutputAnomalyClass).
+        The set is ENFORCED here, at the boundary, not left to the caller:
+        this function forwards $Reason to Invoke-TopazOutputAnomalyHandling,
+        which has always declared the same ValidateSet -- and one of those two
+        forwarding calls happens AFTER a multi-hour upload has already
+        succeeded and been logged "Safe to stop". An unvalidated value would
+        therefore turn a completed upload into an unhandled parameter-binding
+        exception mid-stop (nothing between here and Stop-Sequence.ps1 catches
+        it), leaving the box running with the render already safe. Failing at
+        the boundary, before any rclone work, is the same convention
+        Assert-ValidCompletionSignal / Assert-ValidStopStrategy follow.
     .OUTPUTS
         [bool] $true if the upload transferred AND verified (within 2
         attempts), OR if OutputDir was empty (always -- see above). $false
@@ -2673,7 +3138,7 @@ function Invoke-TopazRenderUpload {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Config,
-        [string]$Reason = 'completed'
+        [ValidateSet('completed', 'stalled', 'maxlifetime')][string]$Reason = 'completed'
     )
 
     $cfg = $Config
@@ -2736,78 +3201,44 @@ function Invoke-TopazRenderUpload {
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Uploading $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes), from '$($cfg.OutputDir)' to '$($cfg.UploadTarget)' (reason=$Reason). This MUST finish before the instance may stop."
 
-    # --drive-chunk-size trades memory for throughput on large files; 4
-    # transfers x 128M is ~512 MB of buffers, trivial on a 64 GB box and much
-    # faster than the 8 MiB default for multi-GB renders.
-    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir -Base @(
-        '--config', $cfg.RcloneConfigPath,
-        '--log-level', 'INFO'
-    )
-
-    $copyArgs = @('copy', $cfg.OutputDir, $cfg.UploadTarget) + $common + @(
-        '--transfers', '4',
-        '--drive-chunk-size', '128M',
-        '--retries', '3',
-        '--low-level-retries', '10',
-        '--stats', '1m'
-    )
+    $common = Get-TopazRcloneCommonArgs -Config $cfg
+    $copyArgs = @('copy', $cfg.OutputDir, $cfg.UploadTarget) + $common + (Get-TopazRcloneTuningArgs)
 
     # Independent verification pass. --one-way so pre-existing extra files at
     # the destination (previous sessions' renders) are not treated as errors.
     $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way')
 
-    # THE SINGLE UPLOAD RETRY. Previously a single copy+check failure returned
-    # $false straight away, which (with OutputIsEphemeral) refused the stop on
-    # the FIRST blip -- costing instance uptime for something a plain retry
-    # would often fix (a dropped connection mid-chunk, transient Drive-side
-    # rate limiting). $maxAttempts is a literal constant, not a Config.ps1
-    # knob -- see Resolve-UploadRetryDecision's own comment on why that bound
-    # is deliberately not operator-tunable. Each attempt redoes BOTH copy and
-    # check (a partial transfer is exactly the case a retry should fix, and
-    # re-running `check` alone against a partial copy would just re-confirm
-    # the same failure).
-    $maxAttempts = 2
-    $copied      = $false
-    $verified    = $false
+    # THE SINGLE UPLOAD RETRY lives in Invoke-TopazRcloneVerifiedTransfer, with
+    # the other two upload paths. Previously a single copy+check failure
+    # returned $false straight away, which (with OutputIsEphemeral) refused the
+    # stop on the FIRST blip -- costing instance uptime for something a plain
+    # retry would often fix (a dropped connection mid-chunk, transient
+    # Drive-side rate limiting).
+    #
+    # The success message used to end "See '$rcloneLog' for transfer detail.",
+    # naming a variable that only ever existed inside Build-RcloneLogFileArgs's
+    # own scope -- so the single most important line in the whole pipeline (the
+    # one confirming a multi-hour render reached Drive) rendered as "See ''".
+    # Dropped rather than reconstructed: Build-RcloneLogFileArgs deliberately
+    # returns its base UNCHANGED when the path cannot be resolved, so a
+    # hand-built literal would name a file rclone was never told to write --
+    # the same misleading pointer, differently spelled. rclone's own log, when
+    # there is one, sits beside stop.log in LogDir.
+    $transfer = Invoke-TopazRcloneVerifiedTransfer -Config $cfg `
+        -CopyArgs $copyArgs -CheckArgs $checkArgs `
+        -Component 'stop' -Label 'Upload' `
+        -Subject "'$($cfg.OutputDir)' -> '$($cfg.UploadTarget)'" `
+        -TimeoutSec $cfg.UploadTimeoutSec `
+        -FailureContext "target=$($cfg.UploadTarget)."
 
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        Write-TopazLog -Component 'stop' -Level 'INFO' `
-            -Message "Upload attempt $attempt of $maxAttempts (rclone copy)."
-
-        $copied = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $copyArgs `
-            -TimeoutSec $cfg.UploadTimeoutSec `
-            -Component 'stop' `
-            -SuccessMessage "Upload attempt $attempt of ${maxAttempts}: rclone copy completed. See '$rcloneLog' for transfer detail." `
-            -FailureVerb "Upload attempt $attempt of $maxAttempts (rclone copy)" `
-            -FailureContext "target=$($cfg.UploadTarget)."
-
-        $verified = $false
-        if ($copied) {
-            Write-TopazLog -Component 'stop' -Level 'INFO' `
-                -Message "Upload attempt $attempt of $maxAttempts (rclone check)."
-
-            $verified = Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `
-                -TimeoutSec $cfg.UploadTimeoutSec `
-                -Component 'stop' `
-                -SuccessMessage "Upload attempt $attempt of ${maxAttempts}: rclone check VERIFIED every file in '$($cfg.OutputDir)' is present and intact at '$($cfg.UploadTarget)'." `
-                -FailureVerb "Upload attempt $attempt of $maxAttempts (rclone check)" `
-                -FailureContext "target=$($cfg.UploadTarget)."
-        }
-
-        if ($copied -and $verified) { break }
-
-        if (Resolve-UploadRetryDecision -AttemptNumber $attempt -MaxAttempts $maxAttempts -Succeeded $false) {
-            Write-TopazLog -Component 'stop' -Level 'WARN' `
-                -Message "Upload attempt $attempt of $maxAttempts FAILED (copied=$copied verified=$verified). Retrying once more (attempt $($attempt + 1) of $maxAttempts) in $($cfg.UploadRetryDelaySec)s."
-            Start-Sleep -Seconds $cfg.UploadRetryDelaySec
-        }
-        else {
-            Write-TopazLog -Component 'stop' -Level 'ERROR' `
-                -Message "Upload attempt $attempt of $maxAttempts FAILED (copied=$copied verified=$verified). Both attempts (1 initial + 1 retry) exhausted; the instance will NOT be stopped while renders remain unuploaded on ephemeral storage."
-        }
+    # THIS path's terminal policy, deliberately kept out of the shared helper:
+    # OutputDir's own upload failing is the ONE upload outcome in this file
+    # that refuses a stop.
+    if (-not ($transfer.Copied -and $transfer.Verified)) {
+        Write-TopazLog -Component 'stop' -Level 'ERROR' `
+            -Message "Upload FAILED after $($transfer.Attempts) attempt(s) (copied=$($transfer.Copied) verified=$($transfer.Verified)). Both attempts (1 initial + 1 retry) exhausted; the instance will NOT be stopped while renders remain unuploaded on ephemeral storage."
+        return $false
     }
-
-    if (-not ($copied -and $verified)) { return $false }
 
     Write-TopazLog -Component 'stop' -Level 'INFO' `
         -Message "Upload verified: $($files.Count) file(s), $([math]::Round($totalBytes/1GB,2)) GiB ($totalBytes bytes) now safely in '$($cfg.UploadTarget)'. Safe to stop."
@@ -2822,6 +3253,10 @@ function Invoke-TopazRenderUpload {
 
     return $true
 }
+
+# ===========================================================================
+# SECTION 10 - FINAL COMPLETION SAFETY GATE AND STOP NOTIFICATION
+# ===========================================================================
 
 function Test-TopazOutputManifestUnchanged {
     <#
@@ -2928,7 +3363,7 @@ function Test-TopazCompletedStopSafetyGate {
         $locked = @($files | Where-Object { -not (Test-FileUnlocked -Path $_.FullName) })
         if ($locked.Count -gt 0) {
             Write-TopazLog -Component 'stop' -Level 'ERROR' `
-                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): $($locked.Count) OutputDir file(s) are still locked: $($locked.FullName -join ', ')."
+                -Message "FINAL COMPLETION SAFETY GATE REFUSED ($Phase): $($locked.Count) OutputDir file(s) are still locked: $($locked.FullName -join ', '). LOCKED HERE MEANS SOME PROCESS HOLDS A HANDLE, NOT NECESSARILY A WRITER -- an antivirus scan or a shell thumbnailer holding a READ handle produces exactly the same result (see Test-FileUnlocked). The watchdog will re-arm and retry, so this refusal costs uptime, not data."
             return [pscustomobject]@{ Safe = $false; Files = @() }
         }
         return [pscustomobject]@{ Safe = $true; Files = $files }
@@ -2964,10 +3399,7 @@ function Test-TopazCompletedStopSafetyGate {
         return $false
     }
 
-    $common = Build-RcloneLogFileArgs -LogDir $cfg.LogDir -Base @(
-        '--config', $cfg.RcloneConfigPath,
-        '--log-level', 'INFO'
-    )
+    $common = Get-TopazRcloneCommonArgs -Config $cfg
     $checkArgs = @('check', $cfg.OutputDir, $cfg.UploadTarget) + $common + @('--one-way')
 
     $checkOk = [bool](Invoke-TopazAwsCli -FileName $cfg.RclonePath -Arguments $checkArgs `

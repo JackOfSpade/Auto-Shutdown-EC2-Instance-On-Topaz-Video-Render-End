@@ -410,6 +410,153 @@ Describe 'Write-TopazLog timestamp contract' {
     }
 }
 
+Describe 'Write-TopazLog file output (directory creation, rotation, and failure degradation)' {
+
+    # WHAT THIS GUARDS. Everything above tests the CONSOLE half of the logger.
+    # The FILE half -- create the directory, roll at 5 MB, append, and never
+    # throw -- had no coverage at all, and that is the half that IS the
+    # post-mortem once the box has powered itself off: the incident
+    # reconstructions in docs/13-16 rest entirely on these files. It is also
+    # why this function silently emitted FOUR ErrorRecords per log line into
+    # its caller's error stream through every CI run: with an unresolvable
+    # LogDir, New-Item / Join-Path / Test-Path each failed NON-terminating,
+    # rotation was skipped without a word, and the only error the catch ever
+    # saw was Add-Content's downstream "Cannot bind argument to parameter
+    # 'LiteralPath' because it is null" -- a symptom, reported in place of the
+    # cause.
+    #
+    # TestDrive throughout, never 'C:\' -- these must run identically under
+    # pwsh 7 on a Linux CI runner and Windows PowerShell 5.1 on the guest.
+
+    BeforeEach {
+        # A FRESH directory per test: TestDrive is cleaned up when the block
+        # ends, not between individual It blocks, so a shared 'logs' folder
+        # would carry one test's log file (and its rotated backup) into the
+        # next test's assertions.
+        $script:LogRoot = Join-Path $TestDrive ('logs-' + [guid]::NewGuid().ToString('N'))
+        Mock Get-TopazAutoStopConfig { [pscustomobject]@{ LogDir = $script:LogRoot } }
+    }
+
+    It 'creates LogDir when it does not exist and writes the timestamped line to the per-component .log file' {
+        Test-Path -LiteralPath $script:LogRoot | Should -Be $false
+
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'first line' 6>$null
+
+        $logFile = Join-Path $script:LogRoot 'unit.log'
+        Test-Path -LiteralPath $logFile | Should -Be $true
+        (Get-Content -LiteralPath $logFile -Raw) | Should -Match '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}\] \[INFO\] first line'
+    }
+
+    It 'APPENDS rather than overwriting, preserving order across calls' {
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'line one' 6>$null
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'line two' 6>$null
+
+        $lines = @(Get-Content -LiteralPath (Join-Path $script:LogRoot 'unit.log'))
+        $lines.Count | Should -Be 2
+        $lines[0] | Should -Match 'line one'
+        $lines[1] | Should -Match 'line two'
+    }
+
+    It 'rotates a log larger than 5MB to the .log.1 backup and starts the live file fresh' {
+        New-Item -ItemType Directory -Path $script:LogRoot -Force | Out-Null
+        $logFile = Join-Path $script:LogRoot 'unit.log'
+        # One Set-Content of a repeated string, not a loop: this only has to be
+        # over the threshold, not realistic.
+        Set-Content -LiteralPath $logFile -Value ('x' * (5MB + 64)) -NoNewline
+        (Get-Item -LiteralPath $logFile).Length | Should -BeGreaterThan 5MB
+
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'after rotation' 6>$null
+
+        $rotated = Join-Path $script:LogRoot 'unit.log.1'
+        Test-Path -LiteralPath $rotated | Should -Be $true
+        (Get-Item -LiteralPath $rotated).Length | Should -BeGreaterThan 5MB
+        $live = @(Get-Content -LiteralPath $logFile)
+        $live.Count | Should -Be 1
+        $live[0] | Should -Match 'after rotation'
+    }
+
+    It 'replaces an EXISTING .log.1 backup rather than failing or leaving a third file behind' {
+        New-Item -ItemType Directory -Path $script:LogRoot -Force | Out-Null
+        $logFile = Join-Path $script:LogRoot 'unit.log'
+        $rotated = Join-Path $script:LogRoot 'unit.log.1'
+        Set-Content -LiteralPath $rotated -Value 'PREVIOUS BACKUP'
+        Set-Content -LiteralPath $logFile -Value ('y' * (5MB + 64)) -NoNewline
+
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'after second rotation' 6>$null
+
+        (Get-Content -LiteralPath $rotated -Raw) | Should -Not -Match 'PREVIOUS BACKUP'
+        @(Get-ChildItem -LiteralPath $script:LogRoot -File).Count | Should -Be 2
+    }
+
+    It 'does not grow the file when it is under the 5MB threshold (no premature rotation)' {
+        New-Item -ItemType Directory -Path $script:LogRoot -Force | Out-Null
+        $logFile = Join-Path $script:LogRoot 'unit.log'
+        Set-Content -LiteralPath $logFile -Value 'small existing content'
+
+        Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'appended' 6>$null
+
+        Test-Path -LiteralPath (Join-Path $script:LogRoot 'unit.log.1') | Should -Be $false
+        (Get-Content -LiteralPath $logFile -Raw) | Should -Match 'small existing content'
+    }
+
+    It 'degrades a write failure to a WARN naming the THROWN cause, and never throws' {
+        Mock Add-Content { throw 'simulated disk full' }
+
+        { Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'doomed' 6>$null 3>$null } | Should -Not -Throw
+
+        $warnings = @(Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'doomed' 6>$null 3>&1)
+        $joined = ($warnings | ForEach-Object { "$_" }) -join "`n"
+        $joined | Should -Match 'Failed to write log file'
+        # The CAUSE, not a downstream null-binding artefact.
+        $joined | Should -Match 'simulated disk full'
+    }
+
+    It 'degrades an UNRESOLVABLE LogDir to exactly ONE warning, with at most one ErrorRecord (was four per line)' {
+        # A drive qualifier that exists on neither platform: 'C:' would silently
+        # NOT reproduce the failure on the real Windows guest.
+        Mock Get-TopazAutoStopConfig { [pscustomobject]@{ LogDir = 'Q:\nope\logs' } }
+
+        # $Error is global and accumulates across the whole suite.
+        $Error.Clear()
+        $warnings = @(Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'unresolvable' 6>$null 3>&1)
+
+        @($warnings).Count | Should -Be 1
+        "$($warnings[0])" | Should -Match 'Failed to write log file'
+        $Error.Count | Should -BeLessOrEqual 1
+    }
+
+    It 'writes the console/stream line and keeps going even when the CONFIG ITSELF fails to load' {
+        # The three Assert-Valid* guards exist to fail loudly at load. If the
+        # logger depends on a VALID config, "loudly" becomes "silently" for the
+        # exact failure the operator most needs recorded: the scheduled tasks
+        # run -WindowStyle Hidden with no redirection, so an unlogged error
+        # leaves nothing on the box at all.
+        Mock Get-TopazAutoStopConfig { throw "CompletionSignal 'WorkerOny' is invalid." }
+
+        { Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'config is broken' 6>$null 3>$null } |
+            Should -Not -Throw
+
+        $info = @(Write-TopazLog -Component 'unit' -Level 'INFO' -Message 'config is broken' 3>$null 6>&1)
+        "$info" | Should -Match 'config is broken'
+    }
+
+}
+
+Describe 'Write-TopazLog fallback LogDir drift guard' {
+    # Deliberately OUTSIDE the block above, which mocks Get-TopazAutoStopConfig:
+    # this assertion is about the REAL shipped config value.
+
+    It 'keeps the hardcoded fallback LogDir identical to the shipped config value' {
+        # The literal in Write-TopazLog is deliberately duplicated from
+        # Get-TopazAutoStopConfig's LogDir so logging survives a config that
+        # fails validation. Duplication is only safe while something notices
+        # when the two drift apart.
+        $shipped = (Get-TopazAutoStopConfig).LogDir
+        $shipped | Should -Be 'C:\topaz-autostop\logs'
+        (Get-Command Write-TopazLog).Definition | Should -Match ([regex]::Escape("`$logDir = '$shipped'"))
+    }
+}
+
 Describe 'Assert-ValidCompletionSignal' {
 
     It 'does not throw for WorkerOnly' {
@@ -1030,6 +1177,19 @@ Describe 'Get-TopazAutoStopConfig (misplaced-output anomaly + upload-retry + inc
         $script:cfg.RecoveryScanMaxDepth | Should -BeGreaterThan 0
         $script:cfg.RecoveryScanTimeoutSec | Should -BeOfType [int]
         $script:cfg.RecoveryScanTimeoutSec | Should -BeGreaterThan 0
+    }
+
+    It 'RecoveryUploadTimeoutSec is a positive integer bounding the WHOLE per-candidate recovery upload phase' {
+        # Recovery upload runs one rclone copyto+check pair per candidate, so
+        # this aggregate budget is what keeps
+        # Get-TopazStopSequenceExecutionTimeLimit finite: without it the honest
+        # worst case is RecoveryScanMaxFiles x UploadTimeoutSec.
+        $script:cfg.RecoveryUploadTimeoutSec | Should -BeOfType [int]
+        $script:cfg.RecoveryUploadTimeoutSec | Should -BeGreaterThan 0
+        # Sanity floor, not a pin: a budget shorter than a single realistic
+        # multi-GB transfer would make every candidate after the first read as
+        # "never attempted".
+        $script:cfg.RecoveryUploadTimeoutSec | Should -BeGreaterOrEqual 1800
     }
 
     It 'RecoveryMaxAgeMin is a positive integer (the recency bound Invoke-TopazOutputAnomalyHandling turns into -ModifiedAfter)' {
@@ -1935,6 +2095,30 @@ Describe 'Invoke-TopazRenderUpload (upload retry loop + unconditional anomaly-sc
         }
     }
 
+    Context 'Reason is validated at the boundary, not left to the caller' {
+        It 'throws for a Reason outside the documented set, BEFORE any rclone work happens' {
+            # Without the ValidateSet here, a bad value bound fine and only blew
+            # up when this function forwarded it to
+            # Invoke-TopazOutputAnomalyHandling -- and one of those two forwards
+            # happens AFTER a multi-hour upload has succeeded and "Safe to stop"
+            # has been logged, turning a completed upload into an unhandled
+            # parameter-binding exception mid-stop.
+            Mock Invoke-TopazAwsCli { throw 'rclone must never run for an invalid Reason' }
+            $cfg = Get-UploadTestConfig
+
+            { Invoke-TopazRenderUpload -Config $cfg -Reason 'bogus' } | Should -Throw
+            Should -Invoke Invoke-TopazAwsCli -Times 0 -Exactly
+        }
+
+        It 'accepts every value Stop-Sequence.ps1 and Invoke-TopazOutputAnomalyHandling declare' {
+            Mock Invoke-TopazAwsCli { return $true }
+            $cfg = Get-UploadTestConfig
+            foreach ($reason in @('completed', 'stalled', 'maxlifetime')) {
+                { Invoke-TopazRenderUpload -Config $cfg -Reason $reason } | Should -Not -Throw
+            }
+        }
+    }
+
     Context 'OutputDir enumeration failure is fail-closed' {
         It 'returns $false, logs an error, and never invokes rclone rather than uploading a partial listing' {
             Mock Get-ChildItem { throw 'simulated access failure' }
@@ -2111,14 +2295,28 @@ Describe 'Test-TopazOutputManifestUnchanged' {
 
 Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS A)' {
     # Same retry plumbing/cap as Invoke-TopazRenderUpload, reused via the same
-    # Resolve-UploadRetryDecision helper -- but the TERMINAL behaviour is
+    # Invoke-TopazRcloneVerifiedTransfer helper -- but the TERMINAL behaviour is
     # deliberately different (see the function's own comment): this never
     # gates the stop, it only ever affects what gets logged as each file's
     # disposition.
+    #
+    # THE ARGUMENT-SHAPE TESTS BELOW ARE THE POINT OF THIS BLOCK, not an extra.
+    # Every assertion here used to inspect $Arguments[0] alone -- the rclone
+    # VERB -- which is precisely why this path could pass the whole suite while
+    # scoping its batched `copy` with `--include <raw filename>`. rclone filter
+    # patterns are globs, so a candidate named 'cut[final].mov' selected NOTHING,
+    # both rclone calls exited 0 with nothing to do, and every candidate was
+    # logged 'uploaded+verified' moments before the stop erased the volume
+    # holding it. Assert the whole argument list, per candidate.
 
     BeforeAll {
         function Get-RecoveryTestConfig {
-            param([bool]$OutputIsEphemeral = $true, [int]$RetryDelaySec = 0, [bool]$RcloneAvailable = $true)
+            param(
+                [bool]$OutputIsEphemeral = $true,
+                [int]$RetryDelaySec = 0,
+                [bool]$RcloneAvailable = $true,
+                [int]$RecoveryUploadTimeoutSec = 5400
+            )
             [pscustomobject]@{
                 RclonePath          = if ($RcloneAvailable) { 'C:\fake\rclone.exe' } else { 'C:\missing\rclone.exe' }
                 RcloneConfigPath    = 'C:\fake\rclone.conf'
@@ -2128,6 +2326,7 @@ Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS 
                 UploadTimeoutSec    = 14400
                 UploadRetryDelaySec = $RetryDelaySec
                 OutputIsEphemeral   = $OutputIsEphemeral
+                RecoveryUploadTimeoutSec = $RecoveryUploadTimeoutSec
             }
         }
 
@@ -2178,9 +2377,162 @@ Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS 
             $cfg = Get-RecoveryTestConfig
             $result = Invoke-TopazRecoveryUpload -Config $cfg -Candidates @((Get-TestCandidate))
             $result.AnyUnrecovered | Should -Be $false
-            $script:CallSeq | Should -Be @('copy', 'check')
+            $script:CallSeq | Should -Be @('copyto', 'check')
             Should -Invoke Invoke-TopazAwsCli -Times 2 -Exactly
             ($script:Logged -join "`n") | Should -Match 'uploaded\+verified'
+        }
+    }
+
+    Context 'the rclone ARGUMENT SHAPE per candidate (the guard the --include defect slipped past)' {
+        It 'transfers each candidate with a LITERAL copyto into the recovered/ folder, keeping its path relative to the volume root, and never with a filter' {
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments -join ' ')
+                return $true
+            }
+            $cfg = Get-RecoveryTestConfig
+            [void] (Invoke-TopazRecoveryUpload -Config $cfg -Candidates @(
+                (Get-TestCandidate -Name 'D:\SDR_Render_video3_slp.mov'),
+                (Get-TestCandidate -Name 'D:\stray\second.mov')
+            ))
+
+            $joined = $script:CallSeq -join ' | '
+            $joined | Should -Match ([regex]::Escape('copyto D:\SDR_Render_video3_slp.mov gdrive:temp/recovered/SDR_Render_video3_slp.mov'))
+            $joined | Should -Match ([regex]::Escape('copyto D:\stray\second.mov gdrive:temp/recovered/stray/second.mov'))
+            # A filter of ANY kind here re-arms the defect: a glob that matches
+            # nothing makes rclone exit 0 with nothing transferred.
+            $joined | Should -Not -Match '--include'
+            $joined | Should -Not -Match '--filter'
+        }
+
+        It 'verifies against the destination''s PARENT DIRECTORY with a file source (the shape rclone is known to accept), one-way' {
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments -join ' ')
+                return $true
+            }
+            $cfg = Get-RecoveryTestConfig
+            [void] (Invoke-TopazRecoveryUpload -Config $cfg -Candidates @((Get-TestCandidate -Name 'D:\stray\second.mov')))
+
+            $joined = $script:CallSeq -join ' | '
+            $joined | Should -Match ([regex]::Escape('check D:\stray\second.mov gdrive:temp/recovered/stray'))
+            $joined | Should -Match '--one-way'
+        }
+
+        It 'preserves a filename containing rclone filter metacharacters EXACTLY, and does not report it verified without transferring it' {
+            # THE REGRESSION TEST FOR THE CRITICAL DEFECT. 'cut[final]*?.mov' as
+            # an --include pattern matches no file on disk; copy and check both
+            # exit 0 having done nothing, and the file was logged
+            # 'uploaded+verified' while never leaving the volume.
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments -join ' ')
+                # Fail unless the literal name is present, i.e. model an rclone
+                # that cannot find a file whose name was mangled into a glob.
+                return (($Arguments -join ' ') -match ([regex]::Escape('cut[final]*?.mov')))
+            }
+            $cfg = Get-RecoveryTestConfig
+            $result = Invoke-TopazRecoveryUpload -Config $cfg -Candidates @((Get-TestCandidate -Name 'D:\cut[final]*?.mov'))
+
+            $joined = $script:CallSeq -join ' | '
+            $joined | Should -Match ([regex]::Escape('copyto D:\cut[final]*?.mov gdrive:temp/recovered/cut[final]*?.mov'))
+            $joined | Should -Match ([regex]::Escape('check D:\cut[final]*?.mov gdrive:temp/recovered'))
+            $joined | Should -Not -Match '--include'
+            $result.AnyUnrecovered | Should -Be $false
+            ($script:Logged -join "`n") | Should -Match 'uploaded\+verified'
+        }
+
+        It 'flattens a candidate that is not under the resolvable volume root to a leaf name, never pasting a drive letter into the remote path' {
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments -join ' ')
+                return $true
+            }
+            # OutputDir with no drive-letter root: Get-TopazWindowsPathRoot
+            # returns '' (it does on a non-Windows runner for any non 'X:\'
+            # path), which the old substring arithmetic would have turned into
+            # 'gdrive:temp/recovered/D:/orphan.mov'.
+            $cfg = Get-RecoveryTestConfig
+            $cfg.OutputDir = '\\server\share\Renders'
+            [void] (Invoke-TopazRecoveryUpload -Config $cfg -Candidates @((Get-TestCandidate -Name 'D:\orphan.mov')))
+
+            $joined = $script:CallSeq -join ' | '
+            $joined | Should -Match ([regex]::Escape('copyto D:\orphan.mov gdrive:temp/recovered/orphan.mov'))
+            $joined | Should -Not -Match ([regex]::Escape('recovered/D:'))
+        }
+    }
+
+    Context 'the disposition is a PER-FILE verdict, not one batch verdict replicated across every candidate' {
+        It 'reports each candidate on its own outcome when rclone succeeds for one file and fails for another' {
+            # The batched implementation logged the SAME verdict for every
+            # candidate, because `rclone copy` exits nonzero if ANY file in the
+            # batch failed -- so three safely-uploaded files were reported
+            # 'PERMANENTLY DESTROYED ... UNRECOVERABLE' alongside the one that
+            # really did fail.
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments[0])
+                return (($Arguments -join ' ') -match 'good\.mov')
+            }
+            $cfg = Get-RecoveryTestConfig
+            $result = Invoke-TopazRecoveryUpload -Config $cfg -Candidates @(
+                (Get-TestCandidate -Name 'D:\good.mov'),
+                (Get-TestCandidate -Name 'D:\bad.mov')
+            )
+
+            $result.AnyUnrecovered | Should -Be $true
+            $dispositions = @($script:Logged | Where-Object { $_ -match 'RECOVERY DISPOSITION' })
+            @($dispositions).Count | Should -Be 2
+            @($dispositions | Where-Object { $_ -match 'uploaded\+verified' -and $_ -match 'good\.mov' }).Count | Should -Be 1
+            @($dispositions | Where-Object { $_ -match 'NOT RECOVERED' -and $_ -match 'bad\.mov' }).Count | Should -Be 1
+            # The safe file must NOT be told it is about to be destroyed.
+            @($dispositions | Where-Object { $_ -match 'good\.mov' -and $_ -match 'PERMANENTLY DESTROYED' }).Count | Should -Be 0
+        }
+
+        It 'gives each candidate its own copy+check pair (2 files x copyto+check = 4 rclone calls), not one batch for all of them' {
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments[0])
+                return $true
+            }
+            $cfg = Get-RecoveryTestConfig
+            [void] (Invoke-TopazRecoveryUpload -Config $cfg -Candidates @(
+                (Get-TestCandidate -Name 'D:\one.mov'),
+                (Get-TestCandidate -Name 'D:\two.mov')
+            ))
+            $script:CallSeq | Should -Be @('copyto', 'check', 'copyto', 'check')
+        }
+    }
+
+    Context 'the phase-wide wall-clock budget (RecoveryUploadTimeoutSec)' {
+        It 'still attempts the FIRST candidate in full even with a zero budget, then reports the rest as never attempted' {
+            # The budget is checked BETWEEN candidates, never mid-transfer, so a
+            # single misplaced render is never cut short by it -- and a file the
+            # phase never reached must say so rather than borrow the wording of
+            # a transfer that was tried and failed.
+            Mock Test-Path { $true }
+            Mock Invoke-TopazAwsCli {
+                param($Arguments)
+                $script:CallSeq.Add($Arguments[0])
+                return $true
+            }
+            $cfg = Get-RecoveryTestConfig -RecoveryUploadTimeoutSec 0
+            $result = Invoke-TopazRecoveryUpload -Config $cfg -Candidates @(
+                (Get-TestCandidate -Name 'D:\first.mov'),
+                (Get-TestCandidate -Name 'D:\second.mov')
+            )
+
+            $script:CallSeq | Should -Be @('copyto', 'check')
+            $result.AnyUnrecovered | Should -Be $true
+            $joined = $script:Logged -join "`n"
+            $joined | Should -Match 'first\.mov.*uploaded\+verified|uploaded\+verified.*first\.mov'
+            $joined | Should -Match 'NEVER RUN for it'
         }
     }
 
@@ -2195,7 +2547,7 @@ Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS 
             $cfg = Get-RecoveryTestConfig
             $result = Invoke-TopazRecoveryUpload -Config $cfg -Candidates @((Get-TestCandidate))
             $result.AnyUnrecovered | Should -Be $true
-            $script:CallSeq | Should -Be @('copy', 'copy')
+            $script:CallSeq | Should -Be @('copyto', 'copyto')
             Should -Invoke Invoke-TopazAwsCli -Times 2 -Exactly
         }
 
@@ -2235,7 +2587,7 @@ Describe 'Invoke-TopazRecoveryUpload (recovery upload retry loop -- ERROR CLASS 
             Mock Test-Path { $true }
             Mock Invoke-TopazAwsCli {
                 param($Arguments)
-                if ($Arguments[0] -eq 'copy') { return $true }
+                if ($Arguments[0] -eq 'copyto') { return $true }
                 return $false
             }
             $cfg = Get-RecoveryTestConfig
@@ -2607,7 +2959,7 @@ Describe 'Invoke-TopazIncrementalUpload (CORRECTION 3 -- upload each render as i
 }
 
 Describe 'Get-TopazStopSequenceExecutionTimeLimit' {
-    It 'covers final and recovery uploads, retry delays, and every stop-plan verification wait' {
+    It 'covers final and recovery uploads, the recovery phase budget, retry delays, and every stop-plan verification wait' {
         $cfg = [pscustomobject]@{
             S3SyncTarget        = 's3://bucket/renders'
             S3SyncTimeoutSec    = 1800
@@ -2615,6 +2967,7 @@ Describe 'Get-TopazStopSequenceExecutionTimeLimit' {
             UploadTimeoutSec    = 14400
             UploadRetryDelaySec = 15
             RecoveryScanTimeoutSec = 60
+            RecoveryUploadTimeoutSec = 5400
             TopazForensicTimeoutSec = 10
             SnsTopicArn         = 'arn:aws:sns:us-east-1:123456789012:topic'
             AwsCliTimeoutSec    = 60
@@ -2625,9 +2978,405 @@ Describe 'Get-TopazStopSequenceExecutionTimeLimit' {
         $limit = Get-TopazStopSequenceExecutionTimeLimit -Config $cfg
 
         # 5m margin + 30m S3 + final/recovery (each 2 attempts x copy+check
-        # x 4h, plus one retry) + final 4h check + 1m recovery scan + 10s
-        # forensic capture + 1m SNS + 1m EC2 API + 2 x 5m verification.
-        $limit.TotalSeconds | Should -Be (300 + 1800 + (9 * 14400) + (2 * 15) + 60 + 10 + 60 + 60 + (2 * 300))
+        # x 4h, plus one retry) + final 4h check + the recovery phase's own
+        # 90m aggregate budget + 1m recovery scan + 10s forensic capture +
+        # 1m SNS + 1m EC2 API + 2 x 5m verification.
+        #
+        # THE RECOVERY TERM IS LOAD-BEARING, not bookkeeping. Recovery upload
+        # is now one rclone copyto+check pair PER CANDIDATE, so without an
+        # aggregate bound in the function under test the honest worst case
+        # would be RecoveryScanMaxFiles (200) x 4h -- a scheduled-task
+        # ExecutionTimeLimit measured in months. The 9 x UploadTimeoutSec above
+        # still covers the one candidate that may be in flight when the budget
+        # expires (it is checked between candidates, never mid-transfer).
+        $limit.TotalSeconds | Should -Be (300 + 1800 + (9 * 14400) + (2 * 15) + 5400 + 60 + 10 + 60 + 60 + (2 * 300))
         $limit.TotalHours | Should -BeGreaterThan 36
+    }
+
+    It 'omits the recovery-upload phase budget entirely when no UploadTarget is configured (no upload can run)' {
+        $cfg = [pscustomobject]@{
+            S3SyncTarget        = ''
+            S3SyncTimeoutSec    = 1800
+            UploadTarget        = ''
+            UploadTimeoutSec    = 14400
+            UploadRetryDelaySec = 15
+            RecoveryScanTimeoutSec = 60
+            RecoveryUploadTimeoutSec = 5400
+            TopazForensicTimeoutSec = 10
+            SnsTopicArn         = ''
+            AwsCliTimeoutSec    = 60
+            StopStrategy        = 'GuestShutdown'
+            StopVerifySec       = 300
+        }
+
+        $limit = Get-TopazStopSequenceExecutionTimeLimit -Config $cfg
+        $limit.TotalSeconds | Should -Be (300 + 60 + 10 + 300)
+    }
+}
+
+Describe 'Get-TopazOutputFiles' {
+    # WHAT THIS GUARDS. This is the ONE recursive OutputDir enumerator, and its
+    # contract is fail-closed: return the COMPLETE snapshot or throw, because
+    # `Get-ChildItem -ErrorAction SilentlyContinue` returns a PARTIAL list after
+    # an access or I/O error -- which would make an incomplete upload look
+    # complete and permit the stop that erases the ephemeral volume. Three
+    # safety-critical decisions rest on it (Invoke-TopazRenderUpload's upload
+    # gate, Test-TopazCompletedStopSafetyGate's two manifest snapshots, and the
+    # watchdog's incremental-upload poll), yet every one of their test blocks
+    # MOCKS it -- so until now nothing exercised the real implementation, and a
+    # "simplification" to SilentlyContinue would have passed CI.
+    #
+    # TestDrive throughout, never 'D:\', so this runs identically under pwsh 7
+    # on a Linux CI runner and Windows PowerShell 5.1 on the guest.
+
+    It 'throws for a path that does not exist rather than returning an empty list' {
+        # "Empty" and "unreadable" must never be the same answer: an empty
+        # OutputDir is treated as "nothing to upload, proceed".
+        $missing = Join-Path $TestDrive 'no-such-directory'
+        { Get-TopazOutputFiles -Path $missing } | Should -Throw '*does not exist or is not a directory*'
+    }
+
+    It 'throws for a path that is a FILE rather than a directory' {
+        $file = Join-Path $TestDrive 'not-a-directory.txt'
+        Set-Content -LiteralPath $file -Value 'x'
+        { Get-TopazOutputFiles -Path $file } | Should -Throw '*does not exist or is not a directory*'
+    }
+
+    It 'returns every file recursively, and NO directory objects' {
+        # Directories are filtered via PSIsContainer, not Get-ChildItem's -File
+        # dynamic parameter (which is unavailable whenever path resolution
+        # fails, including under a mocked Get-ChildItem).
+        $root = Join-Path $TestDrive 'outputdir'
+        $nested = Join-Path $root 'nested'
+        New-Item -ItemType Directory -Path $nested -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'top.mov') -Value 'a'
+        Set-Content -LiteralPath (Join-Path $nested 'deep.mov') -Value 'b'
+
+        $files = @(Get-TopazOutputFiles -Path $root)
+
+        $files.Count | Should -Be 2
+        @($files | Where-Object { $_.PSIsContainer }).Count | Should -Be 0
+        @($files | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('deep.mov', 'top.mov')
+    }
+
+    It 'returns an empty list (without throwing) for a directory that really is empty' {
+        $root = Join-Path $TestDrive 'empty-outputdir'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+        $files = @(Get-TopazOutputFiles -Path $root)
+        $files.Count | Should -Be 0
+    }
+
+    It 'PROPAGATES a mid-enumeration failure instead of returning the partial list collected so far' {
+        # The whole point of the -ErrorAction Stop: a truncated listing that
+        # reaches a caller looks exactly like a smaller OutputDir.
+        $root = Join-Path $TestDrive 'partial-outputdir'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Mock Get-ChildItem {
+            [pscustomobject]@{ FullName = 'one.mov'; Name = 'one.mov'; Length = 1 }
+            throw 'simulated I/O failure halfway through the walk'
+        }
+
+        { Get-TopazOutputFiles -Path $root } | Should -Throw '*simulated I/O failure*'
+    }
+
+    It 'does not silence enumeration errors (no -ErrorAction SilentlyContinue/Ignore in the ENUMERATION call)' {
+        # Asserted against the parsed BODY, not (Get-Command).Definition as a
+        # whole: the comment-based help legitimately contains the words
+        # "SilentlyContinue" while explaining why the code must not use it.
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            (Get-Command Get-TopazOutputFiles).Definition, [ref]$null, [ref]$null)
+        $commands = $ast.FindAll(
+            { param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+
+        foreach ($command in $commands) {
+            $text = $command.Extent.Text
+            $text | Should -Not -Match 'SilentlyContinue'
+            $text | Should -Not -Match 'ErrorAction\s+Ignore'
+        }
+    }
+}
+
+Describe 'Invoke-TopazAwsCli' {
+    # WHAT THIS GUARDS. This is the bounded process launcher behind every rclone
+    # copy/check, the S3 sync, the SNS publish and the EC2 stop call -- and its
+    # $false is ultimately what makes Invoke-TopazRenderUpload return $false,
+    # which is what makes Stop-Sequence.ps1 REFUSE to erase an ephemeral render.
+    # Every existing test mocks it away, so none of its three failure contracts
+    # (timeout -> Kill + WARN + $false; nonzero exit -> WARN with the output
+    # tail + $false; launch failure -> WARN + $false) was exercised at all. A
+    # regression that turned a nonzero exit into $true would pass CI and convert
+    # a failed upload into permission to erase the scratch volume.
+    #
+    # Real child processes, not mocks -- but the CURRENT PowerShell host,
+    # resolved via (Get-Process -Id $PID).Path, so the same tests run on pwsh 7
+    # (Linux CI) and Windows PowerShell 5.1 (the guest). Deliberately NOT
+    # `sh -c`, which would fail the Windows half of that contract.
+
+    BeforeAll {
+        $script:PsHost = (Get-Process -Id $PID).Path
+    }
+
+    BeforeEach {
+        $script:Logged = New-Object System.Collections.Generic.List[string]
+        Mock Write-TopazLog {
+            param($Message, $Level)
+            $script:Logged.Add("[$Level] $Message")
+        }
+    }
+
+    It 'returns $true and logs the SuccessMessage on a clean exit 0' {
+        $ok = Invoke-TopazAwsCli -FileName $script:PsHost `
+            -Arguments @('-NoProfile', '-Command', 'exit 0') `
+            -TimeoutSec 60 -Component 'test' `
+            -SuccessMessage 'PROBE SUCCEEDED' -FailureVerb 'probe'
+
+        $ok | Should -Be $true
+        ($script:Logged -join "`n") | Should -Match 'PROBE SUCCEEDED'
+    }
+
+    It 'returns $false on a NONZERO exit, naming the exit code and the captured output tail' {
+        $ok = Invoke-TopazAwsCli -FileName $script:PsHost `
+            -Arguments @('-NoProfile', '-Command', 'Write-Output "boom detail"; exit 3') `
+            -TimeoutSec 60 -Component 'test' `
+            -SuccessMessage 'must not be logged' -FailureVerb 'probe' -FailureContext 'target=nowhere.'
+
+        $ok | Should -Be $false
+        $joined = $script:Logged -join "`n"
+        $joined | Should -Match '\[WARN\] probe exited with code 3'
+        $joined | Should -Match 'boom detail'
+        $joined | Should -Match 'target=nowhere\.'
+        $joined | Should -Not -Match 'must not be logged'
+    }
+
+    It 'returns $false when the executable cannot be launched at all' {
+        $ok = Invoke-TopazAwsCli -FileName 'topaz-definitely-not-a-real-binary-xyz' `
+            -Arguments @('--version') `
+            -TimeoutSec 60 -Component 'test' `
+            -SuccessMessage 'must not be logged' -FailureVerb 'probe'
+
+        $ok | Should -Be $false
+        ($script:Logged -join "`n") | Should -Match '\[WARN\] probe failed:'
+    }
+
+    It 'kills the child and returns $false when it outlives TimeoutSec, rather than blocking the stop path forever' {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $ok = Invoke-TopazAwsCli -FileName $script:PsHost `
+            -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') `
+            -TimeoutSec 2 -Component 'test' `
+            -SuccessMessage 'must not be logged' -FailureVerb 'probe'
+        $sw.Stop()
+
+        $ok | Should -Be $false
+        ($script:Logged -join "`n") | Should -Match 'probe timed out after 2s'
+        # The bound is the point: it must return in ~2s, not in 30.
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 20
+    }
+
+    It 'passes each argument through ConvertTo-TopazCliArgument, so one containing spaces arrives as ONE argument' {
+        # The join into ProcessStartInfo.Arguments is the piece
+        # ConvertTo-TopazCliArgument's own unit tests cannot cover: an argument
+        # that silently splits would make rclone operate on the wrong path.
+        # -File, not -Command: only -File hands the remaining arguments to the
+        # script as $args, which is the round trip under test.
+        $probeScript = Join-Path $TestDrive 'argument-probe.ps1'
+        Set-Content -LiteralPath $probeScript `
+            -Value 'if ($args.Count -eq 1 -and $args[0] -eq "a b c") { exit 0 } else { exit 9 }'
+
+        $ok = Invoke-TopazAwsCli -FileName $script:PsHost `
+            -Arguments @('-NoProfile', '-File', $probeScript, 'a b c') `
+            -TimeoutSec 60 -Component 'test' `
+            -SuccessMessage 'ARGUMENT ARRIVED INTACT' -FailureVerb 'probe'
+
+        $ok | Should -Be $true
+        ($script:Logged -join "`n") | Should -Match 'ARGUMENT ARRIVED INTACT'
+    }
+}
+
+Describe 'Invoke-TopazRcloneVerifiedTransfer (the ONE copy+verify+retry loop, shared by all three upload paths)' {
+    # This loop used to exist three times, once per upload path. That is how the
+    # recovery path kept a glob-based --include scope long after the incremental
+    # path had been fixed to use literal paths for exactly the reason the
+    # recovery path needed it too. These tests pin the shared contract; each
+    # caller's own Describe pins what it DOES with the result, which is where
+    # the three legitimately differ.
+
+    BeforeAll {
+        function Get-TransferTestConfig {
+            param([int]$RetryDelaySec = 0)
+            [pscustomobject]@{
+                RclonePath          = 'C:\fake\rclone.exe'
+                UploadRetryDelaySec = $RetryDelaySec
+            }
+        }
+    }
+
+    BeforeEach {
+        Mock Start-Sleep { }
+        $script:CallSeq = New-Object System.Collections.Generic.List[string]
+        $script:Logged  = New-Object System.Collections.Generic.List[string]
+        Mock Write-TopazLog {
+            param($Message, $Level)
+            $script:Logged.Add("[$Level] $Message")
+        }
+    }
+
+    It 'runs copy then check once each on a first-attempt success, and reports Attempts=1' {
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:CallSeq.Add($Arguments[0])
+            return $true
+        }
+        $result = Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copy', 'src', 'dst') -CheckArgs @('check', 'src', 'dst') `
+            -Component 'stop' -Label 'Upload' -Subject "'src' -> 'dst'" -TimeoutSec 60
+
+        $result.Copied | Should -Be $true
+        $result.Verified | Should -Be $true
+        $result.Attempts | Should -Be 1
+        $script:CallSeq | Should -Be @('copy', 'check')
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'never runs the check when the copy failed (it would only re-confirm the same failure)' {
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:CallSeq.Add($Arguments[0])
+            return $false
+        }
+        $result = Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copy', 'src', 'dst') -CheckArgs @('check', 'src', 'dst') `
+            -Component 'stop' -Label 'Upload' -Subject "'src' -> 'dst'" -TimeoutSec 60
+
+        $script:CallSeq | Should -Be @('copy', 'copy')
+        $result.Copied | Should -Be $false
+        $result.Verified | Should -Be $false
+    }
+
+    It 'caps at exactly 2 attempts, sleeping UploadRetryDelaySec exactly once, and reports Attempts=2' {
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:CallSeq.Add($Arguments[0])
+            return $false
+        }
+        $result = Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copy', 'src', 'dst') -CheckArgs @('check', 'src', 'dst') `
+            -Component 'stop' -Label 'Upload' -Subject "'src' -> 'dst'" -TimeoutSec 60
+
+        # Attempts must be the attempts actually RUN -- the loop variable is one
+        # past the cap once it finishes, which would misreport 3 on a 2-attempt
+        # policy and put a wrong number into an operator-facing log line.
+        $result.Attempts | Should -Be 2
+        Should -Invoke Invoke-TopazAwsCli -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+    }
+
+    It 'redoes BOTH steps on the retry when the CHECK failed on an otherwise-successful copy' {
+        $script:CheckCalls = 0
+        Mock Invoke-TopazAwsCli {
+            param($Arguments)
+            $script:CallSeq.Add($Arguments[0])
+            if ($Arguments[0] -eq 'copy') { return $true }
+            $script:CheckCalls++
+            return ($script:CheckCalls -ge 2)
+        }
+        $result = Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copy', 'src', 'dst') -CheckArgs @('check', 'src', 'dst') `
+            -Component 'stop' -Label 'Upload' -Subject "'src' -> 'dst'" -TimeoutSec 60
+
+        $script:CallSeq | Should -Be @('copy', 'check', 'copy', 'check')
+        $result.Verified | Should -Be $true
+        $result.Attempts | Should -Be 2
+    }
+
+    It 'prefixes every line with the caller''s Label and the greppable "attempt N of M", and names the Subject' {
+        Mock Invoke-TopazAwsCli { return $false }
+        [void] (Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copy', 'src', 'dst') -CheckArgs @('check', 'src', 'dst') `
+            -Component 'watchdog' -Label 'Incremental upload' -Subject "'finished.mov' -> 'gdrive:temp/finished.mov'" -TimeoutSec 60)
+
+        $joined = $script:Logged -join "`n"
+        $joined | Should -Match 'Incremental upload attempt 1 of 2'
+        $joined | Should -Match 'Incremental upload attempt 2 of 2'
+        $joined | Should -Match ([regex]::Escape("'finished.mov' -> 'gdrive:temp/finished.mov'"))
+    }
+
+    It 'treats the Subject as literal text, never as a format string (a render filename may contain braces)' {
+        # -f style templating here would throw on 'clip{v2}.mov' -- inside the
+        # stop path, after the transfer has already happened.
+        Mock Invoke-TopazAwsCli { return $true }
+        { Invoke-TopazRcloneVerifiedTransfer -Config (Get-TransferTestConfig) `
+            -CopyArgs @('copyto', 'D:\clip{v2}.mov', 'gdrive:temp/clip{v2}.mov') `
+            -CheckArgs @('check', 'D:\clip{v2}.mov', 'gdrive:temp') `
+            -Component 'stop' -Label 'Recovery upload' -Subject "'D:\clip{v2}.mov' -> 'gdrive:temp/clip{v2}.mov'" -TimeoutSec 60 } |
+            Should -Not -Throw
+
+        ($script:Logged -join "`n") | Should -Match ([regex]::Escape('clip{v2}.mov'))
+    }
+}
+
+Describe 'Config.ps1 section index' {
+    # The header's function index used to name THREE of the file's 33 functions
+    # ("this file exposes a few helpers"), and the file had no top-level section
+    # banners at all -- 3000+ lines navigable only by grep. A stale index is
+    # worse than none, so it is asserted rather than trusted.
+
+    BeforeAll {
+        $script:ConfigPath = (Resolve-Path (Join-Path $PSScriptRoot '../Config.ps1')).Path
+        $script:ConfigText = Get-Content -LiteralPath $script:ConfigPath -Raw
+
+        $configAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ConfigPath, [ref]$null, [ref]$null)
+
+        # TOP-LEVEL definitions only: several functions define private helpers
+        # inside their own bodies (Write-RecoveryDisposition, Test-WorkerIdle,
+        # Get-UnlockedOutputSnapshot), which are implementation detail and have
+        # no business in a file-level index.
+        $script:DefinedFunctions = @(
+            $configAst.EndBlock.Statements |
+                Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } |
+                ForEach-Object { $_.Name }
+        )
+
+        # The leading comment-based help block, i.e. everything before its
+        # closing tag.
+        $script:Header = $script:ConfigText.Substring(0, $script:ConfigText.IndexOf('#>'))
+        $script:IndexedFunctions = @(
+            [regex]::Matches($script:Header, '(?m)^\s{8}([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+) - ') |
+                ForEach-Object { $_.Groups[1].Value }
+        )
+    }
+
+    It 'lists EVERY top-level function defined in the file' {
+        $script:DefinedFunctions.Count | Should -BeGreaterThan 30
+        $missing = @($script:DefinedFunctions | Where-Object { $script:IndexedFunctions -notcontains $_ })
+        $missing -join ', ' | Should -Be ''
+    }
+
+    It 'lists NOTHING that is not defined in the file (no stale entries after a rename)' {
+        $script:IndexedFunctions.Count | Should -Be $script:DefinedFunctions.Count
+        $stale = @($script:IndexedFunctions | Where-Object { $script:DefinedFunctions -notcontains $_ })
+        $stale -join ', ' | Should -Be ''
+    }
+
+    It 'keeps the index in the same order as the file, so it can be read as a map' {
+        ($script:IndexedFunctions -join ' > ') | Should -Be ($script:DefinedFunctions -join ' > ')
+    }
+
+    It 'carries a top-level banner for every section named in the index, with matching titles' {
+        $banners = @(
+            [regex]::Matches($script:ConfigText, '(?m)^# (SECTION \d+ - .+)$') |
+                ForEach-Object { $_.Groups[1].Value }
+        )
+        $banners.Count | Should -BeGreaterThan 0
+        foreach ($banner in $banners) {
+            $script:Header | Should -Match ([regex]::Escape($banner))
+        }
+        # Every section named in the header index must also exist as a banner.
+        $indexedSections = @(
+            [regex]::Matches($script:Header, '(?m)^\s{4}(SECTION \d+ - .+)$') |
+                ForEach-Object { $_.Groups[1].Value.TrimEnd() }
+        )
+        $indexedSections.Count | Should -Be $banners.Count
     }
 }

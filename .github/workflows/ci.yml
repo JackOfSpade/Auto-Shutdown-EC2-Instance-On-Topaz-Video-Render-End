@@ -3,39 +3,172 @@ name: CI
 on:
   push:
   pull_request:
+  # Not merely a manual escape hatch: auto-merge-claude.yml pushes its merge
+  # commit to main using GITHUB_TOKEN, and GitHub deliberately raises NO workflow
+  # events for a GITHUB_TOKEN push (its recursion guard). So the merge commit
+  # would get no CI run at all, and auto-merge's main-history gate — "the exact
+  # current main SHA must be green before another branch is merged" — could never
+  # be satisfied, deadlocking the drain after a single merge. This trigger is what
+  # lets that workflow dispatch a CI run for the SHA it just pushed.
+  # Note GitHub only offers workflow_dispatch for the copy of this file on the
+  # default branch, which is exactly where the merge commit lands.
+  workflow_dispatch: {}
+
+# Every job below only checks out, lints, and tests; not one writes to the
+# repository, so none needs more than read access to contents. Without this block
+# they inherit the repository-default token scope, which matters because this
+# workflow runs third-party code with that token in the environment (the
+# actionlint container, PSGallery modules, PyPI wheels). Deliberately NOT copied
+# to auto-merge-claude.yml, whose wider scope is required and justified there.
+permissions:
+  contents: read
 
 jobs:
   shell-lint:
-    name: Shell + workflow checks (shellcheck, actionlint, auto-merge tests)
+    name: Shell + workflow checks (shellcheck, bash 3.2 lint, IAM JSON, bash tests, actionlint)
     runs-on: ubuntu-latest
+    # Nothing here should take minutes. The default is GitHub's 360, and this job
+    # does two unbounded network fetches (the shellcheck tarball, the actionlint
+    # image pull); a repo whose entire premise is not paying for idle compute
+    # should not leave a hung runner burning for six hours.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install shellcheck
+        # Pinned, and fetched from the upstream release rather than `apt-get
+        # install shellcheck`, for two reasons. (1) apt resolves to whatever the
+        # runner image's archive offers this week, so the bar this job holds the
+        # tree to could move under a completely unrelated change — the same silent
+        # redness the actionlint tag pin below exists to prevent. (2) 0.10.0 is
+        # specifically the shellcheck bundled inside rhysd/actionlint:1.7.7, which
+        # is what lints the bash embedded in workflow `run:` blocks — matching it
+        # means .sh files on disk and bash inside a workflow are held to ONE
+        # standard instead of two. Bump this and that tag together.
+        # The install cannot be dropped in favour of a preinstalled binary: act's
+        # catthehacker/ubuntu:act-latest image ships no shellcheck at all.
+        # Arch is resolved at runtime rather than hardcoded, for the same reason as
+        # the pwsh install below: the pre-push hook defaults to ACT_ARCH=native, so
+        # on this Apple Silicon host the container is arm64, and an x86_64 tarball
+        # there dies with an opaque exec-format error.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+          set -euo pipefail
+          ver=0.10.0
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64 | arm64) arch=aarch64 ;;
+            *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSLo /tmp/shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${ver}/shellcheck-v${ver}.linux.${arch}.tar.xz"
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-v${ver}/shellcheck" /usr/local/bin/shellcheck
+          # Print it: a version that moves without anyone noticing is the exact
+          # failure this pin exists to prevent, so make it visible every run.
+          shellcheck --version
 
       - name: Run shellcheck
         # --source-path=SCRIPTDIR resolves each `# shellcheck source=` directive
         # relative to the sourcing file's own directory (so tests/ can follow
         # ../scripts/*.sh); without it shellcheck emits SC1091 and fails the job.
-        run: shellcheck -x --source-path=SCRIPTDIR control-plane/*.sh control-plane/lib/*.sh scripts/*.sh tests/*.sh
+        # The file list is DISCOVERED rather than globbed by hand: the previous
+        # four-glob list silently excluded tests/fixtures/*.sh, and those fixtures
+        # are not throwaway stubs — fake-aws-scheduler.sh is what decides which arm
+        # of the EventBridge-Scheduler-vs-CloudWatch-Events fallback the deploy test
+        # actually exercises, so a quoting bug there turns a passing test into a
+        # test of the wrong branch. Any new directory is now covered automatically.
+        # .claude/ is excluded because this agent tooling keeps full repo copies in
+        # .claude/worktrees/; a clean CI checkout has no such directory, but a
+        # developer running `act push` from a dirty checkout would otherwise lint
+        # every worktree copy. An empty result makes shellcheck exit non-zero,
+        # which is intended: a discovery gate that finds nothing has proved nothing.
+        run: find . -name '*.sh' -not -path './.git/*' -not -path './.claude/*' -print0 | xargs -0 shellcheck -x --source-path=SCRIPTDIR
 
-      - name: Run auto-merge decision tests
-        run: bash tests/test_auto_merge_logic.sh
+      - name: Lint for bash-4-only syntax (these scripts must run on macOS bash 3.2)
+        # The operator runs control-plane/ and scripts/ from a Mac, where /bin/bash
+        # is still 3.2 — Apple never shipped bash 4 (GPLv3). `${var^^}` / `${var,,}`
+        # case modification is a bash 4.0 feature, and on 3.2 it does not degrade:
+        # it is a fatal "bad substitution" parse error that kills the script at the
+        # point of use. shellcheck does NOT catch it by default (it assumes a modern
+        # bash unless a file declares otherwise), so nothing else in this pipeline
+        # would. One grep is the whole gate, and it is cheap enough to run on every
+        # push. tests/ is included because the harnesses run on the same machine.
+        # The ERE anchors the ^ / , operator immediately after the parameter name
+        # (with an optional array subscript) so ordinary commas inside `${x:-a,b}`
+        # or `${x//,/;}` are not false positives. It does match the syntax written
+        # inside a comment, which is deliberate — the cheapest way to keep the rule
+        # legible is to let prose about it live in docs/, not in these scripts.
+        run: |
+          set -euo pipefail
+          if grep -rEn --include='*.sh' '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(\^\^?|,,?)[^}]*\}' control-plane scripts tests; then
+            echo "::error::bash 4 only: the case-modification expansions shown above (\${var^^} / \${var,,}) are a parse error on macOS /bin/bash 3.2, which is where these scripts run. Use tr '[:lower:]' '[:upper:]' instead."
+            exit 1
+          fi
 
-      - name: Run control-plane validation tests
-        # tests/test_control_plane_validation.sh is being added alongside a new control-plane/lib/
-        # directory by a concurrent change; this step targets that fixed path deliberately.
-        run: bash tests/test_control_plane_validation.sh
+      - name: Validate IAM policy JSON
+        # control-plane/iam/*.json is handed verbatim to AWS via `file://` by
+        # 02-create-iam-role.sh, 04-deploy-max-lifetime-lambda.sh and
+        # 05-grant-audit-reads.sh, and nothing else in this pipeline parses JSON:
+        # shellcheck reads .sh, PSScriptAnalyzer reads in-guest/, ruff reads
+        # lambda/. A stray comma committed while editing a Statement block
+        # therefore surfaces only mid-deploy, as an opaque MalformedPolicyDocument,
+        # after 04-deploy has already tagged the instance, zipped the code and
+        # created the role — leaving a half-provisioned control plane to unwind by
+        # hand. These documents are also the tag-scoped guardrails that keep the
+        # Lambda from stopping the wrong instance, so they are worth a parse check.
+        # python3 (present on both GitHub's runner and catthehacker's act image)
+        # rather than `jq empty`: json.load accepts exactly ONE document, while jq
+        # happily accepts a stream, so a file that ended up with two concatenated
+        # objects would pass jq and still be rejected by AWS.
+        run: |
+          set -euo pipefail
+          checked=0
+          for policy in control-plane/iam/*.json; do
+            [ -f "$policy" ] || continue
+            checked=$((checked + 1))
+            if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$policy"; then
+              echo "::error file=$policy::not valid JSON — AWS would reject this mid-deploy with MalformedPolicyDocument."
+              exit 1
+            fi
+          done
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::No control-plane/iam/*.json matched — the policy documents moved, so this check proved nothing."
+            exit 1
+          fi
+          echo "IAM policy documents parsed: $checked."
 
-      - name: Run max-lifetime deployment scheduler tests
-        run: bash tests/test_deploy_max_lifetime_scheduler.sh
+      - name: Run bash test suites
+        # Discovered, not hand-listed. This used to be one copy-pasted step per
+        # suite, which meant a new tests/test_*.sh was gated only if whoever wrote
+        # it also remembered to edit this file. A safety net that silently is not
+        # running is worse than an absent one (see docs/16-render-loss-incident.md),
+        # so the glob picks up any suite the moment it lands.
+        # Stops at the FIRST failing suite and names it, so the log points at the
+        # culprit and not at the loop; an empty glob fails loudly rather than
+        # reporting a vacuous pass.
+        run: |
+          set -euo pipefail
+          ran=0
+          for suite in tests/test_*.sh; do
+            [ -f "$suite" ] || continue
+            ran=$((ran + 1))
+            echo "::group::$suite"
+            if ! bash "$suite"; then
+              echo "::endgroup::"
+              echo "::error file=$suite::bash test suite failed: $suite"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::No tests/test_*.sh suites matched — the discovery glob is broken, so this job proved nothing."
+            exit 1
+          fi
+          echo "Bash test suites passed: $ran."
 
       - name: Run actionlint
-        # The shellcheck step above only globs standalone *.sh files — it never sees the bash embedded
+        # The shellcheck step above only covers standalone *.sh files on disk — it never sees the bash embedded
         # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
         # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
         # so this is the only gate that covers that bash. Pinned to a specific tag (not `:latest`) so a
@@ -47,6 +180,10 @@ jobs:
   powershell:
     name: PowerShell analyze + test
     runs-on: ubuntu-latest
+    # See the shell-lint job: Install-Module from PSGallery and the pwsh tarball
+    # curl below are both unbounded network operations, and 360 idle minutes is
+    # the wrong default for this repo of all repos.
+    timeout-minutes: 15
     defaults:
       run:
         shell: pwsh
@@ -73,6 +210,13 @@ jobs:
           set -euo pipefail
           [ "${ACT:-}" = "true" ] || exit 0
           if ! command -v pwsh >/dev/null 2>&1; then
+            # Pinned so the act-local gate runs a fixed, reviewed runtime instead
+            # of whatever the download URL serves today; 7.4.x is the LTS line, so
+            # it stays close to the pwsh GitHub's ubuntu-latest preinstalls. It is
+            # deliberately NOT asserted to equal the other hosts this code meets
+            # (GitHub's preinstalled pwsh, and the 7.5.x a developer runs locally
+            # per docs/10) — the floor check and the version line printed by the
+            # next step are what make those differences visible rather than silent.
             ver=7.4.6
             # Match the CONTAINER's arch, not the host's. The pre-push hook runs act
             # with --container-architecture linux/amd64, but a bare `act push` on an
@@ -94,6 +238,23 @@ jobs:
 
       - name: Install PSScriptAnalyzer + Pester
         run: |
+          # Three different PowerShell hosts run this job's code over its lifetime:
+          # the 7.4.6 installed above under act, whatever pwsh GitHub's
+          # ubuntu-latest preinstalls, and the developer's local pwsh. Record which
+          # one actually ran — a behavior difference between them is otherwise
+          # invisible in the log. The floor is asserted LOOSELY (>= 7.4) on purpose:
+          # these hosts are allowed to differ, they just may not drop below the
+          # version this suite was reviewed on. Compared on Major/Minor rather than
+          # cast to [version], because PSVersion is a SemanticVersion on pwsh 7 and
+          # a preview build would not cast cleanly.
+          # None of this says anything about Windows PowerShell 5.1, which this job
+          # never runs; PSUseCompatibleSyntax below is what covers the 5.1 target.
+          Write-Host "PowerShell host: $($PSVersionTable.PSVersion) on $($PSVersionTable.Platform)"
+          $psv = $PSVersionTable.PSVersion
+          if ($psv.Major -lt 7 -or ($psv.Major -eq 7 -and $psv.Minor -lt 4)) {
+              throw "This job needs pwsh 7.4 or newer, but is running $psv."
+          }
+
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           # Versions are intentional: PSScriptAnalyzer 1.25.0 is the reviewed
           # version used to establish the warning allowlist below. Pester 5.7.1
@@ -117,19 +278,66 @@ jobs:
           # Only add a rule here when the in-guest tree triggers it because of a DELIBERATE design
           # choice (verified against the current tree, not assumed) — never to silence a real finding.
           # Never allowlist a security-class rule (credential/secret handling, injection, etc.).
+          # Each entry below enumerates EVERY site it silences, so a reviewer can diff the list
+          # against the tree instead of trusting a summary. Sites are named by file + function
+          # rather than file:line, because line numbers rot on the first unrelated edit above them.
+          # Re-derive the authoritative list before touching this block:
+          #   Invoke-ScriptAnalyzer -Path in-guest -Recurse -Severity Warning |
+          #     ForEach-Object { '{0}:{1} {2}' -f (Split-Path $_.ScriptPath -Leaf), $_.Line, $_.RuleName }
           $allowedWarningRules = @(
-              # Config.ps1's best-effort IMDS helpers (Get-Ec2ImdsToken / Get-Ec2Identity) intentionally
-              # swallow errors: IMDS being unreachable is an expected, handled case (the caller gets
-              # $null), documented in Get-Ec2Identity's own .DESCRIPTION - not a masked bug.
+              # Six sites, three kinds, all deliberate:
+              #  - Config.ps1 / Get-Ec2Identity x3 (the instance-id, placement/region and
+              #    availability-zone IMDS lookups): IMDS being unreachable is an expected, handled
+              #    case - the caller gets $null, as Get-Ec2Identity's own .DESCRIPTION states.
+              #  - Config.ps1 / Get-GpuUtilizationMax and Config.ps1 / Invoke-TopazAwsCli x1 each:
+              #    `try { $proc.Kill() } catch { }` after WaitForExit timed out. The process is
+              #    already being abandoned and the TIMEOUT is what gets reported (Invoke-TopazAwsCli
+              #    WARN-logs it; Get-GpuUtilizationMax returns $null, which its callers treat as
+              #    "no reading"), so a Kill that merely raced the process's own exit has nothing to add.
+              #  - Register-ScheduledTasks.ps1 x1, the Stop-ScheduledTask issued before
+              #    Unregister-ScheduledTask. This is the one entry here that is NOT cosmetic, and the
+              #    first place to look if this rule is ever un-allowlisted: the comment directly above
+              #    that call documents the orphaned-watchdog hazard the Stop exists to prevent (two
+              #    watchdogs on one render, each independently invoking Stop-Sequence.ps1). It stays
+              #    allowlisted because Stop-ScheduledTask also throws for the ordinary "registered but
+              #    not currently running" case, and because the very next line unregisters with
+              #    -ErrorAction Stop - so a task that cannot be torn down at all still fails loudly
+              #    instead of being quietly re-registered alongside its own orphan.
               'PSAvoidUsingEmptyCatchBlock',
-              # Watchdog.ps1 and Config.ps1 helper names intentionally describe what they return
-              # rather than following the strict singular-noun convention: Get-TopazPids/-TopazWorkers
-              # return arrays, Get-OutputBytes returns a byte total, and Build-AwsCliArgs returns an
-              # argument list - "Pid"/"Worker"/"Byte"/"Arg" would misdescribe the value.
+              # Nine sites, all plural because the name describes what the function RETURNS and the
+              # singular form would misdescribe it. Watchdog.ps1: Get-TopazPids, Get-TopazWorkers,
+              # Get-WorkerIoBytes, Get-OutputBytes, Resolve-ProcessDescendants. Config.ps1:
+              # Get-TopazOutputFiles, Build-AwsCliArgs, Build-RcloneLogFileArgs,
+              # Find-RenderRecoveryCandidates. Each returns a collection,
+              # an argument list, or a byte total; "Pid"/"Worker"/"Byte"/"Arg"/"File"/"Descendant"/
+              # "Candidate" would name a single item none of them ever returns.
               'PSUseSingularNouns'
           )
 
-          $results = Invoke-ScriptAnalyzer -Path in-guest -Recurse
+          # PSUseCompatibleSyntax is the ONLY automated check anywhere in this repo that the in-guest
+          # scripts still PARSE under Windows PowerShell 5.1. That gap matters more here than any
+          # other: 5.1 is what the EC2 Windows Server guest actually runs, while every runner in this
+          # file - and Pester, and the developer's Mac - is pwsh 7, so a PS7-only construct (`??`,
+          # `?.`, ternary, `?[]`) sails through every other gate green. On 5.1 it is not a runtime
+          # warning, it is a parse error that takes down the WHOLE file; and since every in-guest
+          # script dot-sources Config.ps1 by literal name, one such construct there stops Watchdog.ps1
+          # from starting at all - the render is never signalled complete and the GPU instance bills
+          # until a human notices.
+          # The rule is opt-in: it does not fire from the default rule set, which is the only reason
+          # -Settings exists here. It reports at Error severity, so the blocking filter below already
+          # fails the build on it with no allowlist change needed. Verified when added: enabling it
+          # produced ZERO new diagnostics against the then-current in-guest tree, so it gates future
+          # code without re-litigating existing code.
+          $compatSettings = @{
+              Rules = @{
+                  PSUseCompatibleSyntax = @{
+                      Enable         = $true
+                      TargetVersions = @('5.1', '7.0')
+                  }
+              }
+          }
+
+          $results = Invoke-ScriptAnalyzer -Path in-guest -Recurse -Settings $compatSettings
           $results | Format-Table -AutoSize
 
           $blocking = @($results | Where-Object {
@@ -158,6 +366,9 @@ jobs:
   python-lambda:
     name: Python lambda lint + test
     runs-on: ubuntu-latest
+    # As above: pip resolving from PyPI is an unbounded network operation, and
+    # nothing in this job legitimately takes minutes.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4

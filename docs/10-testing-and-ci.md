@@ -4,32 +4,108 @@
 
 This project is split across three languages (Bash, PowerShell, Python), each
 with its own linter and, where the code has meaningful logic to exercise, its
-own test suite. All of it is wired into GitHub Actions
+own test suite. All of it is defined in one workflow
 ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) so a bad change is
-caught before it reaches an EC2 box that bills by the hour.
+caught before it reaches an EC2 box that bills by the hour. **Where that
+workflow actually executes today is not GitHub** - read the next section before
+you rely on it.
+
+## Where CI actually runs today
+
+GitHub Actions is currently **disabled** for this repository (`gh api
+repos/:owner/:repo/actions/permissions` returns `{"enabled":false}`). It was
+enabled earlier - the run history still holds 34 runs, the most recent on
+2026-08-10 - and was switched off afterwards. So `ci.yml` is not running in the
+cloud right now, and a green checkmark will not appear on a push or a PR.
+
+The gate that does run is [`act`](https://github.com/nektos/act), invoked by a
+**global pre-push hook** (installed for every repo on this machine via git's
+`init.templateDir`, at `~/.git-templates/hooks/pre-push`). On a push to a
+protected branch (`main`, `master`, `release*`) the hook checks out the exact
+pushed SHA into a temporary detached worktree and runs the whole workflow there
+in Docker, so what gets validated is the commit being pushed and not whatever
+happens to be in your working tree - and the push is blocked unless every job
+passes. Relevant knobs:
+
+| Env | Effect |
+|-----|--------|
+| `SKIP_ACT=1 git push` | skip the hook for one push |
+| `git push --no-verify` | skip all pre-push hooks |
+| `ACT_ARCH` | `native` (default; arm64 containers on Apple Silicon) or `amd64` |
+| `ACT_TIMEOUT` | seconds per local CI run, default `900`, `0` disables |
+| `ACT_JOBS` | max concurrent jobs, default `1` |
+| `ACT_ARGS` | extra flags passed through to `act` |
+| `ACT_PROTECTED_BRANCHES` | branch globs the hook guards; empty protects nothing |
+
+Two consequences worth stating plainly:
+
+- The hook is **machine-local**. A clone on another machine, or a push with
+  `SKIP_ACT=1` / `--no-verify`, has no CI at all. Nothing in the repository can
+  tell you that happened - so if you are working somewhere other than the
+  maintainer's Mac, run the commands in this document by hand.
+- [`.actrc`](../.actrc) exists only for `act` (GitHub never reads it) and works
+  around an `act` PATH bug, not anything wrong with the workflow.
+
+If cloud Actions is ever switched back on, re-verify the auto-merge workflow
+first: it is the one workflow with write permissions, it triggers on `CI`
+completing, and it depends on `ci.yml`'s `workflow_dispatch` trigger to get a CI
+run for the merge commit it pushes (GitHub raises no workflow events for a
+`GITHUB_TOKEN` push). A Windows CI leg is the other thing to add - see
+[Known gaps](#known-gaps) below.
 
 ## What CI checks
 
 | Area | Path | Lint | Tests |
 |------|------|------|-------|
-| Control plane | `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`, `tests/*.sh` | `shellcheck`, `actionlint` | `bash tests/test_auto_merge_logic.sh`, `bash tests/test_control_plane_validation.sh`, `bash tests/test_deploy_max_lifetime_scheduler.sh` |
-| In-guest pipeline | `in-guest/` | PSScriptAnalyzer | Pester (`in-guest/tests/`) |
+| Shell (control plane, `scripts/`, `tests/`) | every `*.sh` in the tree (discovered, not listed) | `shellcheck` 0.10.0, bash-3.2 grep lint, `actionlint` | every `tests/test_*.sh` (discovered, not listed) |
+| IAM policy documents | `control-plane/iam/*.json` | `python3 -c json.load` | - |
+| In-guest pipeline | `in-guest/` | PSScriptAnalyzer (incl. PS 5.1 syntax compat) | Pester (`in-guest/tests/`) |
 | Max-lifetime Lambda | `lambda/max-lifetime-stop/` | `ruff` | `pytest` |
 
-- **`shellcheck`** lints every control-plane / `scripts/` / `tests/` script for
-  common shell scripting bugs (unquoted expansions, unchecked exit codes, etc.),
-  run with `-x --source-path=SCRIPTDIR` so a `# shellcheck source=` directive
-  (e.g. `tests/test_auto_merge_logic.sh` sourcing `../scripts/auto_merge_decision.sh`)
+- **`shellcheck`** lints every `*.sh` in the tree for common shell scripting bugs
+  (unquoted expansions, unchecked exit codes, etc.), run with
+  `-x --source-path=SCRIPTDIR` so a `# shellcheck source=` directive (e.g.
+  `tests/test_auto_merge_logic.sh` sourcing `../scripts/auto_merge_decision.sh`)
   resolves relative to the *sourcing* file's own directory instead of failing
-  with `SC1091`.
+  with `SC1091`. The file list comes from `find`, not a hand-written glob: the
+  previous four-glob list quietly excluded `tests/fixtures/*.sh`, and those
+  fixtures decide which branch of the deploy scripts the tests exercise, so a
+  quoting bug in one turns a passing test into a test of the wrong code path.
+  shellcheck is pinned to **0.10.0** and installed from the upstream release
+  rather than `apt`, because that is the version bundled inside the pinned
+  `actionlint` image below - so shell files on disk and bash embedded in a
+  workflow are held to one standard. Bump the two together.
+- **bash-3.2 lint** - one `grep` over `control-plane/`, `scripts/` and `tests/`
+  that fails the build on the bash 4 case-modification expansions. These scripts
+  are run by the operator from a Mac, where `/bin/bash` is still 3.2, and there
+  the construct is not a no-op but a fatal `bad substitution` parse error;
+  shellcheck does not flag it by default, so nothing else in the pipeline would
+  catch it. Use `tr '[:lower:]' '[:upper:]'` instead. The grep matches the
+  syntax inside comments too, so keep prose about the rule in `docs/` (as here)
+  rather than in the scripts themselves.
+- **IAM policy JSON validation** - `control-plane/iam/*.json` is handed verbatim
+  to AWS by `02-create-iam-role.sh`, `04-deploy-max-lifetime-lambda.sh` and
+  `05-grant-audit-reads.sh` via `file://`, and nothing else in the pipeline
+  parses JSON. Without this check, a stray comma surfaces only mid-deploy as an
+  opaque `MalformedPolicyDocument`, after the deploy script has already tagged
+  the instance, zipped the code and created the role. `python3`'s `json.load` is
+  used rather than `jq empty` because it accepts exactly one document, where
+  `jq` would accept a stream of two concatenated objects that AWS still rejects.
 - **`actionlint`** (pinned Docker tag, not `:latest`, so an unrelated actionlint
   release can't silently turn this job red) statically checks the workflow YAML
   under `.github/workflows/` **and** shells out to `shellcheck` on every
   embedded `run:` block - the only gate that covers the bash written directly
   inline in a workflow step (e.g. the merge loop in
   [`auto-merge-claude.yml`](../.github/workflows/auto-merge-claude.yml)), which
-  the standalone `shellcheck` glob above never sees because it only looks at
+  the standalone `shellcheck` sweep above never sees because it only looks at
   `*.sh` files on disk.
+- **The bash test suites** are discovered with a `tests/test_*.sh` glob rather
+  than listed step by step, so a new suite is gated from the moment it lands
+  instead of only if whoever wrote it also remembered to edit `ci.yml`. The loop
+  stops at the first failing suite and names it. An empty glob fails the build:
+  a discovery gate that matches nothing has proved nothing, and this project has
+  a whole incident write-up ([docs/16](16-render-loss-incident.md)) about
+  trusting a check that was not actually doing anything.
 - **`tests/test_control_plane_validation.sh`** exercises the pure predicates in
   [`control-plane/lib/validation.sh`](../control-plane/lib/validation.sh) (the
   `IDLE_MINUTES`/`MAX_LIFETIME_HOURS`/shutdown-behavior/profile-name checks
@@ -46,7 +122,24 @@ caught before it reaches an EC2 box that bills by the hour.
   explaining the deliberate design choice it is silencing). A security-class
   rule (credential/secret handling, injection, etc.) is never allowlisted. This
   closes a gap where a real Warning-level finding could previously pass CI
-  silently as long as it was not an Error/ParseError.
+  silently as long as it was not an Error/ParseError. Each allowlist entry
+  enumerates every site it silences, by file and function rather than by line
+  number, so the list can be diffed against the tree; the analyzer command that
+  regenerates it is in the comment beside it.
+- **PSScriptAnalyzer's `PSUseCompatibleSyntax`** (`TargetVersions = 5.1, 7.0`)
+  is the **only** automated check that the `in-guest/` scripts still parse under
+  **Windows PowerShell 5.1**, which is what the EC2 Windows Server guest runs.
+  Everything else that touches this code - the CI runners, Pester, a developer's
+  Mac - is pwsh 7, so a PS7-only construct (`??`, `?.`, ternary, `?[]`) passes
+  every other gate green and then fails on the box that matters. On 5.1 it is
+  not a runtime warning but a parse error covering the whole file, and because
+  every in-guest script dot-sources `Config.ps1` by literal name, one such
+  construct there stops `Watchdog.ps1` from starting at all: the render is never
+  signalled complete and the GPU instance keeps billing. The rule is opt-in (it
+  does not fire from the default rule set) and reports at Error severity, so the
+  existing blocking filter fails the build on it with no allowlist change.
+  Enabling it added zero diagnostics to the tree as it stood, so it gates new
+  code without re-litigating existing code.
 - **Pester 5.x** runs the unit tests in [`in-guest/tests/`](../in-guest/tests/),
   which exercise `Resolve-RenderActive` (the pure completion-decision helper in
   [`in-guest/Config.ps1`](../in-guest/Config.ps1)) across all three
@@ -134,11 +227,26 @@ python -m pip install -r lambda/max-lifetime-stop/requirements-dev.txt && python
 
 ## Running the Pester tests locally
 
-Pester 5 requires **PowerShell 7+ (`pwsh`)**, which is what CI runs it under.
-CI pins the reviewed Pester 5.7.1 release and verifies that the loaded module
-is major version 5, preventing an incompatible new major version from silently
-changing the test runner.
-If you have `pwsh` installed:
+CI runs Pester under **PowerShell 7 (`pwsh`)** on a Linux runner. (Pester 5
+itself also supports Windows PowerShell 5.1 - which matters here, because 5.1 is
+the in-guest target - but nothing in CI exercises that combination.)
+
+CI installs Pester 5.7.1 and then asserts that the *loaded* module's version
+string is exactly `5.7.1`, throwing otherwise. That is stricter than a
+major-version check: it blocks both a runner's preinstalled legacy Pester 3.4
+and any newer PSGallery release from silently changing the test runner. If you
+run the suite locally with a different 5.x, expect that assertion to fire - it
+is not a bug in your setup. Install the pinned version with:
+
+```powershell
+Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser
+```
+
+The same pattern applies to PSScriptAnalyzer, which is imported with
+`-RequiredVersion 1.25.0` and asserted the same way, because its exact ruleset
+is what the warning allowlist above was established against.
+
+Then:
 
 ```powershell
 Invoke-Pester -Path in-guest/tests -CI
@@ -147,5 +255,39 @@ Invoke-Pester -Path in-guest/tests -CI
 There is nothing Windows-specific about the tests themselves (see above), so
 this also works on a non-Windows machine with `pwsh` installed - you do not
 need an EC2 GPU box just to run the unit tests.
+
+## Known gaps
+
+Accepted, deliberate holes in the above. They are written down because an
+unlisted gap eventually gets mistaken for coverage.
+
+- **No test executes on Windows anywhere.** `in-guest/tests/Watchdog.Tests.ps1`
+  contains exactly one platform-gated test - the `Test-FileUnlocked` case for a
+  file held open with an exclusive handle, marked `-Skip:(-not $IsWindows)`
+  because `FileShare` advisory-lock semantics are only guaranteed on Windows.
+  The skip is correct; the gap is that no CI leg ever supplies Windows, so that
+  branch of the render-completion decision is verified nowhere. This is the "1
+  skipped" in the suite's pass line, and it is permanent, not incidental.
+  A `windows-latest` matrix leg was considered and **rejected for now**: with
+  cloud Actions disabled and `act` unable to run Windows containers, the leg
+  would never execute on any machine - a gate that looks like coverage and is
+  not, which is the exact failure mode [docs/16](16-render-loss-incident.md)
+  exists to warn about. Until then, run `Invoke-Pester -Path in-guest/tests -CI`
+  manually on the EC2 Windows box when touching `Test-FileUnlocked`. **If cloud
+  Actions is ever re-enabled, adding that leg is the first thing to do.** Note
+  it would buy exactly one thing - the skip stops skipping - and not a 5.1
+  signal: the job sets `defaults.run.shell: pwsh`, so a Windows leg still runs
+  PowerShell 7. `PSUseCompatibleSyntax` remains the 5.1 gate, and it is the
+  cheaper one anyway, since it covers every in-guest script rather than only the
+  code the tests reach.
+- **The control-plane deploy scripts are lint-only, with one exception.** Only
+  `04-deploy-max-lifetime-lambda.sh` is executed by a test (against the fake-AWS
+  fixtures). `00`, `01`, `02`, `03` and `05` get `shellcheck` and the bash-3.2
+  grep and nothing more, so the *shape* of the AWS calls they make is unverified
+  - including `03-create-idle-alarm.sh`, which provisions the CloudWatch alarm
+  that can stop the instance from outside the guest entirely, where a wrong
+  `--period` / `--evaluation-periods` / `--threshold` produces a stop that
+  bypasses every in-guest refusal. The fixture harness to close this already
+  exists and is proven; a new `tests/test_*.sh` is picked up by CI automatically.
 
 Back to the [README](../README.md).

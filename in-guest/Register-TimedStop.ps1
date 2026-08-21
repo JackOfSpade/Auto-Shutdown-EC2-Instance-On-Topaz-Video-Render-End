@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Registers a ONE-SHOT wall-clock hard stop: at a fixed time from now, stop
-    this instance regardless of what the render queue is doing. Must be run
+    Registers a wall-clock hard stop: at a fixed time from now, stop this
+    instance regardless of what the render queue is doing, RETRYING every
+    RetryIntervalMinutes until a stop actually takes effect. Must be run
     ELEVATED. Idempotent.
 
 .DESCRIPTION
@@ -10,10 +11,13 @@
     AWS control plane cannot be reached from anywhere the operator currently
     is. It exists purely as a COST BACKSTOP.
 
-    It registers a scheduled task that runs ONCE, as SYSTEM, at
-    (now + Hours), invoking:
+    It registers a scheduled task that first runs, as SYSTEM, at (now + Hours)
+    and then REPEATS every RetryIntervalMinutes until a stop actually takes
+    effect (see the interlock note below -- a fired stop can be refused, and a
+    task that fired once and gave up would be a cost cap that stopped capping).
+    Each run invokes:
 
-        Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun
+        Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun -ExitCodeOnRefusal
 
     -IgnoreDryRun is deliberate and is the whole point: the watchdog may still
     be running in DryRun while its detection logic is being validated, but the
@@ -81,6 +85,17 @@
     Run from an elevated (Administrator) PowerShell.
     Inspect afterwards with:
         Get-ScheduledTask -TaskName 'TopazAutoStop-TimedStop' | Get-ScheduledTaskInfo
+
+    READING LastTaskResult. The action passes -ExitCodeOnRefusal, so the task's
+    exit code carries the outcome instead of hiding it:
+        0 - the stop was performed (or deliberately suppressed by DryRun).
+        2 - the stop was REFUSED (upload interlock, final completion gate, or
+            every action in the stop plan failing). The box is still running
+            and this task will try again on the next repetition. See stop.log
+            for WHICH guard fired.
+    Without that switch a refusal reported 0 -- "success" -- for a cost
+    backstop that had not stopped anything and was about to keep not stopping
+    it every RetryIntervalMinutes.
 #>
 
 [CmdletBinding()]
@@ -141,17 +156,38 @@ if ($Cancel) {
 # ---------------------------------------------------------------------------
 
 $stopScript = Join-Path $cfg.InstallDir 'Stop-Sequence.ps1'
-if (-not (Test-Path -LiteralPath $stopScript)) {
+
+# Config.ps1 is checked alongside it because Stop-Sequence.ps1 dot-sources
+# "$PSScriptRoot\Config.ps1" by literal name on its first executable line: an
+# InstallDir holding the stop script but not its config is a backstop that
+# throws on load and stops nothing, which is indistinguishable from a healthy
+# one until the deadline passes. Install.ps1 does not abort on a failed copy,
+# so that state is reachable.
+$stopConfigScript = Join-Path $cfg.InstallDir 'Config.ps1'
+
+$missingStopScripts = @()
+if (-not (Test-Path -LiteralPath $stopScript)) { $missingStopScripts += $stopScript }
+if (-not (Test-Path -LiteralPath $stopConfigScript)) { $missingStopScripts += $stopConfigScript }
+if ($missingStopScripts.Count -gt 0) {
+    $missingStopList = $missingStopScripts -join ', '
     Write-TopazLog -Component 'timedstop' -Level 'ERROR' `
-        -Message "Missing installed script '$stopScript'. Run Install.ps1 first so the task points at an installed copy. Aborting."
-    throw "Register-TimedStop.ps1: '$stopScript' not found. Run Install.ps1 first."
+        -Message "Missing installed script(s): $missingStopList. Run Install.ps1 first so the task points at a complete installed copy. Aborting."
+    throw "Register-TimedStop.ps1: missing installed script(s): $missingStopList. Run Install.ps1 first."
 }
 
 $fireAt = (Get-Date).AddHours($Hours)
 
+# -ExitCodeOnRefusal is passed ONLY here, never on the watchdog's own call.
+# Under -File, Stop-Sequence.ps1's `return $false` refusal is just an object
+# written to stdout: the host prints 'False' and exits 0, so
+# Get-ScheduledTaskInfo (which .NOTES sends the operator to) reported
+# LastTaskResult=0 -- success -- for a backstop that had refused to stop the
+# box and would keep refusing. The switch makes THIS invocation translate the
+# refusal into exit 2 while leaving Watchdog.ps1's `& <script>` call returning
+# a bare $false, which is the value its re-arm branch tests with `-eq $false`.
 $action = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
-    -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`" -Reason maxlifetime -IgnoreDryRun" -f $stopScript)
+    -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`" -Reason maxlifetime -IgnoreDryRun -ExitCodeOnRefusal" -f $stopScript)
 
 # Repeating, not one-shot. See .DESCRIPTION: the ephemeral upload interlock can
 # REFUSE this stop, and a one-shot task would then never try again -- a cost cap
@@ -219,7 +255,7 @@ try {
     # COST CAP; misreading it by a whole timezone is expensive in exactly the
     # direction nobody notices until the bill arrives.
     Write-TopazLog -Component 'timedstop' -Level 'INFO' `
-        -Message "Timed stop ARMED: task '$taskName' will run Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) (in $Hours h)."
+        -Message "Timed stop ARMED: task '$taskName' will run Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun -ExitCodeOnRefusal at $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) (in $Hours h), then retry every $RetryIntervalMinutes min while the stop is refused (LastTaskResult=2)."
 
     Write-Output ""
     Write-Output "  Timed stop armed"
@@ -228,7 +264,8 @@ try {
     Write-Output "  Fires at    : $($fireAt.ToString('yyyy-MM-dd HH:mm:ss zzz')) (local)  -- in $Hours hour(s)"
     Write-Output "  Retries     : every $RetryIntervalMinutes min if the stop is REFUSED"
     Write-Output "                (the upload interlock can refuse it; see stop.log)"
-    Write-Output "  Action      : Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun"
+    Write-Output "  Action      : Stop-Sequence.ps1 -Reason maxlifetime -IgnoreDryRun -ExitCodeOnRefusal"
+    Write-Output "  Refusals    : show as LastTaskResult=2 in Get-ScheduledTaskInfo (0 = stopped)"
     Write-Output "  Max runtime : $executionTimeLimit per invocation (derived from configured sync/upload/stop bounds)"
     Write-Output "  StopStrategy: $($cfg.StopStrategy)  (plan: $((Resolve-StopPlan -Strategy $cfg.StopStrategy) -join ' -> '))"
     Write-Output ""

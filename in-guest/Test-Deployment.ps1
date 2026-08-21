@@ -7,7 +7,12 @@
 .DESCRIPTION
     Dot-sources Config.ps1 and runs a fixed series of named, independent
     checks against the live box: PowerShell/OS version, elevation, config
-    sanity, nvidia-smi, the Topaz GUI process, worker-process discovery (with
+    sanity (including whether OutputIsEphemeral agrees with the volume
+    OutputDir actually lives on, whether the rclone upload path -- the hard
+    precondition for ever stopping an ephemeral box -- is present and
+    authorised, and whether the copy being validated matches the INSTALLED
+    copy the scheduled tasks run), nvidia-smi, the Topaz GUI process,
+    worker-process discovery (with
     parent/child ancestry classification -- reusing Watchdog.ps1's OWN
     Get-TopazPids/Get-TopazWorkers/Resolve-ProcessDescendants, dot-sourced
     read-only below, so this check exercises the EXACT attribution logic the
@@ -42,6 +47,9 @@
     It never registers/unregisters a scheduled task, never touches Topaz or
     any of its files, and never powers off, stops, or terminates anything.
     Safe to run repeatedly, at any time, including while a render is active.
+    (`rclone listremotes` in check 3b is read-only and purely local -- it
+    parses the config file and makes no network call, uploads nothing, and
+    deletes nothing.)
 
 .NOTES
     Target : Windows PowerShell 5.1 on Windows Server (EC2 GPU instance).
@@ -53,7 +61,16 @@
 #>
 
 [CmdletBinding()]
-param()
+param(
+    # Test/import seam, mirroring Initialize-ScratchDisk.ps1's: dot-source this
+    # file to get its pure helpers WITHOUT running a single check, printing a
+    # banner, or exiting. Operators never pass it; it exists so the
+    # safety-relevant predicates below (which decide whether arming DryRun=$false
+    # could TERMINATE this instance) are unit-testable at all -- this file has
+    # no test coverage otherwise, because its checks talk to IMDS, the AWS CLI
+    # and the live process table.
+    [switch]$LibraryOnly
+)
 
 # ---------------------------------------------------------------------------
 # Load shared config + helpers. A failure here (e.g. an invalid
@@ -102,30 +119,6 @@ try {
 }
 catch {
     $watchdogLoadError = $_.Exception.Message
-}
-
-# ---------------------------------------------------------------------------
-# Best-effort refresh of THIS PROCESS's own copy of PATH from the registry,
-# before any resolvability check below runs. This process's environment was
-# captured when its shell started; a dependency installed afterwards (the
-# documented AWS CLI v2 install on this exact box is the motivating case)
-# would otherwise report a false negative instead of the box's TRUE current
-# state, which is the entire point of a preflight tool. This only mutates
-# THIS PROCESS's in-memory environment block -- never the registry, never
-# any other process, and it is silently best-effort (a failure here just
-# means the checks below fall back to this session's existing PATH).
-# ---------------------------------------------------------------------------
-
-try {
-    $machinePathValue = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $userPathValue = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-    $refreshedPathParts = @($machinePathValue, $userPathValue) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    if ($refreshedPathParts.Count -gt 0) {
-        $env:Path = [string]::Join(';', $refreshedPathParts)
-    }
-}
-catch {
-    $null = $_
 }
 
 # ---------------------------------------------------------------------------
@@ -386,13 +379,170 @@ function Get-WorkerNamePattern {
     return , @()
 }
 
+function Test-StopPlanCanReachGuestShutdown {
+    <#
+    .SYNOPSIS
+        Pure: can the configured StopStrategy ever reach Stop-Computer?
+    .DESCRIPTION
+        This single boolean is what decides whether checks 10 and 11 below FAIL
+        or merely WARN -- i.e. whether the operator is told that arming
+        DryRun=$false could TERMINATE (destroy) this instance rather than stop
+        it. It was computed twice, verbatim, in two places roughly 40 lines
+        apart. Nothing pinned the two copies together, and a future edit that
+        fixed or inverted only ONE of them would send check 11 down its PASS
+        branch for an 'Auto' plan on a 'terminate' box while every test in the
+        repo stayed green. One implementation, one call site each.
+
+        Resolve-StopPlan (Config.ps1) is the authority on what a strategy
+        expands to: only 'Ec2ApiStop' alone never falls back to a guest
+        shutdown. Every other value -- including the default 'Auto', an absent
+        StopStrategy property, and any value Resolve-StopPlan does not
+        recognize (its own `default` branch returns the two-action plan) -- CAN
+        reach Stop-Computer. Treating the unknown cases as "can reach" is the
+        fail-safe direction: it keeps the dangerous-combination FAIL armed
+        rather than quietly downgrading it.
+    .PARAMETER StopStrategy
+        The configured StopStrategy, or $null/'' when the config has no such
+        property.
+    .OUTPUTS
+        [bool] $true when a guest shutdown is reachable.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$StopStrategy)
+
+    if ([string]::IsNullOrWhiteSpace($StopStrategy)) { return $true }
+    return ($StopStrategy -ne 'Ec2ApiStop')
+}
+
+function Resolve-EphemeralOutputVerdict {
+    <#
+    .SYNOPSIS
+        Pure: does OutputIsEphemeral agree with the volume OutputDir lives on?
+    .DESCRIPTION
+        OutputIsEphemeral is the single flag that arms the interlock which
+        prevented a repeat of the render loss in docs/16. NOTHING in the
+        pipeline cross-checks it against reality: Get-TopazAutoStopConfig
+        validates CompletionSignal, StopStrategy and WorkerNamesLike, and this
+        preflight only checked that OutputDir exists.
+
+        The dangerous disagreement is renders-on-the-scratch-volume with the
+        interlock DISARMED: a 'stalled' or 'maxlifetime' stop then powers the
+        box off with no upload gate at all (Stop-Sequence.ps1 only runs the
+        completion safety gate for reason='completed'), and the instance store
+        is wiped. That is a FAIL.
+
+        The opposite disagreement -- persistent output marked ephemeral -- costs
+        no data; it just makes the interlock block stops for output that was
+        never at risk. WARN.
+    .PARAMETER OutputDir
+        $cfg.OutputDir, e.g. 'D:\Renders'.
+    .PARAMETER ScratchDriveLetter
+        $cfg.ScratchDriveLetter. Accepts 'D' or 'D:'.
+    .PARAMETER OutputIsEphemeral
+        $cfg.OutputIsEphemeral.
+    .OUTPUTS
+        [pscustomobject]@{ Status = 'PASS'|'WARN'|'FAIL'; Detail = <string> }
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$OutputDir,
+        [AllowNull()][AllowEmptyString()][string]$ScratchDriveLetter,
+        [bool]$OutputIsEphemeral
+    )
+
+    # Get-TopazWindowsPathRoot, not [System.IO.Path]: OutputDir is always a
+    # Windows path regardless of which OS runs this code, and .NET on Linux
+    # returns '' for 'D:\Renders'. See its own comment in Config.ps1. Its -Path
+    # is Mandatory, so an unset OutputDir is screened out here rather than
+    # binding-erroring inside a config-sanity check.
+    $outputRoot = if ([string]::IsNullOrWhiteSpace($OutputDir)) { '' } else { Get-TopazWindowsPathRoot -Path $OutputDir }
+    if ([string]::IsNullOrWhiteSpace($outputRoot)) {
+        return [pscustomobject]@{
+            Status = 'WARN'
+            Detail = "OutputDir '$OutputDir' is not a drive-letter-rooted Windows path, so it cannot be compared against ScratchDriveLetter '$ScratchDriveLetter'. OutputIsEphemeral=`$$OutputIsEphemeral could not be corroborated."
+        }
+    }
+
+    # Trim the same way Get-ExistingScratchDriveValidation does: a config
+    # carrying 'D:' rather than 'D' must not produce a spurious mismatch.
+    $scratchLetter = "$ScratchDriveLetter".Trim().TrimEnd(':')
+    $outputLetter = $outputRoot.Substring(0, 1)
+    $onScratchVolume = [string]::Equals($outputLetter, $scratchLetter, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ($onScratchVolume -and -not $OutputIsEphemeral) {
+        return [pscustomobject]@{
+            Status = 'FAIL'
+            Detail = "*** DATA LOSS RISK *** OutputDir '$OutputDir' is on the instance-store scratch volume (${scratchLetter}:), which is ERASED on every instance stop, but OutputIsEphemeral is `$false -- so Stop-Sequence.ps1's upload interlock is DISARMED. A stalled or timed hard stop would power the box off without verifying the upload and destroy every finished render in that folder. Set OutputIsEphemeral = `$true, or move OutputDir onto the persistent C: drive."
+        }
+    }
+
+    if (-not $onScratchVolume -and $OutputIsEphemeral) {
+        return [pscustomobject]@{
+            Status = 'WARN'
+            Detail = "OutputDir '$OutputDir' is NOT on the scratch volume (${scratchLetter}:) yet OutputIsEphemeral is `$true. Nothing is at risk of being erased, but the interlock will refuse every stop whose upload fails, for output that actually survives a stop. Set OutputIsEphemeral = `$false if '$outputRoot' really is persistent."
+        }
+    }
+
+    $where = if ($onScratchVolume) { "on the wiped instance-store volume (${scratchLetter}:)" } else { "on persistent storage ($outputRoot)" }
+    return [pscustomobject]@{
+        Status = 'PASS'
+        Detail = "OutputDir '$OutputDir' is $where and OutputIsEphemeral=`$$OutputIsEphemeral agrees with that."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Dot-source seam. Everything above is a helper definition; everything below
+# actually probes the box. Referenced (not merely declared) so
+# PSReviewUnusedParameter stays quiet.
+# ---------------------------------------------------------------------------
+
+if ($LibraryOnly) { return }
+
+# ---------------------------------------------------------------------------
+# Best-effort refresh of THIS PROCESS's own copy of PATH from the registry,
+# before any resolvability check below runs. This process's environment was
+# captured when its shell started; a dependency installed afterwards (the
+# documented AWS CLI v2 install on this exact box is the motivating case)
+# would otherwise report a false negative instead of the box's TRUE current
+# state, which is the entire point of a preflight tool. This only mutates
+# THIS PROCESS's in-memory environment block -- never the registry, never
+# any other process, and it is silently best-effort (a failure here just
+# means the checks below fall back to this session's existing PATH).
+#
+# Below the -LibraryOnly seam on purpose: dot-sourcing this file for its pure
+# helpers must not touch even this process's environment.
+# ---------------------------------------------------------------------------
+
+try {
+    $machinePathValue = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPathValue = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    $refreshedPathParts = @($machinePathValue, $userPathValue) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($refreshedPathParts.Count -gt 0) {
+        $env:Path = [string]::Join(';', $refreshedPathParts)
+    }
+}
+catch {
+    $null = $_
+}
+
 # ---------------------------------------------------------------------------
 # Banner.
+#
+# $PSScriptRoot and InstallDir are printed because this tool validates
+# WHICHEVER copy of the pipeline it was launched from: it dot-sources
+# "$PSScriptRoot\Config.ps1", while the scheduled tasks run the InstallDir
+# copies. Run from the repo checkout after editing Config.ps1 but before
+# re-running Install.ps1, every result below describes a pipeline that is not
+# the one the box will actually execute -- a drift documented in docs/11 as a
+# known failure mode. Check 3 compares the two copies; this line says which
+# one was measured.
 # ---------------------------------------------------------------------------
 
 Write-Output '===================================================================='
 Write-Output "Topaz Auto-Stop Preflight - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
 Write-Output "Host=$env:COMPUTERNAME User=$env:USERDOMAIN\$env:USERNAME"
+Write-Output "Validating : $PSScriptRoot"
+Write-Output "InstallDir : $($cfg.InstallDir)   (what the scheduled tasks run)"
 Write-Output '===================================================================='
 Write-Output ''
 
@@ -494,6 +644,164 @@ else {
     Write-PreflightResult -Status 'FAIL' -Name 'Config: timing values' -Detail ($timingProblems -join '; ')
 }
 
+# --- 3a. OutputIsEphemeral vs. the volume OutputDir actually lives on -------
+#
+# Pure decision, so it lives in Resolve-EphemeralOutputVerdict above and is unit
+# tested; only the reporting is here.
+
+$ephemeralVerdict = Resolve-EphemeralOutputVerdict -OutputDir $cfg.OutputDir `
+    -ScratchDriveLetter $cfg.ScratchDriveLetter -OutputIsEphemeral ([bool]$cfg.OutputIsEphemeral)
+Write-PreflightResult -Status $ephemeralVerdict.Status -Name 'Config: OutputIsEphemeral vs OutputDir volume' `
+    -Detail $ephemeralVerdict.Detail
+
+# --- 3b. The upload path, which is a hard precondition for stopping at all --
+#
+# WHY THIS IS A FAIL AND NOT A NICETY. With the shipped defaults
+# (OutputIsEphemeral=$true, UploadTarget='gdrive:temp'),
+# Invoke-TopazRenderUpload returns $false the moment either rclone path is
+# missing, Stop-Sequence.ps1's ephemeral interlock then REFUSES the stop, and
+# the watchdog re-arms every DebounceSec forever. A box where
+# Set-GoogleDriveAuth.ps1 was never run is structurally incapable of ever
+# stopping -- and this preflight used to print VERDICT: GO for it. The word
+# 'rclone' did not appear in this file at all.
+#
+# The FAIL conditions below are exactly the conditions Stop-Sequence.ps1 and
+# Test-TopazCompletedStopSafetyGate actually refuse on; nothing broader.
+
+if ($cfg.OutputIsEphemeral -and [string]::IsNullOrWhiteSpace($cfg.UploadTarget)) {
+    Write-PreflightResult -Status 'FAIL' -Name 'Config: UploadTarget' `
+        -Detail "OutputDir '$($cfg.OutputDir)' is marked ephemeral but no UploadTarget is configured. Stop-Sequence.ps1 REFUSES every stop in that state (there is nowhere to save renders that the stop is about to erase), so this instance can never stop itself. Set UploadTarget in Config.ps1 and re-run Install.ps1."
+}
+elseif ([string]::IsNullOrWhiteSpace($cfg.UploadTarget)) {
+    Write-PreflightResult -Status 'WARN' -Name 'Config: UploadTarget' `
+        -Detail "No UploadTarget configured. Renders are never uploaded before a stop. That is only safe because OutputIsEphemeral is `$false, i.e. '$($cfg.OutputDir)' survives the stop."
+}
+else {
+    Write-PreflightResult -Status 'PASS' -Name 'Config: UploadTarget' `
+        -Detail "'$($cfg.UploadTarget)' is configured as the verified upload destination for '$($cfg.OutputDir)'."
+
+    $uploadIsMandatory = [bool]$cfg.OutputIsEphemeral
+    $rcloneMissingStatus = if ($uploadIsMandatory) { 'FAIL' } else { 'WARN' }
+    $rcloneStakes = if ($uploadIsMandatory) {
+        'Until it exists, EVERY stop is REFUSED and this instance keeps billing.'
+    }
+    else {
+        'Renders will not be uploaded before a stop (not fatal: OutputDir is persistent).'
+    }
+
+    $rcloneExeOk = Test-Path -LiteralPath $cfg.RclonePath -PathType Leaf
+    if ($rcloneExeOk) {
+        Write-PreflightResult -Status 'PASS' -Name 'rclone executable' `
+            -Detail "Found at the configured RclonePath '$($cfg.RclonePath)'."
+    }
+    else {
+        Write-PreflightResult -Status $rcloneMissingStatus -Name 'rclone executable' `
+            -Detail "NOT found at the configured RclonePath '$($cfg.RclonePath)'. $rcloneStakes Install rclone there, or fix RclonePath in Config.ps1."
+    }
+
+    $rcloneConfigOk = Test-Path -LiteralPath $cfg.RcloneConfigPath -PathType Leaf
+    if ($rcloneConfigOk) {
+        Write-PreflightResult -Status 'PASS' -Name 'rclone config' `
+            -Detail "Found at '$($cfg.RcloneConfigPath)' (the Drive remote has been authorised)."
+    }
+    else {
+        Write-PreflightResult -Status $rcloneMissingStatus -Name 'rclone config' `
+            -Detail "NOT found at '$($cfg.RcloneConfigPath)': the Google Drive remote has never been authorised on this box. $rcloneStakes Run Set-GoogleDriveAuth.ps1 (elevated, from an interactive DCV session)."
+    }
+
+    # `rclone listremotes` is local and read-only -- it parses the config file
+    # and makes no network call, so it stays inside this tool's read-only
+    # contract. WARN only: a remote that cannot be listed is diagnosable, while
+    # the FAILs above are keyed on the two conditions the stop path itself
+    # refuses on.
+    if ($rcloneExeOk -and $rcloneConfigOk) {
+        $expectedRemote = ($cfg.UploadTarget -split ':')[0]
+        $listRemotesArgs = ConvertTo-AwsArgumentString -ArgumentList @('listremotes', '--config', $cfg.RcloneConfigPath)
+        $listRemotesResult = Invoke-BoundedCommand -FileName $cfg.RclonePath -Arguments $listRemotesArgs -TimeoutSec 15
+
+        $foundRemotes = @()
+        if ($listRemotesResult.Ok -and ($listRemotesResult.ExitCode -eq 0)) {
+            $foundRemotes = @(($listRemotesResult.StdOut -split "`r?`n") |
+                ForEach-Object { "$_".Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+
+        if ($foundRemotes -contains "${expectedRemote}:") {
+            Write-PreflightResult -Status 'PASS' -Name "rclone remote '${expectedRemote}:'" `
+                -Detail "Present in '$($cfg.RcloneConfigPath)', matching UploadTarget '$($cfg.UploadTarget)'."
+        }
+        else {
+            $listRemotesErrText = "$($listRemotesResult.StdOut)$($listRemotesResult.StdErr)".Trim()
+            if ([string]::IsNullOrWhiteSpace($listRemotesErrText)) { $listRemotesErrText = $listRemotesResult.Error }
+            Write-PreflightResult -Status 'WARN' -Name "rclone remote '${expectedRemote}:'" `
+                -Detail "UploadTarget is '$($cfg.UploadTarget)', whose remote is '${expectedRemote}:', but 'rclone listremotes' did not report it (found: $($foundRemotes -join ', ')$listRemotesErrText). Re-run Set-GoogleDriveAuth.ps1 -RemoteName '$expectedRemote', or fix UploadTarget."
+        }
+    }
+}
+
+# --- 3c. Which copy of the pipeline did this run actually validate? ---------
+#
+# This script dot-sources "$PSScriptRoot\Config.ps1", but the scheduled tasks
+# run the InstallDir copies. Run from the repo checkout after editing
+# Config.ps1 and before re-running Install.ps1, every check in this report
+# describes a pipeline the box will never execute -- docs/11 lists exactly that
+# ("DryRun is still $true in the installed copy") as a known failure mode, and
+# this tool was silent about it.
+#
+# Severity ladder matches check 12's convention: not-installed-yet is a WARN
+# (the preflight is documented as runnable before Install.ps1), an INCOMPLETE
+# install is a FAIL, and content drift is a WARN naming each file.
+
+if ($PSScriptRoot -eq $cfg.InstallDir) {
+    Write-PreflightResult -Status 'PASS' -Name 'Repo vs installed copy' `
+        -Detail "Running from InstallDir itself ('$($cfg.InstallDir)'), so this report describes exactly the files the scheduled tasks execute."
+}
+else {
+    # Config.ps1/Watchdog.ps1/Stop-Sequence.ps1 are the pipeline; the other two
+    # are the boot/metric tasks. All five are what Install.ps1 copies.
+    $installedNames = @('Config.ps1', 'Watchdog.ps1', 'Stop-Sequence.ps1', 'Push-GpuMetric.ps1', 'Initialize-ScratchDisk.ps1')
+    $requiredNames = @('Config.ps1', 'Watchdog.ps1', 'Stop-Sequence.ps1')
+
+    $presentInstalled = @($installedNames | Where-Object { Test-Path -LiteralPath (Join-Path $cfg.InstallDir $_) -PathType Leaf })
+
+    if ($presentInstalled.Count -eq 0) {
+        Write-PreflightResult -Status 'WARN' -Name 'Repo vs installed copy' `
+            -Detail "This run validated '$PSScriptRoot', but the pipeline is not installed in '$($cfg.InstallDir)' yet (none of $($installedNames -join ', ') are there). Run Install.ps1, then re-run this preflight so it measures what the scheduled tasks will actually execute."
+    }
+    else {
+        $missingInstalled = @($requiredNames | Where-Object { $presentInstalled -notcontains $_ })
+        if ($missingInstalled.Count -gt 0) {
+            Write-PreflightResult -Status 'FAIL' -Name 'Repo vs installed copy' `
+                -Detail "'$($cfg.InstallDir)' is a PARTIAL install: missing $($missingInstalled -join ', '). Every installed script dot-sources Config.ps1 by literal name and Watchdog.ps1 invokes Stop-Sequence.ps1, so the tasks would fail at run time. Re-run Install.ps1 and check its log for copy errors."
+        }
+
+        $driftedFiles = @()
+        foreach ($name in $presentInstalled) {
+            $repoCopy = Join-Path $PSScriptRoot $name
+            if (-not (Test-Path -LiteralPath $repoCopy -PathType Leaf)) { continue }
+            try {
+                # Get-FileHash exists in Windows PowerShell 5.1; read-only, and
+                # at most five small files.
+                $repoHash = (Get-FileHash -LiteralPath $repoCopy -Algorithm SHA256 -ErrorAction Stop).Hash
+                $installedHash = (Get-FileHash -LiteralPath (Join-Path $cfg.InstallDir $name) -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($repoHash -ne $installedHash) { $driftedFiles += $name }
+            }
+            catch {
+                $driftedFiles += "$name (could not be hashed: $($_.Exception.Message))"
+            }
+        }
+
+        if ($driftedFiles.Count -gt 0) {
+            Write-PreflightResult -Status 'WARN' -Name 'Repo vs installed copy' `
+                -Detail "This run validated '$PSScriptRoot', but the INSTALLED copy the scheduled tasks run differs in: $($driftedFiles -join ', '). Anything this report says about those files (DryRun, UploadTarget, timings, detection logic) may not describe the running pipeline. Re-run Install.ps1, then re-run this preflight."
+        }
+        elseif ($missingInstalled.Count -eq 0) {
+            Write-PreflightResult -Status 'PASS' -Name 'Repo vs installed copy' `
+                -Detail "'$PSScriptRoot' and the installed copy in '$($cfg.InstallDir)' are byte-identical for $($presentInstalled -join ', ')."
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 4. nvidia-smi.
 # ---------------------------------------------------------------------------
@@ -504,7 +812,16 @@ Write-Output '-- 4. nvidia-smi --'
 $gpuSignalNeedsNvidiaSmi = ($cfg.CompletionSignal -eq 'GpuOnly') -or ($cfg.CompletionSignal -eq 'WorkerOrGpu')
 $gpuSnapshot = Get-NvidiaSmiUtilizationSnapshot
 
-if ($gpuSnapshot) {
+# NOT `if ($gpuSnapshot)`. Get-NvidiaSmiUtilizationSnapshot returns an int[],
+# and PowerShell converts a ONE-element array to bool by converting its single
+# element -- so @(0) is FALSY while @(37) and @(0,0) are truthy. The target
+# g6e.2xlarge has exactly one GPU, and an idle GPU reads 0%, which is the
+# normal state when the operator runs this preflight BEFORE starting a render.
+# The old condition therefore reported a perfectly working nvidia-smi as
+# unreadable, and on CompletionSignal='GpuOnly'/'WorkerOrGpu' turned that into
+# a spurious FAIL and VERDICT: NO-GO. $null is still the only failure signal
+# (see the function's own returns).
+if ($null -ne $gpuSnapshot -and $gpuSnapshot.Count -gt 0) {
     $gpuMax = ($gpuSnapshot | Measure-Object -Maximum).Maximum
     $gpuUtilizationList = ($gpuSnapshot | ForEach-Object { "$_%" }) -join ', '
     Write-PreflightResult -Status 'PASS' -Name 'nvidia-smi' `
@@ -763,15 +1080,11 @@ else {
 
     # StopStrategy (Config.ps1/Resolve-StopPlan) is read defensively -- like
     # WorkerNamesLike, it may not exist on every shape this config object has
-    # taken. 'Ec2ApiStop' alone NEVER falls back to a guest shutdown, so
-    # instanceInitiatedShutdownBehavior is moot for that specific plan; any
-    # other/unknown value (including the default 'Auto', and the unrecognized
-    # fallback in Resolve-StopPlan itself) CAN reach Stop-Computer, so the
-    # unverified/'terminate' cases below remain fully relevant to it. Treating
-    # an unrecognized value as "can reach guest shutdown" is the fail-safe
-    # (more cautious) assumption.
+    # taken. The "can this plan reach Stop-Computer?" question itself lives in
+    # the pure Test-StopPlanCanReachGuestShutdown above (see its .DESCRIPTION
+    # for why it is one function rather than two copies of the same expression).
     $stopStrategyValue = if ($cfg.PSObject.Properties.Name -contains 'StopStrategy') { $cfg.StopStrategy } else { $null }
-    $canReachGuestShutdown = ($null -eq $stopStrategyValue) -or ($stopStrategyValue -ne 'Ec2ApiStop')
+    $canReachGuestShutdown = Test-StopPlanCanReachGuestShutdown -StopStrategy $stopStrategyValue
     $stopStrategyNote = if ($null -ne $stopStrategyValue) { " (StopStrategy='$stopStrategyValue')" } else { '' }
 
     if ($shutdownBehaviorValue -eq 'stop') {
@@ -811,7 +1124,9 @@ Write-Output '-- 11. DryRun state --'
 
 $shutdownBehaviorDisplay = if ($null -eq $shutdownBehaviorValue) { 'UNVERIFIED' } else { $shutdownBehaviorValue }
 $stopStrategyValue = if ($cfg.PSObject.Properties.Name -contains 'StopStrategy') { $cfg.StopStrategy } else { $null }
-$canReachGuestShutdown = ($null -eq $stopStrategyValue) -or ($stopStrategyValue -ne 'Ec2ApiStop')
+# Same predicate as check 10, deliberately -- these two checks disagreeing is
+# how a 'terminate' box on an 'Auto' plan would slip through as a PASS.
+$canReachGuestShutdown = Test-StopPlanCanReachGuestShutdown -StopStrategy $stopStrategyValue
 $stopStrategyDisplay = if ($null -ne $stopStrategyValue) { $stopStrategyValue } else { '(not present in this config)' }
 
 if ($cfg.DryRun) {
@@ -838,7 +1153,21 @@ else {
 Write-Output ''
 Write-Output '-- 12. Scheduled tasks --'
 
-foreach ($taskName in @($cfg.WatchdogTaskName, $cfg.MetricTaskName)) {
+# The SCRATCH task is checked alongside the other two because its absence is
+# invisible until the next boot: check 3's 'Config: OutputDir' PASSes on
+# D:\Renders that exists right now, from this boot, while nothing would
+# re-create it after the next stop wipes the instance store -- and then Topaz
+# has nowhere to export and every stop is refused. Register-ScheduledTasks.ps1
+# registers all three independently, so this really can be the one that failed.
+#
+# WARN, not FAIL, matching this check's existing convention: the preflight is
+# documented as runnable BEFORE Register-ScheduledTasks.ps1, and a FAIL here
+# would report NO-GO for the normal pre-registration run. The extra stakes go
+# in the detail text instead.
+$scratchTaskStakes = "This is the BOOT task that re-creates the instance-store scratch drive; the volume is wiped on every stop, so without it '$($cfg.OutputDir)' will not exist after the next start and every stop will be refused."
+
+foreach ($taskName in @($cfg.WatchdogTaskName, $cfg.ScratchTaskName, $cfg.MetricTaskName)) {
+    $taskStakes = if ($taskName -eq $cfg.ScratchTaskName) { " $scratchTaskStakes" } else { '' }
     try {
         $scheduledTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
         $scheduledTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction Stop
@@ -847,7 +1176,7 @@ foreach ($taskName in @($cfg.WatchdogTaskName, $cfg.MetricTaskName)) {
     }
     catch {
         Write-PreflightResult -Status 'WARN' -Name "Scheduled task '$taskName'" `
-            -Detail "Not registered (or could not be queried): $($_.Exception.Message). Run Register-ScheduledTasks.ps1 (elevated) before arming the pipeline."
+            -Detail "Not registered (or could not be queried): $($_.Exception.Message). Run Register-ScheduledTasks.ps1 (elevated) before arming the pipeline.$taskStakes"
     }
 }
 

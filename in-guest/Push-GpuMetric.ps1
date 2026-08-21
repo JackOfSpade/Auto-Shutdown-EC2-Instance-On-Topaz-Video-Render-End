@@ -63,13 +63,16 @@ $cfg = Get-TopazAutoStopConfig
 # ---------------------------------------------------------------------------
 # 1. Read both signals. Neither read may abort the other -- see the header note
 #    on independent failure. $null from either means "unknown this cycle".
+#
+#    RenderActive is read FIRST, for the same reason it is published first
+#    (see step 3): it is the metric the alarm evaluates. Get-GpuUtilizationMax
+#    spawns nvidia-smi and is allowed to burn its full bounded wait (15s, see
+#    Config.ps1) before returning -- on a box with a wedged GPU driver, which
+#    is precisely the case that bound exists for, reading it first delayed the
+#    alarm's ONLY signal by that much in every one-minute cycle, purely to
+#    fetch a metric the header above documents as telemetry only. The two
+#    reads share no state, so the order is free to fix.
 # ---------------------------------------------------------------------------
-
-$util = Get-GpuUtilizationMax
-if ($null -eq $util) {
-    Write-TopazLog -Component 'metric' -Level 'ERROR' `
-        -Message "Failed to read GPU utilization. Publishing no $($cfg.MetricName) this cycle."
-}
 
 $workerPresent = Test-RenderWorkerPresent -WorkerNamesLike $cfg.WorkerNamesLike
 if ($null -eq $workerPresent) {
@@ -78,6 +81,12 @@ if ($null -eq $workerPresent) {
     # blind, not just a gap in telemetry.
     Write-TopazLog -Component 'metric' -Level 'ERROR' `
         -Message "Worker-presence query FAILED; publishing no $($cfg.RenderActiveMetricName) this cycle. The idle alarm has no fresh datapoint to evaluate."
+}
+
+$util = Get-GpuUtilizationMax
+if ($null -eq $util) {
+    Write-TopazLog -Component 'metric' -Level 'ERROR' `
+        -Message "Failed to read GPU utilization. Publishing no $($cfg.MetricName) this cycle."
 }
 
 if ($null -eq $util -and $null -eq $workerPresent) {

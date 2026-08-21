@@ -285,6 +285,55 @@ In other words, `-Force` is not "stop even though work is in progress" - it is
 "stop now that we have confirmed no work is in progress." See
 [Phase 2](04-phase2-watchdog.md) for the completion and unlock logic.
 
+## What the script returns, and why that is load-bearing
+
+`Stop-Sequence.ps1` reports its outcome as a **single boolean on the output
+stream**:
+
+- **`$false`** - the stop was REFUSED (ephemeral interlock, final completion
+  safety gate) or every action in the plan was attempted and the box is still
+  running.
+- **`$true`** - the stop was performed, or was deliberately suppressed by
+  `DryRun`. ("Suppressed on purpose" is not a failure, and conflating it with a
+  refusal would break the watchdog's own `DryRun` re-arm path.)
+
+`Watchdog.ps1` tests that value with `$stopResult -eq $false` to decide whether
+to re-arm and retry. That is the retry loop keeping an un-uploaded render alive,
+so two properties are non-negotiable and are now pinned by
+[`in-guest/tests/Stop-Sequence.Tests.ps1`](../in-guest/tests/Stop-Sequence.Tests.ps1):
+**exactly one object** is emitted (this is why `Write-TopazLog` writes to the
+Information/Warning/Error streams and never to output - see its comment in
+`Config.ps1`), and the watchdog's call path must never `exit`, because `exit`
+makes the `& <script>` expression yield `$null`, and `$null -eq $false` is
+false, so the re-arm block would simply be skipped.
+
+### `-ExitCodeOnRefusal`, for the scheduled-task caller only
+
+Under Task Scheduler's `powershell.exe -File`, a returned `$false` is just text
+on stdout: the host prints `False` and exits **0**. So a refused wall-clock hard
+stop showed `LastTaskResult=0` - *success* - which is precisely the field
+[`Register-TimedStop.ps1`](../in-guest/Register-TimedStop.ps1)'s `.NOTES` tells
+the operator to inspect for a cost backstop that had, in fact, stopped nothing
+and would keep refusing every `RetryIntervalMinutes`.
+
+The opt-in `-ExitCodeOnRefusal` switch translates the outcome into an exit code
+(**2** = refused, **0** = stopped or suppressed). It is passed by
+`Register-TimedStop.ps1`'s action string and **nowhere else** - deliberately a
+switch rather than a test on `$MyInvocation`, because that test cannot tell
+`-File` from the watchdog's `&` call and would have silently broken the re-arm
+contract above.
+
+### The `-LibraryOnly` seam
+
+Dot-sourcing `Stop-Sequence.ps1 -LibraryOnly` defines its functions and does
+nothing else - no config load, no IMDS round trip, no `stop.log` line. The whole
+body lives in `Invoke-TopazStopSequence`, and the ephemeral branch is the pure
+`Resolve-EphemeralUploadRefusal`. That exists so the ORDERING above is testable:
+before it, the file was straight-line top-level code that could not be loaded
+without attempting a real stop, so moving the safety gate below the `DryRun`
+guard - or dropping a `return $false` - would have left every test in the repo
+green while turning a refusal into a stop.
+
 ## Incremental per-render upload (CORRECTION 3, shipped 2026-07-28)
 
 Before this correction, upload only happened once - inside `Stop-Sequence.ps1`, after the whole

@@ -294,6 +294,56 @@ deployed** here - see the banner at the top of this document and
 [docs/09-appendix-b-boundaries.md](09-appendix-b-boundaries.md) for the
 accepted cost of running without it.
 
+### DANGER: a Lambda stop bypasses `Stop-Sequence.ps1` and can destroy a finished render
+
+Read this before deploying it, and before reading the "conservative" list
+further down as a safety argument.
+
+The Lambda calls `ec2:StopInstances` **out of band**. It never consults the
+guest, and an EC2-API stop triggers nothing inside the guest -
+[`Register-ScheduledTasks.ps1`](../in-guest/Register-ScheduledTasks.ps1)
+registers only at-startup and repeating triggers, never a shutdown-triggered
+task. So when the Lambda fires, [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1)
+**does not run**: no rclone upload, no upload verification, no misplaced-output
+recovery scan, and **no ephemeral-upload interlock**.
+
+`OutputDir` normally sits on the instance-store scratch volume, which is
+**erased the instant the instance stops**. A render that finished but has not
+been uploaded and verified when the ceiling is crossed is permanently lost - no
+local file, no snapshot, nothing to re-run. This is recorded, not theoretical: a
+finished ~2.3 GB render was lost exactly that way on this deployment, see
+[docs/16-render-loss-incident.md](16-render-loss-incident.md). And the exposure
+is not rare - when an upload keeps failing, the interlock deliberately keeps the
+box running with finished renders on `D:` until a human fixes it, which is
+precisely the state a wall-clock Lambda stop erases.
+
+**Prefer [`Register-TimedStop.ps1`](../in-guest/Register-TimedStop.ps1) whenever
+the guest is reachable.** It is the in-guest equivalent (see
+[the section below](#in-guest-alternative-register-timedstopps1)) and takes the
+opposite position on purpose: it routes through `Stop-Sequence.ps1`, so it is
+equally blind to render *progress* but the upload interlock still applies - a
+stop that would erase an unuploaded render is **refused** and retried until the
+upload succeeds. Its header states the trade in as many words: *"Erasing a
+completed render to save a few dollars of instance time is not a trade this
+project makes, so the cost cap yields to it."* The Lambda makes exactly that
+trade. Use the Lambda only where the guest cannot be trusted to act at all, and
+accept that its cap is absolute in both directions.
+
+**Considered and rejected: a guest-set veto tag.** The obvious middle road -
+have the guest tag the instance `TopazUploadPending=true` while unuploaded output
+exists and have the Lambda no-op while that tag is present - was rejected
+deliberately. The max-lifetime cap is the *unconditional* last-resort backstop by
+design, and a guest veto turns it into a soft cap that depends on the same guest
+you deployed it because you could not trust; it would also require granting the
+instance role `ec2:CreateTags`, a new write permission that cuts against the
+least-privilege posture recorded in
+[docs/09 §4](09-appendix-b-boundaries.md). `Register-TimedStop.ps1` already is
+the interlock-honoring variant, and it needs no new grant.
+
+The Lambda's own
+[README](../lambda/max-lifetime-stop/README.md) carries the same warning at the
+top, with a side-by-side comparison of the two backstops.
+
 The idle alarm cannot catch a job that stays **"stuck busy."** Under the default
 `render` signal that means a hung-but-still-alive worker process - `neuroserver`
 or `ffmpeg` wedged but never exiting - since `RenderActive` never drops to `0`
@@ -351,7 +401,17 @@ What the [handler](../lambda/max-lifetime-stop/handler.py) does on each fire:
 - If the instance is **`running`** and its age `>= MAX_LIFETIME_HOURS`, calls
   `ec2:StopInstances`. Otherwise it is a no-op.
 - **Stop only, never terminate.** Idempotent: already-stopping/stopped is a no-op.
-  Timezone-aware UTC math. Graceful if the instance id can't be found.
+  Timezone-aware UTC math. All of that is about *instance* state; none of it is
+  about unuploaded output - see the DANGER block above.
+- **Graceful only where "gone" is a real runtime state.** An
+  `InvalidInstanceID.NotFound` (or a describe with no reservations) degrades to
+  a logged no-op, because the instance genuinely may have been terminated or
+  replaced. An `InvalidInstanceID.Malformed` id does **not**: a structurally
+  invalid id can only be a typo, no later invocation will do better, and a cap
+  that reports SUCCESS every 30 minutes while guarding nothing is the worst way
+  to be broken - so it fails the invocation, where the function's `Errors`
+  metric can see it. Alarm on that metric if you deploy this; nothing in this
+  repo creates that alarm for you.
 - **`MAX_LIFETIME_HOURS` validation is defense-in-depth, not just deploy-time.**
   The handler independently re-validates the env var on every invocation and
   falls back to the 12h default on anything non-numeric, non-positive, **or
@@ -374,16 +434,26 @@ skip it - delete the function and schedule to remove it later.
 
 For a deployment where the control plane cannot be reached to deploy the
 Lambda above, [`Register-TimedStop.ps1`](../in-guest/Register-TimedStop.ps1)
-is an in-guest, one-shot wall-clock backstop that does a similar job locally:
-it registers a SYSTEM scheduled task that fires `Stop-Sequence.ps1 -Reason
+is an in-guest wall-clock backstop that does a similar job locally: it
+registers a SYSTEM scheduled task that fires `Stop-Sequence.ps1 -Reason
 maxlifetime -IgnoreDryRun` a fixed number of hours from now (default **4**),
 **bypassing `DryRun`** on purpose - a backstop that respected `DryRun` would
 not be one - and then following the same `StopStrategy` plan as every other
 stop. It is **blind to render state**: none of the watchdog's debounce,
 stall, or unlock-gate logic applies, so if a render is still running when it
-fires, that render is killed along with the instance. Cancel it
-(`.\Register-TimedStop.ps1 -Cancel`) once the real watchdog is armed and
-verified - see its own header comment for the full reasoning, including a
+fires, that render is killed along with the instance.
+
+**One guard it does not bypass, and this is the whole difference from the
+Lambda above:** going through `Stop-Sequence.ps1` means the ephemeral upload
+interlock still applies. If `OutputDir` is on the scratch volume and its
+finished renders have not been uploaded and verified, the stop is **refused** -
+so the task is registered with a repeating trigger rather than as a true
+one-shot, and retries every `RetryIntervalMinutes` (default 15) until the
+upload succeeds and the stop can go through. A cost cap that fired once, was
+refused, and never tried again would not cap anything.
+
+Cancel it (`.\Register-TimedStop.ps1 -Cancel`) once the real watchdog is armed
+and verified - see its own header comment for the full reasoning, including a
 real near-miss recorded on this deployment.
 
 ## Safety-net operational windows (only relevant if you opt back in)
@@ -435,5 +505,13 @@ a human.
 **None of these three layers is gated by `Config.ps1`'s `DryRun` switch** - only
 the in-guest watchdog/stop-sequence path is. See the `DryRun` caveat in
 [Phase 3](05-phase3-stop-sequence.md).
+
+**And neither control-plane layer is gated by the ephemeral upload interlock
+either** - both stop the instance through the EC2 API, so `Stop-Sequence.ps1`
+never runs and unuploaded renders on the scratch volume are erased with the
+volume. That is a stronger statement than the `DryRun` caveat and it is the
+reason the two rows above are worth reading twice before arming: see the
+[DANGER block](#danger-a-lambda-stop-bypasses-stop-sequenceps1-and-can-destroy-a-finished-render)
+and [docs/16](16-render-loss-incident.md).
 
 Continue to [Phase 5 - notifications](07-phase5-notifications.md).

@@ -53,6 +53,47 @@ Describe 'Test-RenderActive (regression for the A1 [ref]/PSReference bug)' {
             # $null: the worker signal itself IS readable here.
             $result.IoBytes | Should -Be 0
         }
+
+        It 'never pays the nvidia-smi cost under the shipped WorkerOnly signal -- Get-GpuUtilizationMax is not called at all' {
+            # PINS THE COST OPTIMISATION AT Watchdog.ps1's "Only pay the
+            # nvidia-smi cost when the GPU signal is actually used". Nothing
+            # asserted an invocation COUNT before, so a regression that called
+            # Get-GpuUtilizationMax unconditionally would have left the whole
+            # suite green while spawning an nvidia-smi child process with a 15s
+            # WaitForExit every PollSec for the entire length of every render.
+            # $cfg here is the real shipped config (CompletionSignal =
+            # 'WorkerOnly', Config.ps1), so this is the branch the deployment
+            # actually takes.
+            Test-RenderActive | Out-Null
+
+            Should -Invoke Get-GpuUtilizationMax -Times 0 -Exactly
+        }
+    }
+
+    Context 'CompletionSignal = WorkerOrGpu (NOT the shipped value -- the other side of the branch)' {
+        BeforeEach {
+            Mock Get-TopazWorkers { return , @() }
+            Mock Get-GpuUtilizationMax { return 50 }
+        }
+
+        It 'DOES call Get-GpuUtilizationMax, and a busy GPU alone reports Active=$true even with zero workers' {
+            # $cfg here SHADOWS the one captured at Watchdog.ps1's dot-source
+            # scope, for the duration of this It only. PowerShell resolves
+            # unqualified variables dynamically up the CALL stack, which is the
+            # very property the Get-TopazWorkers Describe's shadow
+            # Get-CimInstance below already relies on to read $cfg -- so this
+            # one wins for anything this test calls, and cannot leak anywhere
+            # else. Declared in the It rather than a BeforeEach purely so the
+            # assertions below can read it back in the same scope.
+            $cfg = [pscustomobject]@{ CompletionSignal = 'WorkerOrGpu'; GpuBusyPercent = 15 }
+
+            $result = Test-RenderActive
+
+            Should -Invoke Get-GpuUtilizationMax -Times 1 -Exactly
+            $result.WorkerActive | Should -Be $false
+            $result.GpuValue     | Should -BeGreaterOrEqual $cfg.GpuBusyPercent
+            $result.Active       | Should -Be $true
+        }
     }
 
     Context 'no workers' {
@@ -66,7 +107,15 @@ Describe 'Test-RenderActive (regression for the A1 [ref]/PSReference bug)' {
             Mock Get-GpuUtilizationMax { return $null }
         }
 
-        It 'does not throw and returns Active=$false / WorkerActive=$false (WorkerOrGpu signal, GPU unreadable), IoBytes=0 (worker signal readable, zero workers)' {
+        It 'does not throw and returns Active=$false / WorkerActive=$false (WorkerOnly signal -- the shipped CompletionSignal), IoBytes=0 (worker signal readable, zero workers)' {
+            # WorkerOnly, not WorkerOrGpu: Config.ps1 ships
+            # CompletionSignal = 'WorkerOnly', and that is a MEASURED decision,
+            # not a stale default -- DCV encodes the remote display on the same
+            # GPU at 14-49%, so the GPU signal produced "Render active
+            # (worker=False gpu=21%)" with no render running. Under WorkerOnly
+            # Test-RenderActive never calls Get-GpuUtilizationMax at all, so the
+            # mock above is inert here; the WorkerOrGpu branch has its own
+            # Context below.
             { Test-RenderActive } | Should -Not -Throw
             $result = Test-RenderActive
 
@@ -382,6 +431,14 @@ Describe 'Get-TopazWorkers (real end-to-end delegation, not just Resolve-WorkerA
             # all, this call threw ParameterBindingException -- the exact
             # regression this branch exists to fix in the tests.)
             if ($PSBoundParameters.ContainsKey('Property')) {
+                # $script:FailAncestryQuery makes THIS query -- and only this
+                # query -- fail, which is what a transient CIM/WMI provider
+                # fault looks like from Get-TopazWorkers's point of view: the
+                # every-process ancestry snapshot dies while the narrower
+                # worker query still answers. See the two tests that use it.
+                if ($script:FailAncestryQuery) {
+                    throw 'simulated CIM ancestry-snapshot failure'
+                }
                 return @($script:FakeTopazProcs + $script:FakeWorkerProcs)
             }
 
@@ -400,9 +457,11 @@ Describe 'Get-TopazWorkers (real end-to-end delegation, not just Resolve-WorkerA
     }
 
     BeforeEach {
-        $script:KnownWorkers    = @{}
-        $script:FakeTopazProcs  = @()
-        $script:FakeWorkerProcs = @()
+        $script:KnownWorkers       = @{}
+        $script:FakeTopazProcs     = @()
+        $script:FakeWorkerProcs    = @()
+        $script:FailAncestryQuery  = $false
+        Mock Write-TopazLog { }
     }
 
     It 'returns a flat, non-nested EMPTY array (not $null) for 0 Topaz GUIs / 0 workers' {
@@ -464,6 +523,49 @@ Describe 'Get-TopazWorkers (real end-to-end delegation, not just Resolve-WorkerA
         @($result).Count | Should -Be 2
         (@($result | ForEach-Object { $_.ProcessId }) | Sort-Object) | Should -Be @(300, 500)
     }
+
+    Context 'the ancestry snapshot itself fails (transient CIM/WMI provider fault)' {
+        # WHAT THIS GUARDS -- the single highest-consequence line in
+        # Get-TopazWorkers. Its catch does TWO things: it empties
+        # $allProcesses AND it forces `$topazPids = $null`. The second
+        # assignment is the load-bearing one, and nothing exercised it: with an
+        # empty process table but a still-non-null PID list,
+        # Resolve-ProcessDescendants would return @() ("the GUI has no
+        # descendants"), Resolve-WorkerAttribution would then return @() rather
+        # than $null, Test-RenderActive would report a CONFIRMED-idle box, and
+        # the debounce would start running down ON A BOX THAT IS ACTIVELY
+        # RENDERING. Deleting that one line left all 334 tests green before
+        # these two existed.
+
+        It 'returns exactly $null (unknown), NOT an empty array (idle), when the ancestry query dies with a live GUI and a live worker' {
+            $script:FakeTopazProcs    = @(Get-FakeTopazProc -ProcessId 100)
+            $script:FakeWorkerProcs   = @(Get-FakeTopazProc -ProcessId 500 -ParentProcessId 100)
+            $script:FailAncestryQuery = $true
+
+            $result = Get-TopazWorkers
+
+            # ($null -eq $result), not a pipe into Should -- see the
+            # null-vs-empty note on the first test in this Describe. That
+            # distinction is the entire point here: @() would mean "confirmed
+            # no worker" and start the debounce mid-render.
+            ($null -eq $result) | Should -Be $true
+        }
+
+        It 'still matches an ALREADY-KNOWN worker when the ancestry query dies, so the failure degrades to "unknown" without also losing orphan survival' {
+            $script:FakeTopazProcs    = @(Get-FakeTopazProc -ProcessId 100)
+            $script:FakeWorkerProcs   = @(Get-FakeTopazProc -ProcessId 500 -ParentProcessId 100)
+            $script:FailAncestryQuery = $true
+            # Get-FakeTopazProc pins CreationDate, so this poll's key is
+            # computable up front -- the same "<PID>|<Ticks>" shape
+            # Resolve-WorkerAttribution builds.
+            $script:KnownWorkers = @{ "500|$(([datetime]'2026-01-01T00:00:00').Ticks)" = $true }
+
+            $result = Get-TopazWorkers
+
+            @($result).Count     | Should -Be 1
+            $result[0].ProcessId | Should -Be 500
+        }
+    }
 }
 
 Describe 'Get-WorkerIoBytes' {
@@ -505,27 +607,45 @@ Describe 'Get-WorkerIoBytes' {
 
 Describe 'Get-NextWatchdogState' {
 
+    # -ActiveSec / -ArmSec ARE MANDATORY AND ARE PASSED ON EVERY CALL BELOW,
+    # including in Contexts whose subject is the stall or debounce clock rather
+    # than the arm debounce. They used to default to 0, and ArmSec=0 makes the
+    # arm expression true on the FIRST active poll -- i.e. most of this
+    # Describe was silently exercising a state machine the shipped
+    # configuration never runs. ArmSec=90 below is the REAL shipped value
+    # (Config.ps1), even where the surrounding PollSec/DebounceSec/StallLimitSec
+    # are deliberately small made-up numbers that keep these boundary tests
+    # short.
+
     Context 'stall accrual' {
         It 'hits the stalled verdict exactly at the boundary poll, with unchanged bytes on repeated active polls' {
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; LastBytes = [int64]1000 }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]1000 }
 
             # Poll 1: stall=10, below the 30s limit -> continue.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 10
             $state.Verdict  | Should -Be 'continue'
 
             # Poll 2: stall=20, still below the limit -> continue.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 20
             $state.Verdict  | Should -Be 'continue'
 
             # Poll 3: stall=30, exactly at the limit (-ge boundary) -> stalled.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 30
             $state.Verdict  | Should -Be 'stalled'
+
+            # The stall verdict does NOT depend on being armed: 30s of activity
+            # is still short of ArmSec=90, so a stalled render is detected even
+            # before the watchdog would be willing to call a queue complete.
+            $state.SawActivity | Should -Be $false
         }
     }
 
@@ -533,6 +653,7 @@ Describe 'Get-NextWatchdogState' {
         It 'resets the stall counter on a byte SHRINK, then again on the following GROWTH -- never stalls' {
             # Shrink: 1000 -> 500.
             $afterShrink = Get-NextWatchdogState -IdleSec 0 -StallSec 25 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes 1000 -Active $true -CurrentBytes 500 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $afterShrink.StallSec     | Should -Be 0
             $afterShrink.BytesChanged | Should -Be $true
@@ -543,7 +664,8 @@ Describe 'Get-NextWatchdogState' {
             # against the old high-water mark (1000) -- this is exactly the
             # bug the byte-delta (not growth-only) reset comment documents.
             $afterGrowth = Get-NextWatchdogState -IdleSec $afterShrink.IdleSec -StallSec $afterShrink.StallSec `
-                -SawActivity $afterShrink.SawActivity -LastBytes $afterShrink.LastBytes -Active $true `
+                -SawActivity $afterShrink.SawActivity -ActiveSec $afterShrink.ActiveSec -ArmSec 90 `
+                -LastBytes $afterShrink.LastBytes -Active $true `
                 -CurrentBytes 800 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $afterGrowth.StallSec     | Should -Be 0
             $afterGrowth.BytesChanged | Should -Be $true
@@ -554,10 +676,11 @@ Describe 'Get-NextWatchdogState' {
 
     Context 'pre-render sawActivity guard' {
         It 'never yields "completed" when Active is $false and SawActivity is $false, however much idle accrues' {
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; LastBytes = [int64]0 }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]0 }
 
             1..20 | ForEach-Object {
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $false -CurrentBytes $null -PollSec 10 -DebounceSec 120 -StallLimitSec 900
                 $state.Verdict     | Should -Be 'continue'
                 $state.SawActivity | Should -Be $false
@@ -571,13 +694,18 @@ Describe 'Get-NextWatchdogState' {
     Context 'debounce -> completed' {
         It 'reaches "completed" exactly at the DebounceSec boundary when SawActivity is $true' {
             # idle=110 + poll=10 -> 120, exactly at the 120s debounce (-ge boundary).
+            # ActiveSec=0 is what the real loop carries here: the worker has
+            # already gone, so its arm progress was discarded on the first
+            # inactive poll. SawActivity is what survives, and it is sticky.
             $state = Get-NextWatchdogState -IdleSec 110 -StallSec 0 -SawActivity $true `
+                -ActiveSec 0 -ArmSec 90 `
                 -LastBytes 1000 -Active $false -CurrentBytes $null -PollSec 10 -DebounceSec 120 -StallLimitSec 900
             $state.IdleSec | Should -Be 120
             $state.Verdict | Should -Be 'completed'
 
             # One poll earlier (110s) must NOT yet be "completed".
             $notYet = Get-NextWatchdogState -IdleSec 100 -StallSec 0 -SawActivity $true `
+                -ActiveSec 0 -ArmSec 90 `
                 -LastBytes 1000 -Active $false -CurrentBytes $null -PollSec 10 -DebounceSec 120 -StallLimitSec 900
             $notYet.IdleSec | Should -Be 110
             $notYet.Verdict | Should -Be 'continue'
@@ -585,15 +713,71 @@ Describe 'Get-NextWatchdogState' {
     }
 
     Context 'Active $null freeze' {
-        It 'returns ALL bookkeeping unchanged (freeze), regardless of inputs' {
+        It 'returns ALL bookkeeping unchanged (freeze), regardless of inputs -- ActiveSec and LastIoBytes included' {
+            # ActiveSec and LastIoBytes are two of the six fields the $null
+            # branch carries forward, and both have an explicit rationale
+            # comment in Watchdog.ps1 -- but neither was supplied here, let
+            # alone asserted, so a regression zeroing either one would have
+            # left the whole suite green.
+            #
+            # ActiveSec matters most: an unreadable poll is not evidence the
+            # worker went away, so resetting the arm counter would force a
+            # genuine render to re-earn its 90 seconds. On a box with
+            # intermittent CIM failures that means a real render can NEVER
+            # accumulate ArmSec, and the watchdog silently becomes inert.
             $state = Get-NextWatchdogState -IdleSec 42 -StallSec 17 -SawActivity $true `
-                -LastBytes 9999 -Active $null -CurrentBytes 123456 -PollSec 10 -DebounceSec 120 -StallLimitSec 900
+                -ActiveSec 75 -ArmSec 90 `
+                -LastBytes 9999 -Active $null -CurrentBytes 123456 `
+                -LastIoBytes 5000 -CurrentIoBytes 7777 `
+                -PollSec 10 -DebounceSec 120 -StallLimitSec 900
 
             $state.IdleSec     | Should -Be 42
             $state.StallSec    | Should -Be 17
             $state.SawActivity | Should -Be $true
+            $state.ActiveSec   | Should -Be 75
             $state.LastBytes   | Should -Be 9999
+            $state.LastIoBytes | Should -Be 5000
             $state.Verdict     | Should -Be 'continue'
+        }
+
+        It 'blind polls neither ADVANCE nor RESET the arm counter: a render interrupted by unreadable polls still arms on its sixth genuinely-active poll' {
+            # 3 active polls (45s), 2 blind polls, 3 more active polls. If the
+            # blind polls reset ActiveSec the render would never arm at all; if
+            # they advanced it, it would arm early (75s of real activity + 30s
+            # of nothing). Neither is acceptable, and only walking the whole
+            # sequence pins both directions at once.
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]0; LastIoBytes = $null }
+
+            foreach ($i in 1..3) {
+                $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec `
+                    -SawActivity $state.SawActivity -ActiveSec $state.ActiveSec -ArmSec 90 `
+                    -LastBytes $state.LastBytes -Active $true -CurrentBytes ([int64]0) `
+                    -LastIoBytes $state.LastIoBytes -CurrentIoBytes ([int64](100 * $i)) `
+                    -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
+            }
+            $state.ActiveSec   | Should -Be 45
+            $state.SawActivity | Should -BeFalse
+
+            foreach ($i in 1..2) {
+                $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec `
+                    -SawActivity $state.SawActivity -ActiveSec $state.ActiveSec -ArmSec 90 `
+                    -LastBytes $state.LastBytes -Active $null -CurrentBytes $null `
+                    -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
+                    -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
+                $state.ActiveSec | Should -Be 45      # frozen, not advanced, not reset
+            }
+
+            foreach ($i in 4..6) {
+                $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec `
+                    -SawActivity $state.SawActivity -ActiveSec $state.ActiveSec -ArmSec 90 `
+                    -LastBytes $state.LastBytes -Active $true -CurrentBytes ([int64]0) `
+                    -LastIoBytes $state.LastIoBytes -CurrentIoBytes ([int64](100 * $i)) `
+                    -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
+            }
+
+            # 6 genuinely-active polls x 15s = the 90s arm threshold exactly.
+            $state.ActiveSec   | Should -Be 90
+            $state.SawActivity | Should -BeTrue
         }
     }
 
@@ -607,6 +791,7 @@ Describe 'Get-NextWatchdogState' {
             # and progress must still be recognised, or a perfectly healthy
             # job accrues stall time until it is killed.
             $state = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes 1000 -Active $true -CurrentBytes 1000 `
                 -LastIoBytes 5000 -CurrentIoBytes 5200 `
                 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
@@ -625,10 +810,11 @@ Describe 'Get-NextWatchdogState' {
             # non-null, UNCHANGING I/O baseline supplied on every poll -- this
             # is what proves the I/O signal is actually being compared, not
             # merely ignored because it happens to be $null.
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; LastBytes = [int64]1000; LastIoBytes = [int64]5000 }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; ActiveSec = 90; LastBytes = [int64]1000; LastIoBytes = [int64]5000 }
 
             # Poll 1: stall=10, below the 30s limit -> continue.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 `
                 -LastIoBytes $state.LastIoBytes -CurrentIoBytes 5000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 10
@@ -636,6 +822,7 @@ Describe 'Get-NextWatchdogState' {
 
             # Poll 2: stall=20, still below the limit -> continue.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 `
                 -LastIoBytes $state.LastIoBytes -CurrentIoBytes 5000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 20
@@ -643,6 +830,7 @@ Describe 'Get-NextWatchdogState' {
 
             # Poll 3: stall=30, exactly at the limit (-ge boundary) -> stalled.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes 1000 `
                 -LastIoBytes $state.LastIoBytes -CurrentIoBytes 5000 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
             $state.StallSec | Should -Be 30
@@ -658,6 +846,7 @@ Describe 'Get-NextWatchdogState' {
             # out, so a single unreadable poll does not manufacture a false
             # delta against $null on the very next poll either.
             $state = Get-NextWatchdogState -IdleSec 0 -StallSec 10 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes 1000 -Active $true -CurrentBytes 1000 `
                 -LastIoBytes 5000 -CurrentIoBytes $null `
                 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
@@ -671,6 +860,7 @@ Describe 'Get-NextWatchdogState' {
 
         It 'unknown current or prior output bytes freeze the stall clock, while a known I/O delta still resets it' {
             $unknownCurrent = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes 1000 -Active $true -CurrentBytes $null `
                 -LastIoBytes 5000 -CurrentIoBytes 5000 `
                 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
@@ -680,6 +870,7 @@ Describe 'Get-NextWatchdogState' {
             $unknownCurrent.Verdict   | Should -Be 'continue'
 
             $unknownPrior = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes $null -Active $true -CurrentBytes 1000 `
                 -LastIoBytes 5000 -CurrentIoBytes 5000 `
                 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
@@ -689,6 +880,7 @@ Describe 'Get-NextWatchdogState' {
             $unknownPrior.Verdict   | Should -Be 'continue'
 
             $ioProgress = Get-NextWatchdogState -IdleSec 0 -StallSec 20 -SawActivity $true `
+                -ActiveSec 90 -ArmSec 90 `
                 -LastBytes 1000 -Active $true -CurrentBytes $null `
                 -LastIoBytes 5000 -CurrentIoBytes 5200 `
                 -PollSec 10 -DebounceSec 120 -StallLimitSec 30
@@ -999,13 +1191,21 @@ Describe 'Get-NextUploadTrackingState (CORRECTION 3 -- per-file stability clock 
 }
 
 Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth of the incremental-upload pass)' {
-    # Orchestration around the two pure functions above: enumerates OutputDir,
-    # updates $Tracking in place, and uploads whatever is now eligible. Every
-    # I/O boundary (Test-Path, Get-ChildItem, Test-FileUnlocked,
-    # Invoke-TopazIncrementalUpload, Write-TopazLog) is mocked; Test-TopazTempFile
-    # is left REAL since it is itself a pure, already-tested function -- using it
-    # for real here is simpler than mocking it and exercises the actual
-    # TempMarker wiring too.
+    # Orchestration around the two pure functions above: walks THIS POLL'S
+    # OutputDir snapshot, updates $Tracking in place, and uploads whatever is
+    # now eligible. Every I/O boundary (Test-FileUnlocked,
+    # Invoke-TopazIncrementalUpload, Write-TopazLog) is mocked;
+    # Test-TopazTempFile is left REAL since it is itself a pure, already-tested
+    # function -- using it for real here is simpler than mocking it and
+    # exercises the actual TempMarker wiring too.
+    #
+    # THE SNAPSHOT IS NOW AN ARGUMENT, NOT SOMETHING THIS PASS FETCHES. The
+    # monitoring loop enumerates OutputDir once per poll (Get-OutputFileSnapshot,
+    # its own Describe below) and threads the result into BOTH the progress
+    # signal and this pass, instead of each walking the multi-GB folder
+    # separately at two different instants. So these fixtures build a $files
+    # array directly and pass -Files, rather than mocking Get-ChildItem; the
+    # enumeration-failure case is `-Files $null`.
 
     BeforeAll {
         function Get-PollTestConfig {
@@ -1032,10 +1232,10 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
                 [Parameter(Mandatory)][string]$Name,
                 [Parameter(Mandatory)][int64]$Length,
                 # Fixed default (not Get-Date) so tests that do not care about
-                # write-time get an IDENTICAL value across repeated Get-ChildItem
-                # mock invocations -- a real Get-Date default would risk the
-                # clock ticking over a second mid-test and spuriously tripping
-                # FINDING 2's write-time-changed re-upload path.
+                # write-time get an IDENTICAL value across repeated polls -- a
+                # real Get-Date default would risk the clock ticking over a
+                # second mid-test and spuriously tripping FINDING 2's
+                # write-time-changed re-upload path.
                 [datetime]$LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
             )
             [pscustomobject]@{
@@ -1050,53 +1250,53 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
     BeforeEach {
         $script:Tracking = @{}
         Mock Write-TopazLog { }
-        Mock Test-Path { $true }
         Mock Invoke-TopazIncrementalUpload { $true }
     }
 
-    Context 'preconditions gate the whole pass before ANY filesystem call' {
-        It 'UploadWhenReady=$false -> returns immediately, never calls Get-ChildItem' {
-            Mock Get-ChildItem { throw 'must not be called when UploadWhenReady is $false' }
-            $cfg = Get-PollTestConfig -UploadWhenReady $false
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+    Context 'preconditions gate the whole pass before ANY per-file work' {
+        It 'UploadWhenReady=$false -> returns immediately, touching neither Tracking nor the files' {
+            $cfg   = Get-PollTestConfig -UploadWhenReady $false
+            $files = @((Get-FakeOutputFile -Name 'done.mov' -Length 1000))
+            Mock Test-FileUnlocked { throw 'must not be probed when UploadWhenReady is $false' }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
+            $script:Tracking.Count | Should -Be 0
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+        }
+
+        It 'UploadTarget empty -> returns immediately' {
+            $cfg   = Get-PollTestConfig -UploadTarget ''
+            $files = @((Get-FakeOutputFile -Name 'done.mov' -Length 1000))
+            Mock Test-FileUnlocked { throw 'must not be probed when UploadTarget is empty' }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
             $script:Tracking.Count | Should -Be 0
         }
 
-        It 'UploadTarget empty -> returns immediately, never calls Get-ChildItem' {
-            Mock Get-ChildItem { throw 'must not be called when UploadTarget is empty' }
-            $cfg = Get-PollTestConfig -UploadTarget ''
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
-        }
-
         It 'UploadTarget whitespace-only -> also treated as unset' {
-            Mock Get-ChildItem { throw 'must not be called when UploadTarget is whitespace' }
-            $cfg = Get-PollTestConfig -UploadTarget '   '
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
-        }
+            $cfg   = Get-PollTestConfig -UploadTarget '   '
+            $files = @((Get-FakeOutputFile -Name 'done.mov' -Length 1000))
+            Mock Test-FileUnlocked { throw 'must not be probed when UploadTarget is whitespace' }
 
-        It 'OutputDir missing (Test-Path $false) -> never calls Get-ChildItem' {
-            Mock Test-Path { $false }
-            Mock Get-ChildItem { throw 'must not be called when OutputDir does not exist' }
-            $cfg = Get-PollTestConfig
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
+            $script:Tracking.Count | Should -Be 0
         }
     }
 
     Context 'no files in OutputDir' {
         It 'completes without error, leaves Tracking empty, never uploads' {
-            # Plain '@()', not the leading-comma ', @()' idiom used elsewhere in this
-            # file for Get-TopazPids/Get-TopazWorkers: those need the comma because
-            # THEIR callers do not always re-wrap the result in @() themselves, so a
-            # bare empty array would collapse to $null crossing the return boundary.
-            # Invoke-TopazIncrementalUploadPoll ALWAYS re-wraps with
-            # '@(Get-ChildItem ...)', which already guarantees array-ness on its own --
-            # adding the comma here would instead double-wrap into a 1-element array
-            # containing an empty array, and foreach would iterate once over that
-            # inner empty array instead of zero times.
-            Mock Get-ChildItem { return @() }
+            # Plain '@()', not the leading-comma ', @()' idiom used elsewhere in
+            # this file for Get-TopazPids/Get-TopazWorkers/Get-OutputFileSnapshot:
+            # those need the comma because their RESULT crosses a return
+            # boundary that would otherwise collapse an empty array to $null.
+            # Here it is a plain local, assigned and passed by name, so no
+            # collapse is possible -- and adding the comma would instead
+            # double-wrap into a 1-element array containing an empty array, and
+            # the pass would iterate once over that inner empty array instead of
+            # zero times.
             $cfg = Get-PollTestConfig
 
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files @() } | Should -Not -Throw
             $script:Tracking.Count | Should -Be 0
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
         }
@@ -1104,20 +1304,20 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
 
     Context 'a single file across successive polls: first seen, then stable-but-short, then eligible and uploaded exactly once' {
         It 'uploads on poll 3 (2 full PollSec intervals of a stable size), never again after' {
-            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @((Get-FakeOutputFile -Name 'done.mov' -Length 1000))
             Mock Test-FileUnlocked { $true }
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'done.mov' -Length 1000)) }
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: first seen
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable, still short
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: 15s stable, still short
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> eligible, uploaded
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3: 30s stable -> eligible, uploaded
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: unchanged since upload -> blocks a repeat
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4: unchanged since upload -> blocks a repeat
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
             $script:Tracking['D:\Renders\done.mov'].UploadedSize | Should -Be 1000
@@ -1126,11 +1326,11 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
 
     Context 'a LOCKED file is never uploaded no matter how many stable-size polls pass' {
         It 'never calls Invoke-TopazIncrementalUpload while Test-FileUnlocked keeps returning $false' {
-            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @((Get-FakeOutputFile -Name 'writing.mov' -Length 5000))
             Mock Test-FileUnlocked { $false }
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'writing.mov' -Length 5000)) }
 
-            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files }
 
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
         }
@@ -1141,28 +1341,28 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
             Mock Test-FileUnlocked { $true }
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'growing.mov' -Length 1000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen at 1000
+            $files = @((Get-FakeOutputFile -Name 'growing.mov' -Length 1000))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: first seen at 1000
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'growing.mov' -Length 2000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: size changed -> clock resets
+            $files = @((Get-FakeOutputFile -Name 'growing.mov' -Length 2000))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: size changed -> clock resets
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: stable for 1 interval (15s)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3: stable for 1 interval (15s)
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: stable for 2 intervals (30s) -> eligible
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4: stable for 2 intervals (30s) -> eligible
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
         }
     }
 
     Context 'a Topaz temp/scratch file is tracked but never uploaded, however long its size holds' {
         It 'never calls Invoke-TopazIncrementalUpload for a name matching TempMarker' {
-            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30 -TempMarker '_temp'
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30 -TempMarker '_temp'
+            $files = @((Get-FakeOutputFile -Name 'scratch_temp.mov' -Length 1000))
             Mock Test-FileUnlocked { $true }
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'scratch_temp.mov' -Length 1000)) }
 
-            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+            1..5 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files }
 
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
         }
@@ -1170,20 +1370,20 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
 
     Context 'a FAILED incremental upload leaves the file unmarked so a later poll retries it -- NOT fatal, per Invoke-TopazIncrementalUpload''s own contract' {
         It 'UploadedSize stays $null after a failed attempt, and the next eligible poll retries the upload' {
-            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @((Get-FakeOutputFile -Name 'flaky.mov' -Length 1000))
             Mock Test-FileUnlocked { $true }
             Mock Invoke-TopazIncrementalUpload { $false }
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'flaky.mov' -Length 1000)) }
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable, not yet eligible
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: 15s stable, not yet eligible
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> eligible, attempted, fails
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3: 30s stable -> eligible, attempted, fails
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
             $script:Tracking['D:\Renders\flaky.mov'].UploadedSize | Should -Be $null
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: still eligible (unmarked) -> retried
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4: still eligible (unmarked) -> retried
             Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
         }
     }
@@ -1193,22 +1393,18 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
             Mock Test-FileUnlocked { $true }
 
-            Mock Get-ChildItem {
-                return @(
-                    (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),
-                    (Get-FakeOutputFile -Name 'still-growing.mov' -Length 500)
-                )
-            }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: both first-seen
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: both 15s stable
+            $files = @(
+                (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),
+                (Get-FakeOutputFile -Name 'still-growing.mov' -Length 500)
+            )
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: both first-seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: both 15s stable
 
-            Mock Get-ChildItem {
-                return @(
-                    (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),          # unchanged -> reaches 30s
-                    (Get-FakeOutputFile -Name 'still-growing.mov' -Length 900)    # changed -> resets
-                )
-            }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3
+            $files = @(
+                (Get-FakeOutputFile -Name 'ready.mov' -Length 1000),          # unchanged -> reaches 30s
+                (Get-FakeOutputFile -Name 'still-growing.mov' -Length 900)    # changed -> resets
+            )
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3
 
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Name -eq 'ready.mov' }
             $script:Tracking['D:\Renders\ready.mov'].UploadedSize         | Should -Be 1000
@@ -1218,23 +1414,51 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
 
     Context 'FINDING 2 (2026-07-28 adversarial review): a file unchanged since its successful upload is never re-uploaded, however many further polls see it' {
         It 'calls Invoke-TopazIncrementalUpload exactly once total, across an initial upload plus many identical subsequent polls' {
-            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @((Get-FakeOutputFile -Name 'stable.mov' -Length 1000))
             Mock Test-FileUnlocked { $true }
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'stable.mov' -Length 1000)) }
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> uploaded
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: 15s stable
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3: 30s stable -> uploaded
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
             # Many further polls, same size, same write-time (Get-FakeOutputFile's
             # fixed default) -- THIS is the "must NOT turn into re-uploading the
             # same bytes every poll" requirement the fix is explicitly scoped not
             # to break.
-            1..6 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking }
+            1..6 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files }
 
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
             $script:Tracking['D:\Renders\stable.mov'].UploadedSize | Should -Be 1000
+        }
+
+        It 'stops LOCK-PROBING a file once its uploaded identity matches, instead of re-opening a finished deliverable exclusively on every poll' {
+            # THE COST THIS AVOIDS. Test-FileUnlocked opens the file with
+            # FileShare.None; for a file whose tracked UploadedSize/
+            # UploadedWriteTimeUtc already match what is on disk,
+            # Resolve-IncrementalUploadEligibility returns $false at its
+            # identity gate WITHOUT ever consulting IsUnlocked, so that
+            # exclusive open was pure waste -- repeated for every finished file
+            # on every poll for the rest of a multi-hour queue. It is also the
+            # one operation in this pass that momentarily denies another
+            # process access to a finished deliverable.
+            $cfg   = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @((Get-FakeOutputFile -Name 'finished.mov' -Length 1000))
+            Mock Test-FileUnlocked { $true }
+
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3 -> uploaded
+            Should -Invoke Test-FileUnlocked -Times 3 -Exactly
+
+            # Three more polls, nothing changed: not one further probe.
+            1..3 | ForEach-Object { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files }
+            Should -Invoke Test-FileUnlocked -Times 3 -Exactly
+
+            # ...and the stability bookkeeping keeps advancing regardless, since
+            # it is computed from size alone and never reads IsUnlocked.
+            $script:Tracking['D:\Renders\finished.mov'].SecondsStable | Should -Be 75
         }
     }
 
@@ -1243,23 +1467,23 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
             Mock Test-FileUnlocked { $true }
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'resized.mov' -Length 1000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2 (15s)
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3 (30s) -> uploaded at 1000
+            $files = @((Get-FakeOutputFile -Name 'resized.mov' -Length 1000))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2 (15s)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3 (30s) -> uploaded at 1000
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
             $script:Tracking['D:\Renders\resized.mov'].UploadedSize | Should -Be 1000
 
             # Size now differs from what was uploaded -- must restabilize at the
             # NEW size before re-upload, exactly like a first-time upload would.
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'resized.mov' -Length 4000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: size changed -> clock resets
+            $files = @((Get-FakeOutputFile -Name 'resized.mov' -Length 4000))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4: size changed -> clock resets
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 5: 15s stable at 4000
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 5: 15s stable at 4000
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 6: 30s stable at 4000 -> eligible again
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 6: 30s stable at 4000 -> eligible again
             Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 4000 }
 
@@ -1279,10 +1503,10 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             $t0 = [datetime]'2026-07-28T10:00:00Z'
             $t1 = [datetime]'2026-07-28T11:30:00Z'
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t0)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2 (15s)
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3 (30s) -> uploaded at (1000, t0)
+            $files = @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t0))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2 (15s)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3 (30s) -> uploaded at (1000, t0)
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
             # Same size, but a NEW write-time. SizeLastSeen/SecondsStable were
@@ -1290,8 +1514,8 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             # (per Get-NextUploadTrackingState's own contract) the identity
             # mismatch alone is enough to re-open eligibility on this very poll
             # -- no extra stabilization pass required.
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t1)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4
+            $files = @((Get-FakeOutputFile -Name 'overwritten.mov' -Length 1000 -LastWriteTimeUtc $t1))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4
 
             Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
             $script:Tracking['D:\Renders\overwritten.mov'].UploadedWriteTimeUtc | Should -Be $t1
@@ -1315,10 +1539,10 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             # on Resolve-IncrementalUploadEligibility: a partial CAN still be
             # uploaded and verified in the first instance. That is NOT what
             # this test is pinning; what it pins is what happens next.
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 900)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 1: first seen
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 2: 15s stable
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 3: 30s stable -> "finished", uploaded
+            $files = @((Get-FakeOutputFile -Name 'export.mov' -Length 900))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 1: first seen
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 2: 15s stable
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 3: 30s stable -> "finished", uploaded
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 900 }
             $script:Tracking['D:\Renders\export.mov'].UploadedSize | Should -Be 900
 
@@ -1327,24 +1551,24 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
             # Resolve-IncrementalUploadEligibility's own comment) -- the file
             # starts growing again. It must NOT be re-uploaded while still
             # moving, exactly like any other in-progress render.
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 1500)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 4: size changed -> clock resets
+            $files = @((Get-FakeOutputFile -Name 'export.mov' -Length 1500))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 4: size changed -> clock resets
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 2200)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 5: still growing -> clock resets again
+            $files = @((Get-FakeOutputFile -Name 'export.mov' -Length 2200))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 5: still growing -> clock resets again
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
             # PHASE 3: the resumed export finishes for real, at its correct,
             # complete size.
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'export.mov' -Length 3000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 6: size changed again -> clock resets
+            $files = @((Get-FakeOutputFile -Name 'export.mov' -Length 3000))
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 6: size changed again -> clock resets
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 7: 15s stable at 3000
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 7: 15s stable at 3000
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly
 
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking   # poll 8: 30s stable at 3000 -> eligible again (differs from the uploaded 900)
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files   # poll 8: 30s stable at 3000 -> eligible again (differs from the uploaded 900)
             Should -Invoke Invoke-TopazIncrementalUpload -Times 2 -Exactly
             Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Length -eq 3000 }
 
@@ -1361,22 +1585,21 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
     }
 
     Context 'pruning: a file no longer present in OutputDir is dropped from Tracking' {
-        It 'removes the tracking entry once Get-ChildItem stops returning it' {
+        It 'removes the tracking entry once the snapshot stops containing it' {
             $cfg = Get-PollTestConfig
             Mock Test-FileUnlocked { $true }
 
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'gone-soon.mov' -Length 1000)) }
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking `
+                -Files @((Get-FakeOutputFile -Name 'gone-soon.mov' -Length 1000))
             $script:Tracking.ContainsKey('D:\Renders\gone-soon.mov') | Should -Be $true
 
-            Mock Get-ChildItem { return @() }   # see the 'no files in OutputDir' Context above for why NOT ', @()' here
-            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking
+            Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files @()
             $script:Tracking.ContainsKey('D:\Renders\gone-soon.mov') | Should -Be $false
         }
     }
 
-    Context 'a failure anywhere in the pass is caught, logged as a WARN, and never thrown into the caller -- the single most safety-critical loop in the project' {
-        It 'preserves existing Tracking and makes no upload call when strict enumeration fails, rather than pruning from a partial listing' {
+    Context 'a failure is contained PER FILE, logged as a WARN, and never thrown into the caller -- the single most safety-critical loop in the project' {
+        It 'preserves existing Tracking and makes no upload call when the snapshot itself failed (-Files $null), rather than pruning from a listing it never got' {
             $cfg = Get-PollTestConfig
             $key = 'D:\Renders\already-uploaded.mov'
             $script:Tracking[$key] = @{
@@ -1385,33 +1608,121 @@ Describe 'Invoke-TopazIncrementalUploadPoll (CORRECTION 3 -- one poll''s worth o
                 UploadedSize         = [int64]1000
                 UploadedWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
             }
-            Mock Get-TopazOutputFiles { throw 'simulated access failure' }
 
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $null } | Should -Not -Throw
 
-            $script:Tracking.ContainsKey($key) | Should -Be $true
+            $script:Tracking.ContainsKey($key)  | Should -Be $true
             $script:Tracking[$key].UploadedSize | Should -Be 1000
             Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
         }
 
-        It 'does not throw and logs a WARN when Get-ChildItem itself fails unexpectedly' {
-            $cfg = Get-PollTestConfig
-            Mock Get-ChildItem { throw 'simulated filesystem failure' }
+        It 'does not throw when Test-FileUnlocked itself throws for a tracked file, and says which file it skipped' {
+            $cfg   = Get-PollTestConfig
+            $files = @((Get-FakeOutputFile -Name 'weird.mov' -Length 1000))
+            Mock Test-FileUnlocked { throw 'simulated lock-check failure' }
 
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
+            Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'SKIPPING' -and $Message -match 'weird\.mov'
+            }
+        }
+
+        It 'keeps processing the files AFTER a failing one -- a persistent per-file fault must not disable incremental upload for the rest of the queue' {
+            # THE REGRESSION THIS GUARDS AGAINST, and the reason the single
+            # try/catch that used to wrap the whole foreach was not enough. With
+            # pass-level containment, one throw abandoned every file ORDERED
+            # AFTER it; enumeration order is stable, so a PERSISTENT per-file
+            # fault (a path that does not sit under OutputDir, tripping
+            # Invoke-TopazIncrementalUpload's relative-path arithmetic) silently
+            # disabled incremental upload for those files on EVERY poll for the
+            # life of the process -- with one WARN line per poll to show for it.
+            # The previous version of this test used a SINGLE file, so it
+            # asserted non-throwing while masking the abort entirely.
+            $cfg = Get-PollTestConfig -PollSec 15 -UploadStableSec 30
+            $files = @(
+                (Get-FakeOutputFile -Name 'a.mov'   -Length 1000),
+                (Get-FakeOutputFile -Name 'bad.mov' -Length 2000),
+                (Get-FakeOutputFile -Name 'c.mov'   -Length 3000)
+            )
+            Mock Test-FileUnlocked {
+                if ($Path -eq 'D:\Renders\bad.mov') { throw 'simulated persistent per-file failure' }
+                return $true
+            }
+
+            # bad.mov was already tracked from earlier polls -- size-stable well
+            # past the threshold, so it WOULD be uploaded this poll if its lock
+            # probe did not blow up. Its entry is what proves the $seenKeys
+            # marking still happens outside the per-file try: a file that is
+            # plainly still in OutputDir must not be pruned just because its own
+            # check failed, or its stability clock would reset on every
+            # recurrence and it could never accumulate its way to eligible.
+            # (UploadedSize stays $null here on purpose: a non-null one matching
+            # the file on disk would short-circuit at the identity gate and skip
+            # the lock probe altogether -- see the lock-probe Context above.)
+            $script:Tracking['D:\Renders\bad.mov'] = @{
+                SizeLastSeen         = [int64]2000
+                SecondsStable        = 30
+                UploadedSize         = $null
+                UploadedWriteTimeUtc = $null
+            }
+
+            # Three polls: enough for the two healthy files to cross
+            # UploadStableSec and actually be uploaded.
+            1..3 | ForEach-Object {
+                { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
+            }
+
+            # THE FILE ORDERED AFTER THE FAILING ONE IS THE POINT: it must be
+            # tracked, stability-clocked, and ultimately uploaded, not silently
+            # invisible for the life of the process.
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Name -eq 'c.mov' }
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 1 -Exactly -ParameterFilter { $File.Name -eq 'a.mov' }
+            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly -ParameterFilter { $File.Name -eq 'bad.mov' }
+
+            $script:Tracking['D:\Renders\a.mov'].UploadedSize | Should -Be 1000
+            $script:Tracking['D:\Renders\c.mov'].UploadedSize | Should -Be 3000
+
+            # Not pruned, and not disturbed: the tracking write for a file lives
+            # INSIDE the per-file try, so a skipped file keeps exactly the
+            # bookkeeping it already had rather than being silently rewound.
+            $script:Tracking.ContainsKey('D:\Renders\bad.mov')   | Should -Be $true
+            $script:Tracking['D:\Renders\bad.mov'].SizeLastSeen  | Should -Be 2000
+            $script:Tracking['D:\Renders\bad.mov'].SecondsStable | Should -Be 30
+
+            # ...and every poll says so, once per poll, naming the file.
+            Should -Invoke Write-TopazLog -Times 3 -Exactly -ParameterFilter {
+                $Level -eq 'WARN' -and $Message -match 'SKIPPING' -and $Message -match 'bad\.mov'
+            }
+
+            # The pass as a whole never reports itself as failed -- that WARN is
+            # reserved for a failure OUTSIDE the per-file containment.
+            Should -Invoke Write-TopazLog -Times 0 -Exactly -ParameterFilter {
+                $Message -match 'Incremental upload pass FAILED'
+            }
+        }
+
+        It 'still falls back to the pass-level WARN for a failure OUTSIDE the per-file try, so the outer backstop is not dead code' {
+            # The outer try/catch did not become redundant when the per-file one
+            # was added: it still covers iterating the supplied snapshot,
+            # computing each tracking key, and the prune. A snapshot entry with
+            # no FullName trips the key computation, which sits outside the
+            # per-file try deliberately (see the $seenKeys comment in
+            # Watchdog.ps1) -- and the pass must still return quietly.
+            $cfg   = Get-PollTestConfig
+            $files = @([pscustomobject]@{
+                FullName         = $null
+                Name             = 'nameless.mov'
+                Length           = [int64]1000
+                LastWriteTimeUtc = [datetime]'2026-07-28T10:00:00Z'
+            })
+            Mock Test-FileUnlocked { $true }
+
+            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking -Files $files } | Should -Not -Throw
 
             Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
                 $Level -eq 'WARN' -and $Message -match 'Incremental upload pass FAILED'
             }
-        }
-
-        It 'does not throw when Test-FileUnlocked itself throws for a tracked file' {
-            $cfg = Get-PollTestConfig
-            Mock Get-ChildItem { return @((Get-FakeOutputFile -Name 'weird.mov' -Length 1000)) }
-            Mock Test-FileUnlocked { throw 'simulated lock-check failure' }
-
-            { Invoke-TopazIncrementalUploadPoll -Config $cfg -Tracking $script:Tracking } | Should -Not -Throw
-            Should -Invoke Invoke-TopazIncrementalUpload -Times 0 -Exactly
         }
     }
 }
@@ -1440,6 +1751,64 @@ Describe 'Resolve-StopDecision' {
     }
 }
 
+Describe 'Get-OutputFileSnapshot (the ONE OutputDir walk per poll)' {
+
+    # WHAT THIS REPLACED. An active poll used to enumerate OutputDir twice --
+    # once for the progress/stall signal and once inside the incremental-upload
+    # pass -- on a multi-GB folder, every PollSec, from two different instants.
+    # The loop now takes this snapshot once and threads it into both, so this
+    # function owns the null-vs-empty distinction BOTH of them depend on:
+    # $null means "could not be read" (freeze the stall clock, skip the upload
+    # pass), an empty array means "read fine, nothing there" (byte total 0,
+    # prune every tracked file).
+
+    It 'returns an EMPTY ARRAY, not $null, for a readable but empty directory' {
+        $dir = Join-Path $TestDrive 'snapshot-empty'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+        $result = Get-OutputFileSnapshot -Path $dir
+
+        # ($null -eq $result) rather than a pipe into Should -- piping a
+        # 0-element array delivers ZERO items and Should then compares its own
+        # unset default against $null and wrongly reports a match. See the same
+        # note in the Get-TopazWorkers Describe above.
+        ($null -eq $result) | Should -Be $false
+        @($result).Count    | Should -Be 0
+    }
+
+    It 'returns every file under the path' {
+        $dir = Join-Path $TestDrive 'snapshot-files'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $dir 'a.bin'), (New-Object byte[] 100))
+        [System.IO.File]::WriteAllBytes((Join-Path $dir 'b.bin'), (New-Object byte[] 250))
+
+        $result = Get-OutputFileSnapshot -Path $dir
+
+        @($result).Count | Should -Be 2
+        (@($result | ForEach-Object { $_.Name }) | Sort-Object) | Should -Be @('a.bin', 'b.bin')
+    }
+
+    It 'returns $null and logs a WARN when strict enumeration fails, never a partial listing' {
+        # Get-TopazOutputFiles throws rather than returning a partial list (its
+        # own comment in Config.ps1); this is where that throw becomes the
+        # "unknown" both consumers must not confuse with "empty".
+        Mock Write-TopazLog { }
+        Mock Get-TopazOutputFiles { throw 'simulated access failure' }
+
+        $result = Get-OutputFileSnapshot -Path 'D:\Renders'
+
+        ($null -eq $result) | Should -Be $true
+        Should -Invoke Write-TopazLog -Times 1 -Exactly -ParameterFilter {
+            $Level -eq 'WARN' -and $Message -match 'Could not enumerate OutputDir'
+        }
+    }
+
+    It 'returns $null for a nonexistent path' {
+        Mock Write-TopazLog { }
+        ($null -eq (Get-OutputFileSnapshot -Path (Join-Path $TestDrive 'no-such-dir'))) | Should -Be $true
+    }
+}
+
 Describe 'Get-OutputBytes' {
 
     It 'returns $null for a nonexistent path' {
@@ -1465,6 +1834,37 @@ Describe 'Get-OutputBytes' {
     It 'returns $null when strict enumeration fails, never a partial byte total' {
         Mock Get-TopazOutputFiles { throw 'simulated access failure' }
         Get-OutputBytes -Path 'D:\Renders' | Should -Be $null
+    }
+
+    Context '-Files: summing a snapshot the caller already took' {
+        # The monitoring loop enumerates once per poll and hands the result to
+        # BOTH consumers. The null-vs-zero mapping stays here, in one place and
+        # one Describe: collapsing "enumeration failed" ($null) into "empty
+        # folder" (0) at a call site would let a failed read reset the stall
+        # baseline, which Get-NextWatchdogState's unknown-bytes guard exists to
+        # prevent.
+
+        It 'maps a $null snapshot (enumeration failed) straight through to $null, never to 0' {
+            Get-OutputBytes -Files $null | Should -Be $null
+        }
+
+        It 'maps an EMPTY snapshot (folder read fine, nothing in it) to 0, not $null' {
+            $result = Get-OutputBytes -Files @()
+
+            ($null -eq $result) | Should -Be $false
+            $result | Should -Be 0
+        }
+
+        It 'sums the supplied snapshot and never touches the filesystem -- -Path is not consulted at all' {
+            Mock Get-TopazOutputFiles { throw 'must not enumerate when -Files was supplied' }
+
+            $files = @(
+                [pscustomobject]@{ Length = [int64]100 },
+                [pscustomobject]@{ Length = [int64]250 }
+            )
+
+            Get-OutputBytes -Path 'D:\Renders' -Files $files | Should -Be 350
+        }
     }
 }
 
@@ -1549,9 +1949,101 @@ Describe 'Resolve-RefusalStallSec (retry cadence after a refused stop)' {
             Should -Be 0
     }
 
-    It 'treats maxlifetime like completed (its worker state is not a stall)' {
-        Resolve-RefusalStallSec -Reason 'maxlifetime' -StallLimitSec 1800 -DebounceSec 300 |
-            Should -Be 0
+    It 'REJECTS a reason outside its domain rather than silently returning 0' {
+        # This replaces a test that pinned 'maxlifetime' behaviour. That value
+        # was documented on the parameter but was never reachable: it is a
+        # Stop-Sequence.ps1 / Register-TimedStop.ps1 concept invoked directly by
+        # the timed-stop task, while this function is called from exactly three
+        # places in the watchdog, all passing a $reason that can only ever be
+        # 'completed' or 'stalled'. Meanwhile Resolve-StopDecision, 150 lines
+        # further down the same file, already constrained itself with
+        # ValidateSet('completed','stalled') -- two adjacent functions
+        # disagreeing about one domain.
+        #
+        # What the ValidateSet actually buys: every unrecognised value takes the
+        # `-ne 'stalled'` branch and returns 0, so a future typo like 'stall'
+        # would silently cost a full StallSec (1800s) before the next retry --
+        # exactly the regression this function was written to prevent, arriving
+        # without a sound. Failing at parameter binding is loud instead.
+        { Resolve-RefusalStallSec -Reason 'maxlifetime' -StallLimitSec 1800 -DebounceSec 300 } |
+            Should -Throw
+        { Resolve-RefusalStallSec -Reason 'stall' -StallLimitSec 1800 -DebounceSec 300 } |
+            Should -Throw
+    }
+}
+
+Describe 'Resolve-StopSequenceResult (never let a multi-object return swallow a refusal)' {
+
+    # WHAT THIS GUARDS. The watchdog used to test Stop-Sequence.ps1's return
+    # value with `if ($stopResult -eq $false)`. Against a COLLECTION, -eq is a
+    # filter rather than a comparison: @($true, $false) -eq $false yields the
+    # one-element array @($false), which `if` unrolls to $false -- so the
+    # refusal branch is skipped, Resolve-StopDecision returns 'stop', and the
+    # watchdog breaks out of its outer loop for good with the render still
+    # un-uploaded on the ephemeral scratch volume.
+    #
+    # This is not a hypothetical class of bug in THIS codebase: Config.ps1's own
+    # comment on Write-TopazLog records that log lines contaminating a return
+    # value once already turned `if ($ok -eq $false)` falsy and "defeated the
+    # ephemeral-upload interlock in Stop-Sequence.ps1: a failed upload would
+    # have been read as success and the instance stopped, erasing the render it
+    # had failed to save".
+
+    It "trusts a clean single `$true as 'stopped'" {
+        Resolve-StopSequenceResult -RawResult $true | Should -Be 'stopped'
+    }
+
+    It "reads a clean single `$false as 'refused'" {
+        Resolve-StopSequenceResult -RawResult $false | Should -Be 'refused'
+    }
+
+    It "treats `$null (e.g. Stop-Sequence.ps1 threw before returning) as 'untrustworthy'" {
+        Resolve-StopSequenceResult -RawResult $null | Should -Be 'untrustworthy'
+    }
+
+    It "treats an EMPTY return as 'untrustworthy'" {
+        Resolve-StopSequenceResult -RawResult @() | Should -Be 'untrustworthy'
+    }
+
+    It "treats @(`$true, `$false) -- THE array-filter case -- as 'untrustworthy', not as a stop" {
+        # The exact shape that made `-eq $false` skip the refusal branch.
+        Resolve-StopSequenceResult -RawResult @($true, $false) | Should -Be 'untrustworthy'
+    }
+
+    It "treats a non-boolean return as 'untrustworthy'" {
+        Resolve-StopSequenceResult -RawResult 'yes' | Should -Be 'untrustworthy'
+        Resolve-StopSequenceResult -RawResult 0     | Should -Be 'untrustworthy'
+    }
+
+    It "treats a boolean CONTAMINATED by stray output as 'untrustworthy' in BOTH directions" {
+        # Stricter than "find the one boolean in there somewhere", deliberately.
+        # A stray line alongside $false is the historical incident shape, and a
+        # stray line alongside $true is the one that would cost the render -- so
+        # neither is trusted. The safety bias is unambiguous: a wrongly-refused
+        # stop costs money, a wrongly-trusted stop costs hours of paid render.
+        Resolve-StopSequenceResult -RawResult @('a log line', $false) | Should -Be 'untrustworthy'
+        Resolve-StopSequenceResult -RawResult @('a log line', $true)  | Should -Be 'untrustworthy'
+    }
+
+    It 'only ever returns one of the three documented outcomes' {
+        $seen = @(
+            (Resolve-StopSequenceResult -RawResult $true),
+            (Resolve-StopSequenceResult -RawResult $false),
+            (Resolve-StopSequenceResult -RawResult $null),
+            (Resolve-StopSequenceResult -RawResult @()),
+            (Resolve-StopSequenceResult -RawResult @($true, $true)),
+            (Resolve-StopSequenceResult -RawResult ([pscustomobject]@{ Ok = $true }))
+        )
+
+        foreach ($outcome in $seen) {
+            $outcome | Should -BeIn @('stopped', 'refused', 'untrustworthy')
+        }
+    }
+
+    It 'is pure: repeated calls with the same input return the same outcome' {
+        1..5 | ForEach-Object {
+            Resolve-StopSequenceResult -RawResult @($true, $false) | Should -Be 'untrustworthy'
+        }
     }
 }
 
@@ -1689,11 +2181,22 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
     # real multi-item scenario walks through poll-by-poll, not just its
     # individual branches in isolation.
     #
-    # PollSec=15 / DebounceSec=300 / StallSec=1800 / GpuBusyPercent=15 below
-    # are the REAL values shipped in Config.ps1's Get-TopazAutoStopConfig
-    # (not small made-up numbers like the Describes above use), so a change
-    # to those shipped defaults that weakens the safety margin shows up here
-    # directly.
+    # PollSec=15 / DebounceSec=300 / StallSec=1800 / ArmSec=90 /
+    # GpuBusyPercent=15 below are the REAL values shipped in Config.ps1's
+    # Get-TopazAutoStopConfig (not small made-up numbers like the Describes
+    # above use), so a change to those shipped defaults that weakens the
+    # safety margin shows up here directly.
+    #
+    # ArmSec WAS MISSING FROM THAT LIST, AND FROM EVERY CALL, until it was
+    # threaded through here: it defaulted to 0, so this entire Describe -- the
+    # flagship multi-item scenario -- ran with the arm debounce switched OFF,
+    # and "Item 1 rendering: 5 polls" (75s) only satisfied
+    # `SawActivity | Should -Be $true` because of that. The two guards that
+    # together decide whether a queue may EVER be declared complete are the
+    # near-side ArmSec and the far-side DebounceSec, and they were never
+    # exercised together anywhere in the suite: the Arm debounce Describe above
+    # tests ArmSec with no multi-item structure, and this one tested multi-item
+    # structure with ArmSec disabled.
 
     Context 'item gap shorter than DebounceSec never completes' {
         It 'stays "continue" through a full item, a sub-debounce gap, and the next item starting -- and IdleSec resets to 0 the instant the worker reappears' {
@@ -1702,18 +2205,25 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             # read as "completed" before DebounceSec has actually elapsed,
             # the watchdog would power the box off between queue item 1 and
             # item 2 -- destroying every unrendered item after the first.
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; LastBytes = [int64]1000; LastIoBytes = $null }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]1000; LastIoBytes = $null }
             $bytes = 1000
 
-            # --- Item 1 rendering: 5 polls with the worker present. ---
-            1..5 | ForEach-Object {
+            # --- Item 1 rendering: 6 polls with the worker present. SIX, not
+            #     five: 6 * 15s = 90s is the shipped ArmSec exactly, so item 1
+            #     genuinely EARNS the arm here instead of being handed it by a
+            #     disabled debounce. A real queue item runs for minutes to
+            #     hours, so lengthening this makes the scenario more faithful,
+            #     not less. ---
+            1..6 | ForEach-Object {
                 $bytes += 500
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $true -CurrentBytes $bytes `
                     -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                     -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
                 $state.Verdict | Should -Be 'continue'
             }
+            $state.ActiveSec   | Should -Be 90
             $state.SawActivity | Should -Be $true
             $state.IdleSec     | Should -Be 0
 
@@ -1723,16 +2233,23 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             #     "completed", at any single poll along the way.
             1..10 | ForEach-Object {
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
                     -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                     -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
                 $state.Verdict | Should -Be 'continue'
             }
             $state.IdleSec | Should -Be 150
+            # The gap discarded item 1's arm PROGRESS but not the arm itself:
+            # ActiveSec is back to 0 while SawActivity stays sticky, which is
+            # what lets the queue still complete after the LAST item.
+            $state.ActiveSec   | Should -Be 0
+            $state.SawActivity | Should -Be $true
 
             # --- Item 2 starts: the worker reappears. ---
             $bytes += 500
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $true -CurrentBytes $bytes `
                 -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                 -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1747,6 +2264,45 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
         }
     }
 
+    Context 'the near-side (ArmSec) and far-side (DebounceSec) guards, exercised TOGETHER' {
+        It 'a queue that never properly started can never complete, however long the following idle gap runs' {
+            # THE COMBINED INVARIANT, which nothing pinned while -ArmSec
+            # defaulted to 0. A 75s burst is a transient preview/thumbnail
+            # helper, not a render: it is one poll SHORT of the 90s arm. The
+            # 375s of idle that follows is comfortably PAST the 300s debounce,
+            # so the far-side guard alone would say "completed" -- and under
+            # the old default this exact shape DID arm on the first poll. Only
+            # the near-side guard stops the box being powered off on a session
+            # where no render ever ran.
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]1000; LastIoBytes = $null }
+
+            # 5 polls x 15s = 75s of "activity" -- one poll short of ArmSec.
+            foreach ($i in 1..5) {
+                $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
+                    -LastBytes $state.LastBytes -Active $true -CurrentBytes ([int64](1000 + 500 * $i)) `
+                    -LastIoBytes $state.LastIoBytes -CurrentIoBytes ([int64](100 * $i)) `
+                    -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
+                $state.Verdict | Should -Be 'continue'
+            }
+            $state.ActiveSec   | Should -Be 75
+            $state.SawActivity | Should -Be $false
+
+            # 25 idle polls x 15s = 375s, well past the 300s debounce.
+            foreach ($i in 1..25) {
+                $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
+                    -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
+                    -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
+                    -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
+                $state.Verdict     | Should -Be 'continue'
+                $state.SawActivity | Should -Be $false
+            }
+
+            $state.IdleSec | Should -Be 375
+        }
+    }
+
     Context 'gap exactly at the DebounceSec boundary' {
         It 'is "continue" one poll before DebounceSec, and "completed" on the poll that reaches it (pins the boundary so nobody weakens it accidentally)' {
             # 300s DebounceSec / 15s PollSec = exactly 20 polls. Poll 19 sits
@@ -1754,11 +2310,15 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             # BOTH sides of this boundary means nobody can quietly loosen the
             # debounce (e.g. by switching -ge to -gt in Get-NextWatchdogState,
             # or off-by-one-ing the increment) without a test failing.
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; LastBytes = [int64]5000; LastIoBytes = $null }
+            # SawActivity=$true / ActiveSec=0 is exactly the state the real
+            # loop carries into an inter-item gap: the item that armed the
+            # watchdog has finished and its worker is gone.
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; ActiveSec = 0; LastBytes = [int64]5000; LastIoBytes = $null }
 
             # Poll 1..19: 19 * 15s = 285s, one poll short of the 300s debounce.
             1..19 | ForEach-Object {
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
                     -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                     -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1768,6 +2328,7 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
 
             # Poll 20: 285s + 15s = exactly 300s -- the boundary itself.
             $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                -ActiveSec $state.ActiveSec -ArmSec 90 `
                 -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
                 -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                 -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1788,13 +2349,14 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             # taken right before the stop, and Resolve-StopDecision must turn
             # a confirmed-active re-verify back into "resume" rather than
             # stopping the box out from under a running item.
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; LastBytes = [int64]5000; LastIoBytes = $null }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $true; ActiveSec = 0; LastBytes = [int64]5000; LastIoBytes = $null }
 
             # 25 polls * 15s = 375s, comfortably past the 300s debounce --
             # deliberately longer than the boundary test above so this test
             # is unambiguous about being past it, not sitting on the edge.
             1..25 | ForEach-Object {
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
                     -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                     -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1836,16 +2398,21 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
 
     Context 'GPU corroboration (WorkerOrGpu vs WorkerOnly) during the inter-item gap' {
         It 'WorkerOrGpu reports ACTIVE (the debounce never begins) while the GPU is still busy and the worker process is gone; WorkerOnly reports inactive in the exact same situation' {
-            # THIS IS WHY THE SHIPPED DEFAULT (CompletionSignal='WorkerOrGpu')
-            # EXISTS -- see Config.ps1's own comment on CompletionSignal.
-            # Between two queue items the OLD neuroserver.exe has already
-            # exited and the NEW one has not been spawned yet, so
-            # WorkerActive briefly reads $false even on a perfectly healthy
-            # queue -- but if the GPU is still busy (e.g. Topaz is still
-            # flushing/finalizing the previous item), the GPU signal
-            # corroborates that the box is not really idle. GpuBusyPercent=15
-            # and GpuUtil=50 below are both realistic (real renders peg the
-            # GPU well above this threshold per Config.ps1's own comment).
+            # WHAT THE TWO SIGNALS BUY, AND WHY THIS BOX SHIPS THE STRICTER
+            # ONE. Config.ps1 ships CompletionSignal = 'WorkerOnly' -- NOT
+            # WorkerOrGpu, whatever this comment used to claim -- because DCV
+            # encodes the remote display on the same GPU at 14-49%, so the GPU
+            # signal produced "Render active (worker=False gpu=21%)" on an idle
+            # box and would have kept it up forever. This test pins what that
+            # measured decision COSTS: between two queue items the OLD
+            # neuroserver.exe has already exited and the NEW one has not been
+            # spawned yet, so WorkerActive briefly reads $false even on a
+            # perfectly healthy queue, and under WorkerOnly the debounce starts
+            # accruing during that gap where WorkerOrGpu's GPU corroboration
+            # would have suppressed it. DebounceSec is what covers that gap
+            # instead. GpuBusyPercent=15 and GpuUtil=50 below are both
+            # realistic (real renders peg the GPU well above this threshold per
+            # Config.ps1's own comment).
             $gpuBusyPercent = 15
             $gpuDuringGap   = 50
 
@@ -1864,6 +2431,7 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             # IdleSec toward the 300s debounce despite the render genuinely
             # still being alive.
             $afterWorkerOrGpu = Get-NextWatchdogState -IdleSec 0 -StallSec 0 -SawActivity $true `
+                -ActiveSec 0 -ArmSec 90 `
                 -LastBytes 1000 -Active $activeWorkerOrGpu -CurrentBytes 1000 `
                 -LastIoBytes $null -CurrentIoBytes $null `
                 -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1871,6 +2439,7 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             $afterWorkerOrGpu.Verdict | Should -Be 'continue'
 
             $afterWorkerOnly = Get-NextWatchdogState -IdleSec 0 -StallSec 0 -SawActivity $true `
+                -ActiveSec 0 -ArmSec 90 `
                 -LastBytes 1000 -Active $activeWorkerOnly -CurrentBytes $null `
                 -LastIoBytes $null -CurrentIoBytes $null `
                 -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1888,11 +2457,12 @@ Describe 'Multi-item render queue (inter-item worker gap)' {
             # period for a completed queue; SawActivity is the guard, exactly
             # as an inter-item gap is guarded by DebounceSec once a render
             # has actually started at least once.
-            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; LastBytes = [int64]0; LastIoBytes = $null }
+            $state = [pscustomobject]@{ IdleSec = 0; StallSec = 0; SawActivity = $false; ActiveSec = 0; LastBytes = [int64]0; LastIoBytes = $null }
 
             # 30 polls * 15s = 450s -- well past the 300s debounce.
             1..30 | ForEach-Object {
                 $state = Get-NextWatchdogState -IdleSec $state.IdleSec -StallSec $state.StallSec -SawActivity $state.SawActivity `
+                    -ActiveSec $state.ActiveSec -ArmSec 90 `
                     -LastBytes $state.LastBytes -Active $false -CurrentBytes $null `
                     -LastIoBytes $state.LastIoBytes -CurrentIoBytes $null `
                     -PollSec 15 -DebounceSec 300 -StallLimitSec 1800
@@ -1983,13 +2553,13 @@ Describe 'Get-NextHeartbeatState (bounding silence during a healthy render)' {
     }
 
     It 'is a pure function of (SilentSec, PollSec, HeartbeatSec) alone -- the property the docs/15 fix actually relies on' {
-        # Watchdog.ps1 now calls this from TWO blocking loops (the pre-GUI
-        # wait loop and the main monitoring loop, see its own SCOPE section).
-        # That is only safe because the function has no hidden coupling to
-        # which loop is calling it -- no $script:-scoped clock of its own, no
-        # memory of a previous call. Two independent calls with identical
-        # arguments, as if interleaved between the two different loops, must
-        # return identical results every time.
+        # Watchdog.ps1 now calls this from THREE blocking loops (the pre-GUI
+        # wait loop, the main monitoring loop, and the unlock gate -- see its
+        # own SCOPE section). That is only safe because the function has no
+        # hidden coupling to which loop is calling it -- no $script:-scoped
+        # clock of its own, no memory of a previous call. Two independent calls
+        # with identical arguments, as if interleaved between two different
+        # loops, must return identical results every time.
         $fromWaitLoop       = Get-NextHeartbeatState -SilentSec 285 -PollSec 15 -HeartbeatSec 300
         $fromMonitoringLoop = Get-NextHeartbeatState -SilentSec 285 -PollSec 15 -HeartbeatSec 300
 
@@ -2001,6 +2571,38 @@ Describe 'Get-NextHeartbeatState (bounding silence during a healthy render)' {
             $s.Due       | Should -BeFalse
             $s.SilentSec | Should -Be 115
         }
+    }
+
+    It 'bounds the UNLOCK GATE''s silence too, on that loop''s own UnlockPollSec cadence rather than PollSec' {
+        # THE THIRD BLOCKING LOOP. This function's SCOPE section states the
+        # invariant literally -- "Any future blocking loop added to this script
+        # needs a call here too, or it reintroduces exactly that hole" -- and
+        # the unlock gate was that future loop: between "Waiting up to N min for
+        # output files to unlock" and either "All output files are unlocked" or
+        # the timeout WARN it logged nothing at all, during the phase where the
+        # box is about to power off and erase the scratch volume.
+        #
+        # The tick is UnlockPollSec (shipped 10s), NOT PollSec (15s). At the
+        # shipped UnlockTimeoutMin=5 the gate can only run ~30 ticks, so the
+        # heartbeat lands right at the deadline and this is mostly
+        # future-proofing -- but UnlockTimeoutMin is an operator knob, and
+        # raising it is exactly what would otherwise open a 30-minute void.
+        $unlockPollSec = 10
+        $silent = 0
+        $fired  = @()
+
+        # 90 ticks x 10s = 900s, i.e. what a raised UnlockTimeoutMin of 15 min
+        # would actually walk through.
+        foreach ($tick in 1..90) {
+            $s = Get-NextHeartbeatState -SilentSec $silent -PollSec $unlockPollSec -HeartbeatSec 300
+            $silent = $s.SilentSec
+            if ($s.Due) { $fired += $tick }
+        }
+
+        # 300 / 10 = every 30th tick, three times over 900s -- and NOT every
+        # 20th, which is what feeding it the monitoring loop's PollSec would
+        # have produced.
+        $fired | Should -Be @(30, 60, 90)
     }
 
     It 'HeartbeatSec<=0 pins SilentSec at 0 no matter which loop-shaped PollSec feeds it, so a disabled heartbeat cannot silently accumulate' {

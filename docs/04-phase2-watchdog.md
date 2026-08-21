@@ -153,21 +153,36 @@ behaviour. See [Testing & CI](10-testing-and-ci.md).
 
 ### The state machine
 
-The main loop polls every `PollSec` (default **15 s**) and tracks five things:
+The main loop polls every `PollSec` (default **15 s**) and tracks six things:
 `idleSec` (time with no active render), `stallSec` (time a render is active but
-making no progress), `sawActivity` (have we *ever* seen an active render),
-`lastBytes` (last output-folder size), and `lastIoBytes` (last cumulative
-worker disk I/O total). "Active" on each poll is whatever `CompletionSignal`
-says it is (worker-or-GPU by default) - and it can itself be `$null` ("unknown
-this poll").
+making no progress), `sawActivity` (has the watchdog ever *armed* - see
+`ArmSec` below), `activeSec` (consecutive seconds active so far, the arm
+debounce's own clock), `lastBytes` (last output-folder size), and `lastIoBytes`
+(last cumulative worker disk I/O total). "Active" on each poll is whatever
+`CompletionSignal` says it is (`WorkerOnly` on this deployment, see the table
+above) - and it can itself be `$null` ("unknown this poll").
+
+All six are inputs to one pure function, `Get-NextWatchdogState`, which returns
+the next bookkeeping plus a verdict of `continue` / `stalled` / `completed`;
+the loop itself only fetches inputs, logs, and acts on that verdict. `ArmSec`
+and `activeSec` are **mandatory** parameters of that function with no defaults,
+deliberately: they used to default to `0`, and `ArmSec = 0` arms the watchdog on
+the *first* active poll, silently restoring the very behaviour the arm debounce
+exists to remove. A caller that forgets them now fails loudly at parameter
+binding, and a watchdog that dies leaves the box **up**.
 
 - **Signal unreadable (`$null`)** -> neither idle nor active can be trusted this
   poll. The watchdog logs a warning and **freezes** `idleSec`, `stallSec`,
-  `sawActivity`, `lastBytes`, and `lastIoBytes` exactly as they were, then waits
-  for the next poll. This matters because a transient CIM outage used to be
-  indistinguishable from "no worker" - which could false-complete a queue
+  `sawActivity`, `activeSec`, `lastBytes`, and `lastIoBytes` exactly as they
+  were, then waits for the next poll. This matters because a transient CIM outage
+  used to be indistinguishable from "no worker" - which could false-complete a queue
   mid-encode (nudging `idleSec` toward the debounce) or false-stall a healthy
   one (nudging `stallSec`), on a poll that told us nothing either way.
+  `activeSec` is frozen for the mirror reason: an unreadable poll is not evidence
+  the worker went away, so it must neither *advance* the arm counter nor *reset*
+  it - on a box with intermittent CIM failures, resetting would mean a genuine
+  render could never accumulate `ArmSec` and the watchdog would silently become
+  inert.
 - **Active + progress on EITHER signal** -> healthy; reset `stallSec`. Progress
   is the *union* of two things:
   - the output folder's byte total **changing** (grew OR shrank - a genuinely
@@ -195,6 +210,31 @@ this poll").
   The watchdog logs and waits; it does **not** treat this as a completed queue.
   The `sawActivity` guard is what prevents the box from stopping *before the
   first render even begins*. (See [Appendix A](08-appendix-a-corrections.md).)
+  `activeSec` is also reset to 0 here: the worker is gone, so whatever arm
+  progress it had accrued is discarded rather than banked (see below).
+
+### The arm debounce: `ArmSec`
+
+`DebounceSec` guards the **far** side of a render - do not call it finished too
+early. `ArmSec` (default **90 s**) guards the **near** side - do not call it
+*started* at all until a worker has been continuously present for that long.
+
+The reason is a measured near-miss on 2026-07-27 05:49. Topaz spawns short-lived
+`ffmpeg`/`ffprobe` helpers for previews and thumbnails whenever the operator
+touches the GUI; one appeared at 05:49:11 and was gone by 05:49:43 - under 32
+seconds. That single active poll set `sawActivity`, which is the flag that makes
+the watchdog willing to declare a queue complete. The box then sat idle, ran the
+300 s debounce down, and came within ~90 seconds of stopping an instance on which
+**no render had ever run**, while the operator was actively working on it.
+
+So `sawActivity` is set only once `activeSec` reaches `ArmSec`, and `activeSec`
+resets to 0 on any inactive poll - three separate 30 s blips cannot add up to
+90 s and arm the watchdog by accident. Once armed it **stays** armed: a real
+render that pauses between queue items must not disarm itself, or the completion
+path could never fire at all. The two guards are only meaningful together, and
+`in-guest/tests/Watchdog.Tests.ps1` exercises them that way: a 75 s burst (one
+poll short of `ArmSec`) followed by 375 s of idle (well past `DebounceSec`) must
+still never complete.
 
 ### Re-verifying "completed" after the unlock gate
 
@@ -241,14 +281,67 @@ every output file to become unlocked:
 - For each remaining file it tries to open it for read with **no sharing**
   (`FileShare.None`). Success means nothing else holds a write handle - the file
   is fully flushed and closed.
-- When all such files are unlocked it proceeds. If the timeout expires with files
-  still locked, it logs a warning and proceeds anyway (better to stop a
-  cost-accruing box than hang forever). It re-checks every `UnlockPollSec`
-  (default **10 s**) while waiting.
+- When all such files are unlocked it proceeds. It re-checks every
+  `UnlockPollSec` (default **10 s**) while waiting, and the deadline is computed
+  from `[datetime]::UtcNow`, not local wall-clock time - a DST fall-back would
+  otherwise make a 5-minute gate unreachable for an extra 60 minutes.
+- **If the timeout expires with files still locked, what happens depends on
+  `OutputIsEphemeral`**, and on this deployment (which ships
+  `OutputIsEphemeral = $true`) it is the *refusing* branch that runs:
+  - `OutputIsEphemeral = $false` - it logs a warning and **proceeds anyway**.
+    The output survives the stop either way, so it is better to stop a
+    cost-accruing box than to hang forever.
+  - `OutputIsEphemeral = $true` (**the shipped value**) - it **refuses to stop**
+    and re-arms. Powering off would erase the scratch volume, and a file still
+    locked at the deadline is a file something may still be writing. Refusing is
+    the direct lesson of [docs/16](16-render-loss-incident.md); an unbounded
+    retry that keeps costing money is the correct trade against a stop that
+    costs the render.
+
+The unlock wait is a **blocking** loop, so it keeps its own heartbeat on the
+`HeartbeatSec` clock (ticking at `UnlockPollSec`, not `PollSec`) - otherwise it
+would log nothing at all between "waiting for output files to unlock" and its
+own conclusion, which at a raised `UnlockTimeoutMin` would be a multi-minute void
+in `watchdog.log` during the single most dangerous phase of the cycle.
 
 Then, for a `'completed'` decision only, it re-verifies once (see above) before
 invoking [`Stop-Sequence.ps1`](../in-guest/Stop-Sequence.ps1) with
 `-Reason completed` or `-Reason stalled` (see [Phase 3](05-phase3-stop-sequence.md)).
+
+### The three pre-stop refusals, and the retry loop they create
+
+The watchdog can decline to hand off - or decline to act on a hand-off - at three
+points. All three do the same thing: log loudly, **leave the instance up**, and
+re-arm so the whole `completed -> unlock -> upload -> stop` path retries roughly
+every `DebounceSec`. None of them exits the process, because exiting would leave
+nothing watching a box that is still running, still billing, and still holding an
+un-uploaded render on a volume nothing else will protect (this project runs with
+the CloudWatch idle alarm deliberately **unarmed** - see
+[docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)).
+
+1. **The unlock gate** - files still locked at the deadline on ephemeral storage,
+   or `OutputDir` could not be fully enumerated for the gate at all (see above).
+2. **The handoff snapshot** - immediately after the gate the watchdog records
+   `OutputDir`'s real file count and byte total, which is the line the 2026-07-28
+   incident was missing. If that enumeration fails it refuses rather than claim a
+   partial listing is final.
+3. **`Stop-Sequence.ps1` itself** - it returns `$false` when *it* refused (no
+   `UploadTarget` on ephemeral storage, an upload that failed or could not be
+   verified, or every action in the stop plan failing). The watchdog also treats
+   a **throw** from that script, and any return value that is not exactly one
+   boolean, as a refusal: `Stop-Sequence.ps1` has no top-level `try`/`catch` of
+   its own and legitimately throws on bad config, and an uncaught throw used to
+   kill the watchdog process outright - after which a restarted watchdog, seeing
+   no worker and starting from `sawActivity = $false`, could **never** reach
+   `completed` again and the box would run indefinitely.
+
+Each refusal is numbered in the log (`refusal #N since the last clean cycle`).
+The counter matters because for `reason = 'stalled'` the retry loop is unbounded
+by design - a hung encoder still holding its output handle fails the gate every
+cycle - so without a count `watchdog.log` shows an identical block repeating with
+no way to tell the 40th attempt from the first. It resets to 0 on any cycle that
+did **not** refuse (the re-verify found a live render, or `Stop-Sequence.ps1` ran
+and returned cleanly).
 
 ### Incremental per-render upload, and the blind window it introduces (CORRECTION 3, shipped 2026-07-28)
 
@@ -328,8 +421,29 @@ A failed incremental upload is never fatal to the loop: it reuses `Resolve-Uploa
 one-retry policy, and on continued failure it just logs and leaves the file unmarked in the
 in-memory tracking table for the final `Stop-Sequence.ps1` sweep - still an unconditional
 catch-all - to pick up later. The whole pass is switchable via `UploadWhenReady` (default `$true`)
-without a code change, and is wrapped in its own try/catch so any unexpected failure degrades to a
-logged warning rather than taking down the poll loop.
+without a code change.
+
+**Containment is per file, not per pass.** A failure while handling one file - a lock probe that
+errors, or `Invoke-TopazIncrementalUpload`'s relative-path arithmetic throwing because a file's
+`FullName` does not sit under the configured `OutputDir` (a junction, or an `OutputDir` spelled
+differently from what enumeration returns) - is caught around **that file only**. Everything after
+it in the enumeration is still processed, and the file itself is left exactly as the tracking table
+already had it, for a later poll to retry. This matters because enumeration order is stable: with
+pass-level containment alone, one *persistent* per-file fault silently disabled incremental upload
+for every file ordered after it, on every poll, for the life of the process - defeating this
+correction for precisely the multi-file queue it exists to protect. An outer `try`/`catch` still
+wraps the iteration and the prune as a backstop, so nothing here can take down the poll loop.
+
+**One directory walk per poll.** `OutputDir` is enumerated **once** per poll
+(`Get-OutputFileSnapshot`) and that single snapshot feeds both the progress/stall signal and this
+upload pass. Previously each walked the multi-GB folder separately, every `PollSec`, at two
+different instants - so the two could also disagree about what was in the folder. `$null` from that
+walk means "could not be read", never "empty": the stall bookkeeping freezes and this pass is
+skipped entirely, rather than pruning tracked files that a failed read merely did not see. In the
+same spirit, a file whose tracked uploaded size *and* write-time already match what is on disk is
+no longer lock-probed at all - it is ineligible at the identity gate regardless, and the probe is
+an exclusive `FileShare.None` open that would briefly deny another process access to a finished
+deliverable on every poll for the rest of the queue.
 
 ## Why the tasks run as SYSTEM
 
@@ -392,13 +506,21 @@ Get-ScheduledTaskInfo -TaskName 'TopazAutoStop-Watchdog'   # last-run details
 
 ## Limitation: a watchdog restart mid-render loses in-memory state
 
-`$script:KnownWorkers` (orphan-worker tracking) and the loop variables
-`$sawActivity` / `$idleSec` / `$stallSec` / `$lastBytes` / `$lastIoBytes` live only in the running
+`$script:KnownWorkers` (orphan-worker tracking), `$script:UploadTracking` (the
+incremental-upload table) and the loop variables `$sawActivity` / `$activeSec` /
+`$idleSec` / `$stallSec` / `$lastBytes` / `$lastIoBytes` live only in the running
 `Watchdog.ps1` process - deliberately **not** persisted to disk. If the watchdog
 process itself is restarted mid-render (e.g. by the `RestartCount 3` policy
 above, after a crash), it comes back up with a clean slate: it no longer knows an
 orphaned worker was previously adopted, and it has forgotten whether it has ever
-seen an active render this session. Persisting that state across a stop/start
+seen an active render this session.
+
+The sharpest edge of that is a restart *after* the queue has already drained: the
+fresh process starts with `sawActivity = $false` and finds no worker to arm it,
+so it can never reach `completed` again and the box simply runs on, logging
+"Topaz GUI up but no render has started yet". That is why the stop hand-off is
+wrapped so that nothing - a `Stop-Sequence.ps1` throw included - can end this
+process where re-arming would do (see "The three pre-stop refusals" above). Persisting that state across a stop/start
 cycle was considered and rejected - stale state surviving a restart would risk a
 false stop (e.g. replaying a stale `sawActivity = $true` straight into a fresh
 pre-render lull). The trade-off is deliberate: on a deployment that arms it,

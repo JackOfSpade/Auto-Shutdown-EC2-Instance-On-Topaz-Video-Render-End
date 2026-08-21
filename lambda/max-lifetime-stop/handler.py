@@ -4,18 +4,51 @@ max-lifetime-stop Lambda
 
 OPTIONAL last-resort safety net for the Topaz auto-stop pipeline.
 
-The on-box watchdog + idle CloudWatch alarm normally stop the instance once the
-GPU goes idle. This Lambda catches the pathological case those miss: a job that
-stays "stuck busy" and never goes idle, so the idle alarm never fires and the
-box runs forever. It enforces a hard, absolute ceiling on wall-clock run time:
-if the target instance has been running (LaunchTime) longer than
-MAX_LIFETIME_HOURS, force-stop it -- no matter what the GPU is doing.
+*** DANGER: A STOP FROM THIS LAMBDA CAN PERMANENTLY DESTROY A FINISHED RENDER. ***
 
-It is deliberately dumb and safe:
+This function calls ec2:StopInstances directly, from the control plane. It never
+consults the guest, and nothing in the guest is triggered by an EC2-API stop
+(Register-ScheduledTasks.ps1 registers no shutdown-triggered task), so
+Stop-Sequence.ps1 DOES NOT RUN: no rclone upload, no upload verification, no
+misplaced-output recovery scan, and -- the one that matters -- no ephemeral
+upload interlock. OutputDir normally lives on the instance-store scratch volume,
+which is ERASED the instant the instance stops. A render that has finished but
+has not been uploaded and verified when the ceiling is crossed is simply gone:
+no local file, no snapshot, nothing to re-run. That is not hypothetical -- a
+finished ~2.3 GB render was already lost that way once on this deployment; see
+docs/16-render-loss-incident.md.
+
+The in-guest equivalent, in-guest/Register-TimedStop.ps1, takes the opposite
+position on purpose: it fires Stop-Sequence.ps1, so the interlock still applies
+and a stop that would erase an unuploaded render is REFUSED and retried instead.
+PREFER Register-TimedStop.ps1 whenever the guest is reachable. Deploy this Lambda
+only when the guest cannot be trusted to act at all -- and accept that its cap is
+absolute in both directions: it will always stop the box, including when stopping
+the box is the wrong thing to do.
+
+Note the topology this actually sits in (as of 2026-07-28): the watchdog's own
+render-queue completion detection is the ONLY armed stop path. The GPU-idle
+CloudWatch alarm is opt-in and not armed here -- control-plane/03-create-idle-alarm.sh
+refuses to create it without ENABLE_IDLE_ALARM=1, and the alarm that once existed
+was deleted (see the banner at the top of docs/06-phase4-safety-net.md). So this
+Lambda is not "complementary" to an idle alarm on this deployment: once deployed
+it is the only *scheduled* thing that can stop the box, and its blindness -- to
+render progress and to pending uploads alike -- weighs correspondingly more.
+
+What it is for: the pathological case in-guest completion detection cannot see --
+a job that stays "stuck busy" and never finishes, so the guest never decides to
+stop anything and the box runs forever. It enforces a hard, absolute ceiling on
+wall-clock run time: if the target instance has been running (LaunchTime) longer
+than MAX_LIFETIME_HOURS, force-stop it -- no matter what the GPU is doing.
+
+Within that deliberately narrow job it is dumb and careful:
   * only ever calls ec2:StopInstances (never terminate),
   * idempotent -- if the instance is already stopping/stopped it does nothing,
   * timezone-aware UTC math, and
-  * degrades gracefully if the instance can't be found.
+  * degrades to a logged no-op if the instance genuinely no longer exists
+    (a structurally invalid id raises instead -- see _describe_instance).
+"Dumb and careful" is scoped to instance/GPU state only. It has never said
+anything about unuploaded output; the DANGER block above is what governs there.
 
 Environment variables
 ---------------------
@@ -26,12 +59,15 @@ Environment variables
   AWS_TARGET_REGION    Optional. Region of the target instance. If unset, boto3
                        resolves the region from the standard Lambda runtime env
                        (AWS_REGION); the region is never hardcoded.
+
+Both TARGET_INSTANCE_ID and AWS_TARGET_REGION are stripped before use, because
+an unnoticed stray space in either one breaks the guard on every invocation.
 """
 
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -52,7 +88,7 @@ def _utc_now() -> datetime:
     Kept as a tiny seam so the safety-critical ceiling boundary can be tested
     against a fixed instant instead of depending on wall-clock scheduling.
     """
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _get_instance_id() -> str:
@@ -112,22 +148,65 @@ def _get_max_lifetime_hours() -> float:
 
 def _ec2_client():
     """Build an EC2 client. Region comes from AWS_TARGET_REGION if set, else the
-    standard boto3/Lambda resolution (AWS_REGION). Never hardcoded."""
-    region = os.environ.get("AWS_TARGET_REGION")
+    standard boto3/Lambda resolution (AWS_REGION). Never hardcoded.
+
+    The value is stripped for the same reason _get_instance_id strips its
+    candidates: a console edit or a shell variable can leave stray whitespace,
+    and boto3.client("ec2", region_name="  us-east-1 ") raises
+    InvalidRegionError on EVERY invocation, before describe_instances -- so the
+    cap never runs at all. Stripping to "" (rather than passing the padded
+    value) lets the `if region:` guard below fall through to boto3's standard
+    region resolution, which is the sane reading of "the operator set nothing".
+    """
+    region = (os.environ.get("AWS_TARGET_REGION") or "").strip()
     if region:
         return boto3.client("ec2", region_name=region)
     return boto3.client("ec2")
 
 
 def _describe_instance(ec2, instance_id):
-    """Return the instance dict, or None if it does not exist / has no reservation."""
+    """Return the instance dict, or None if the instance genuinely does not exist.
+
+    The two InvalidInstanceID.* codes are deliberately NOT handled the same way,
+    because they are not the same kind of event:
+
+      * NotFound is a legitimate runtime condition -- the guarded instance was
+        terminated or replaced -- so it degrades to a no-op. It is logged at
+        ERROR rather than WARNING, and names the resolved region, because the
+        other way to reach it is a wrong-region deploy: then every scheduled
+        tick no-ops while reporting SUCCESS, the Errors metric stays flat, and
+        the box runs forever. One greppable line is what makes a dead safety
+        net visible at all (see the README's Monitoring section).
+      * Malformed can only ever be a configuration error -- a typo'd
+        TARGET_INSTANCE_ID edited straight into the Lambda console. No future
+        invocation will do better, so it re-raises and the invocation is
+        recorded as FAILED. That is exactly the "perpetual noop" hazard
+        _get_instance_id's docstring already calls out; swallowing Malformed
+        here re-created it for any structurally invalid id.
+    """
     try:
         response = ec2.describe_instances(InstanceIds=[instance_id])
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
-            logger.warning("Instance %s not found / malformed id (%s).", instance_id, code)
+        if code == "InvalidInstanceID.NotFound":
+            logger.error(
+                "Instance %s does not exist in region %s (%s); the max-lifetime "
+                "cap is guarding nothing. Check TARGET_INSTANCE_ID and "
+                "AWS_TARGET_REGION.",
+                instance_id,
+                getattr(ec2.meta, "region_name", "<unresolved>"),
+                code,
+            )
             return None
+        if code == "InvalidInstanceID.Malformed":
+            logger.error(
+                "Configured instance id %r is structurally invalid (%s); failing "
+                "this invocation deliberately, so a mistyped id shows up on the "
+                "function's Errors metric instead of no-opping successfully "
+                "forever.",
+                instance_id,
+                code,
+            )
         raise
 
     reservations = response.get("Reservations", [])
@@ -202,10 +281,27 @@ def handler(event, context):
 
     # Idempotency / safety: only a genuinely running instance is a candidate.
     if state != "running":
-        reason = "already-not-running" if state in _NON_RUNNING_STATES else "not-running"
-        logger.info(
-            "Instance %s is %s (not 'running'); nothing to stop.", instance_id, state
-        )
+        # The two reason strings are near-identical and both are published in
+        # the README, so they stay as they are; the LOG line is where the two
+        # cases are told apart. 'not-running' means EC2 reported a state
+        # outside the set this handler knows (or the response carried no State
+        # at all, which reads as 'unknown') -- worth a WARNING, because it is
+        # either a new EC2 state or a malformed response, not a routine no-op.
+        known = state in _NON_RUNNING_STATES
+        reason = "already-not-running" if known else "not-running"
+        if known:
+            logger.info(
+                "Instance %s is %s (not 'running'); nothing to stop.",
+                instance_id,
+                state,
+            )
+        else:
+            logger.warning(
+                "Instance %s reports the unrecognized state %r (not 'running'); "
+                "nothing to stop.",
+                instance_id,
+                state,
+            )
         result.update(action="noop", reason=reason)
         return result
 
@@ -239,7 +335,9 @@ def handler(event, context):
         i.get("InstanceId"): i.get("CurrentState", {}).get("Name")
         for i in stop_response.get("StoppingInstances", [])
     }
-    logger.info("stop_instances accepted for %s; transitions=%s", instance_id, transitions)
+    logger.info(
+        "stop_instances accepted for %s; transitions=%s", instance_id, transitions
+    )
 
     result.update(action="stopped", reason="over-ceiling", stopping=transitions)
     return result

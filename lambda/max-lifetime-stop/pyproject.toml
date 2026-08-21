@@ -1,0 +1,54 @@
+# Ruff configuration for lambda/max-lifetime-stop.
+#
+# WHY this file exists. CI runs `python -m ruff check lambda/` from the repo
+# root. With no config file anywhere in the tree, ruff applied only its default
+# selection -- pycodestyle E4/E7/E9 plus Pyflakes F, i.e. "does it parse, are
+# there undefined names or unused imports" and almost nothing else. The version
+# pin in requirements-dev.txt was therefore pinning a near-empty ruleset while
+# the docs described ruff as a substantive gate. This makes it one, for a module
+# whose entire job is deciding whether to call ec2:StopInstances.
+#
+# WHY it lives here rather than at the repo root. Ruff resolves configuration
+# per file, from the nearest pyproject.toml/ruff.toml upward, so every file in
+# this directory picks this up no matter which directory ruff is invoked from --
+# `python -m ruff check lambda/` from the repo root keeps working unchanged.
+# Keeping it here also keeps it out of the deployed artifact for free:
+# control-plane/04-deploy-max-lifetime-lambda.sh zips handler.py by name, never
+# the directory.
+#
+# There is deliberately NO [tool.pytest.ini_options] table here. Adding one
+# would move pytest's rootdir/config discovery, and nothing about this change
+# needs that; the pytest invocation stays exactly as CI has it.
+
+[tool.ruff]
+# Matches the deployed runtime (RUNTIME=python3.12 in
+# control-plane/04-deploy-max-lifetime-lambda.sh) and the interpreter CI pins.
+# Note the consequence: it lets UP017 rewrite `timezone.utc` to the
+# `datetime.UTC` alias, so this package now needs Python >= 3.11 to import at
+# all. That is free on the runtime and in CI, but worth knowing before running
+# handler.py's __main__ smoke test under an older workstation interpreter.
+target-version = "py312"
+
+[tool.ruff.lint]
+# WHY these families, rather than a blanket "select everything" (which would
+# turn every future cosmetic rule addition into a red build on unrelated PRs):
+#   E, W  pycodestyle errors/warnings -- includes E501, so line length is
+#         actually gated instead of drifting file by file.
+#   F     Pyflakes: undefined names, unused imports/variables.
+#   I     import sorting, so adding an import never produces a review diff that
+#         is really about ordering.
+#   B     flake8-bugbear: mutable default arguments, except-clause mistakes,
+#         loop-variable capture -- the class of bug that reads fine in review.
+#   UP    pyupgrade: keeps the source idiomatic for the pinned runtime.
+#   RUF   ruff's own checks, including unused `noqa` directives.
+#   DTZ   flake8-datetimez: bans naive datetimes. This one is load-bearing, not
+#         cosmetic. The whole decision here is `now - LaunchTime >= ceiling`,
+#         and a naive `datetime.now()` in that expression compares against the
+#         tz-aware LaunchTime boto3 returns: a TypeError if you are lucky, an
+#         hours-wrong ceiling if you are not. It flags nothing today -- the
+#         handler is already tz-aware -- and exists to keep it that way.
+#   RET, SIM  control-flow/branch mistakes in the decision path.
+# Deliberately NOT added in the same change: `ruff format --check`. Formatting
+# the already-reviewed source is a separate decision from linting it, and
+# bundling the two would bury real findings under a wholesale reformat.
+select = ["E", "W", "F", "I", "B", "UP", "RUF", "DTZ", "RET", "SIM"]

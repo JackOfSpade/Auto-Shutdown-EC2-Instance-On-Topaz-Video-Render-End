@@ -7,7 +7,9 @@
 #
 # These exact versions are the reviewed Python test set. Ruff 0.15.22 is the
 # reviewed stable release used by CI; pinning the tool prevents a new lint rule
-# from turning an unrelated change red.
+# from turning an unrelated change red. Which rules it actually enforces is a
+# separate question, and lives in pyproject.toml next to this file -- pinning
+# the version alone was pinning ruff's near-empty default selection.
 boto3==1.43.56
 botocore==1.43.56
 pytest==9.1.1

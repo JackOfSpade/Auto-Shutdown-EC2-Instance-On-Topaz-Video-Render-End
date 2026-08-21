@@ -14,10 +14,13 @@
       * the ephemeral interlock runs BEFORE the completed-stop safety gate;
       * the safety gate runs BEFORE the SNS publish and BEFORE the DryRun guard,
         so neither can announce or claim a stop an interlock has refused;
-      * every refusal returns exactly $false, because Watchdog.ps1 tests
-        `$stopResult -eq $false` to decide whether to re-arm and retry. Anything
-        else there ($null, an array, a log line) silently disables the retry
-        path that keeps an un-uploaded render recoverable.
+      * every refusal returns exactly $false -- one [bool], nothing else --
+        because Watchdog.ps1 classifies the return with
+        Resolve-StopSequenceResult, which trusts ONLY that shape. Anything else
+        there ($null, an array, a log line riding along) is 'untrustworthy',
+        which the watchdog treats as a refusal: safe, but it means a stop that
+        really happened can never be confirmed, so the box re-arms and retries
+        forever while still billing.
 
     Moving the safety gate below the DryRun guard, dropping a `return $false`,
     or letting `exit` leak onto the watchdog's call path would all leave the
@@ -353,7 +356,7 @@ Describe 'Invoke-TopazStopSequence (refusal orchestration + safety ordering)' {
         }
     }
 
-    Context 'output-stream hygiene (the value Watchdog.ps1 compares with -eq $false)' {
+    Context 'output-stream hygiene (the value Resolve-StopSequenceResult classifies)' {
 
         It 'emits EXACTLY ONE object, a [bool], on every refusal path' {
             $cases = @(
@@ -378,11 +381,11 @@ Describe 'Stop-Sequence.ps1 entry point (what the caller actually receives)' {
     # literal name -- a contract this repo never changes -- so the only way to
     # run the REAL script tail off a live EC2 guest is to place a copy of it
     # beside a stand-in Config.ps1. That tail is small but load-bearing: it must
-    # `return` the boolean (never `exit`) on the watchdog's path, because
-    # Watchdog.ps1 tests `$stopResult -eq $false`, and `exit` makes the `&`
-    # expression yield $null instead -- $null -eq $false is False, so the
-    # re-arm/retry block would be skipped and an un-uploaded render would be
-    # left for the CloudWatch idle alarm to erase.
+    # `return` the boolean (never `exit`) on the watchdog's path: `exit` makes
+    # the `&` expression yield $null instead, which Resolve-StopSequenceResult
+    # classifies as 'untrustworthy' and the watchdog treats as a refusal. The
+    # box then stays UP and re-arms forever over a stop that already succeeded,
+    # with no log line anywhere saying why.
 
     BeforeAll {
         $script:SandboxDir = Join-Path ([System.IO.Path]::GetTempPath()) ("topaz-stopseq-" + [guid]::NewGuid().ToString('N').Substring(0, 12))

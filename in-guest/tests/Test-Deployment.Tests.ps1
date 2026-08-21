@@ -25,6 +25,19 @@
     Initialize-ScratchDisk.ps1 and Stop-Sequence.ps1 use), so nothing here runs
     a check, probes IMDS, calls the AWS CLI, touches PATH or prints a verdict.
 
+    DELIBERATELY OUT OF SCOPE: check 11's own DryRun verdict chain is left
+    INLINE in Test-Deployment.ps1 and is not covered here. Its only
+    decision-bearing input is Test-StopPlanCanReachGuestShutdown, which IS
+    pinned above; everything the chain adds on top is message formatting over
+    $cfg.DryRun and the $shutdownBehaviorValue that check 10 already verified,
+    so extracting a Resolve-DryRunVerdict today would test PowerShell's `if`
+    rather than a safety property. Recorded so the untested chain next to a
+    tested predicate reads as a decision and not an oversight -- and so the
+    trigger is explicit: the moment that chain grows a condition of its own,
+    extract Resolve-DryRunVerdict and cover the full {DryRun} x {StopStrategy}
+    x {shutdown behavior} matrix, the "*** DANGEROUS COMBINATION ***" branch
+    first.
+
     Run with:
         Invoke-Pester -Path in-guest/tests -CI
 #>

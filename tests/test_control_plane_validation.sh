@@ -30,12 +30,27 @@ assert_true() {   # assert_true <description> <command...>
 
 assert_false() {  # assert_false <description> <command...>
   local desc="$1"; shift
-  if ! "$@"; then
-    echo "PASS: $desc"
-    pass_count=$((pass_count + 1))
-  else
+  local rc=0
+  "$@" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     echo "FAIL: $desc (expected failure/false, got success)"
     fail=1
+  elif [ "$rc" -ge 126 ]; then
+    # 126/127 are the shell's "found but not executable" / "command not found" statuses. A naive
+    # `if ! "$@"` treats those as a PASS, so a predicate renamed or deleted in
+    # control-plane/lib/validation.sh would leave MOST of this suite green against a function that
+    # no longer exists — bash's "command not found" goes to stderr, invisible in the PASS/FAIL
+    # summary. The negative-path assertions are exactly the assert_false ones (an empty INSTANCE_ID
+    # rejected, an out-of-range IDLE_MINUTES rejected, an unconfirmed shutdown behavior rejected),
+    # and those predicates gate real ec2:StopInstances-capable scripts, so they are precisely the
+    # ones that must not be able to pass vacuously.
+    # Mirrors tests/test_auto_merge_logic.sh's harness, deliberately: same hazard, same fix.
+    # Only >= 126 is treated as broken, NOT every "large" status — a genuine command can return one.
+    echo "FAIL: $desc (command '$1' not found or not executable, rc=$rc — not a genuine false)"
+    fail=1
+  else
+    echo "PASS: $desc"
+    pass_count=$((pass_count + 1))
   fi
 }
 
@@ -49,6 +64,20 @@ assert_eq() {     # assert_eq <description> <actual> <expected>
     fail=1
   fi
 }
+
+# ---- predicate existence gate ------------------------------------------------------------------
+# Belt-and-braces for the assert_false hazard above: assert existence UP FRONT, so a rename or a
+# deletion in either sourced library reports the missing predicate BY NAME instead of showing up as
+# a wall of rc=127 assertion failures (or, before the hardening above, as silence). The list is the
+# set of functions this suite actually calls across control-plane/lib/validation.sh and
+# control-plane/lib/aws-idempotent.sh.
+EXPECTED_PREDICATES="is_valid_instance_id is_valid_idle_minutes is_valid_max_lifetime_hours"
+EXPECTED_PREDICATES="$EXPECTED_PREDICATES is_shutdown_behavior_confirmed profile_names_match"
+EXPECTED_PREDICATES="$EXPECTED_PREDICATES run_idempotent run_idempotent_hinted"
+for fn in $EXPECTED_PREDICATES; do
+  declare -F "$fn" >/dev/null \
+    || { echo "FAIL: predicate $fn is missing from control-plane/lib/"; fail=1; }
+done
 
 # ---- is_valid_instance_id: the one input EVERY control-plane script takes ----------------------
 # The scripts tag instances, associate instance profiles onto them, and arm schedules that call

@@ -5,20 +5,24 @@
 Phase 2 installs the on-box pipeline and registers it to run from boot.
 [`Install.ps1`](../in-guest/Install.ps1) copies the scripts into
 `C:\topaz-autostop`; [`Register-ScheduledTasks.ps1`](../in-guest/Register-ScheduledTasks.ps1)
-registers the two SYSTEM scheduled tasks that point at those installed copies.
+registers the three SYSTEM scheduled tasks that point at those installed copies.
 
 ```powershell
 # 1. edit the OPERATOR SETTINGS block in in-guest\Config.ps1 first (Phase 0 values)
 .\in-guest\Install.ps1                     # copies scripts -> C:\topaz-autostop
 # 2. from an ELEVATED PowerShell:
-.\in-guest\Register-ScheduledTasks.ps1     # registers the two SYSTEM tasks
+.\in-guest\Register-ScheduledTasks.ps1     # registers the three SYSTEM tasks
 ```
 
-`Install.ps1` creates `InstallDir` + `LogDir`, copies `Config.ps1`,
-`Watchdog.ps1`, `Stop-Sequence.ps1`, and `Push-GpuMetric.ps1` (plus, best-effort,
-the optional operator tools `Register-TimedStop.ps1` and `Test-Deployment.ps1`
-when present - a missing one of those is only a warning, not an install
-failure), warns if `nvidia-smi`/`aws` are missing, and then tells you to run
+`Install.ps1` creates `InstallDir` + `LogDir`, copies the five mandatory
+scripts - `Config.ps1`, `Watchdog.ps1`, `Stop-Sequence.ps1`, `Push-GpuMetric.ps1`
+and `Initialize-ScratchDisk.ps1` - (plus, best-effort, the four optional
+operator tools `Register-TimedStop.ps1`, `Test-Deployment.ps1`,
+`Set-GoogleDriveAuth.ps1` and `Register-ScheduledTasks.ps1` when present - a
+missing one of those is only a warning, not an install failure; the last is
+copied so `InstallDir` stays self-contained and tasks can be re-registered
+after the repo checkout is deleted, which [docs/11](11-deploying-on-this-instance.md)
+documents as a recovery step), warns if `nvidia-smi`/`aws` are missing, and then tells you to run
 `Register-ScheduledTasks.ps1` from an elevated shell. It does **not** register
 tasks itself - that needs elevation. A directory-creation or script-copy
 failure is a hard install failure, not a warning: `Install.ps1` logs it as an
@@ -448,7 +452,7 @@ deliverable on every poll for the rest of the queue.
 ## Why the tasks run as SYSTEM
 
 [`Register-ScheduledTasks.ps1`](../in-guest/Register-ScheduledTasks.ps1)
-registers both tasks under the **SYSTEM** account (`ServiceAccount` logon,
+registers all three tasks under the **SYSTEM** account (`ServiceAccount` logon,
 `RunLevel Highest`). SYSTEM is required for two reasons:
 
 1. **`SeShutdownPrivilege`.** The guest shutdown that stops the instance needs
@@ -459,7 +463,7 @@ registers both tasks under the **SYSTEM** account (`ServiceAccount` logon,
    processes across all sessions via CIM, so the watchdog always sees the GUI and
    its workers.
 
-The two tasks:
+The three tasks:
 
 - **`TopazAutoStop-Watchdog`** - **two** triggers: `-AtStartup` (the normal
   path) and a **15-minute repeating sweep** (a `-Once` trigger with a
@@ -482,6 +486,18 @@ The two tasks:
   state - on a deployment that arms the CloudWatch idle alarm, that alarm
   backstops exactly this case, since it does not depend on any in-guest
   process's memory; this project runs without that backstop, by decision.)
+- **`TopazAutoStop-ScratchInit`** - a single `-AtStartup` trigger running
+  [`Initialize-ScratchDisk.ps1`](../in-guest/Initialize-ScratchDisk.ps1), with
+  `ExecutionTimeLimit` **15 minutes** and `RestartCount 2` one minute apart.
+  **Deliberately no recurring sweep**, unlike the watchdog: the script is a
+  no-op once the volume exists, so re-running it buys nothing. This task cannot
+  be a one-off install step, because the instance store is wiped and comes back
+  as a **RAW, unpartitioned disk on every start** - so without it `OutputDir`
+  does not exist after the first stop, Topaz has nowhere to export to, and the
+  stop sequence then (correctly) refuses to stop because it cannot upload
+  renders it cannot find. That failure is invisible until the *next* boot,
+  which is why the verification command below uses a wildcard rather than a
+  hand-typed name list.
 - **`TopazAutoStop-GpuMetric`** - a `-Once` trigger with a 1-minute repetition for
   an effectively-infinite duration (~10000 days), so it runs
   `Push-GpuMetric.ps1` once per minute forever; `-MultipleInstances IgnoreNew`
@@ -494,13 +510,15 @@ The two tasks:
 The registration is idempotent: it unregisters any existing same-name task before
 re-creating it, so it is safe to re-run (e.g. after flipping `DryRun`). Each
 task's registration is verified (`Get-ScheduledTask` must find it afterward)
-and the two are attempted independently, so one failing does not stop the
-other from being registered; `Register-ScheduledTasks.ps1` reports honestly
+and the three are attempted independently, so one failing does not stop the
+others from being registered; `Register-ScheduledTasks.ps1` reports honestly
 which task(s), if any, failed and exits non-zero rather than always claiming
-"Both tasks registered." Verify afterward with:
+"All three tasks registered." Verify afterward with the wildcard the script's
+own success message recommends - a name list is the thing that lets a silently
+absent task read as a clean bill of health:
 
 ```powershell
-Get-ScheduledTask -TaskName 'TopazAutoStop-Watchdog','TopazAutoStop-GpuMetric'
+Get-ScheduledTask -TaskName 'TopazAutoStop-*'              # expect all THREE
 Get-ScheduledTaskInfo -TaskName 'TopazAutoStop-Watchdog'   # last-run details
 ```
 

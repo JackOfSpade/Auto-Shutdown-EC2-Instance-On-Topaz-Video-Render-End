@@ -29,3 +29,8 @@ Thumbs.db
 *.swp
 .vscode/
 .idea/
+# Agent tooling keeps FULL repo copies under .claude/worktrees/, so an unguarded
+# `git add -A` would stage thousands of stale duplicate sources as if they were
+# real files. ci.yml's shellcheck discovery already excludes the path explicitly;
+# this keeps it out of git's sight in the first place.
+.claude/

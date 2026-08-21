@@ -45,7 +45,7 @@ unattended.
   isn't a blind stop-the-box alarm). What changed is that **nothing acts on
   it** by default any more.
 - The optional max-lifetime Lambda (below) is **not deployed** either. With
-  neither of those and the one-shot wall-clock timed stop already removed
+  neither of those and the wall-clock timed stop already removed
   (2026-07-27), the **only** thing that will ever stop this box is the
   watchdog completing a render. See
   [docs/09-appendix-b-boundaries.md](09-appendix-b-boundaries.md) for that

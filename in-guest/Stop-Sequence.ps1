@@ -63,9 +63,12 @@ param(
     # Register-TimedStop.ps1's .NOTES tells the operator to inspect. Keying the
     # exit on $MyInvocation instead would ALSO fire on Watchdog.ps1's
     # `& (Join-Path $PSScriptRoot 'Stop-Sequence.ps1')` call, whose result then
-    # becomes $null rather than $false -- and Watchdog.ps1 tests
-    # `$stopResult -eq $false` to decide whether to re-arm, so the retry path
-    # that keeps an un-uploaded render recoverable would silently stop running.
+    # becomes $null rather than $false. Watchdog.ps1 classifies that return with
+    # Resolve-StopSequenceResult, which trusts ONLY a value that is exactly one
+    # [bool]; $null is 'untrustworthy' and is treated as a refusal. So the box
+    # would stay UP and re-arm forever on a stop that had actually succeeded --
+    # a still-billing instance rather than a lost render, but a failure either
+    # way, and one no log line would explain.
     # Only Register-TimedStop.ps1's action string passes this switch.
     [switch]$ExitCodeOnRefusal,
 
@@ -157,8 +160,10 @@ function Invoke-TopazStopSequence {
     .PARAMETER IgnoreDryRun
         Overrides Config's DryRun for this invocation (the timed hard stop).
     .OUTPUTS
-        [bool] -- and NOTHING else on the output stream. Watchdog.ps1 tests the
-        result with `-eq $false`, and Write-TopazLog writes to the
+        [bool] -- and NOTHING else on the output stream. Watchdog.ps1 classifies
+        the result with Resolve-StopSequenceResult, which trusts ONLY a return
+        that is exactly one [bool] and treats every other shape (extra objects
+        included) as a refusal; Write-TopazLog writes to the
         Information/Warning/Error streams precisely so it cannot contaminate it.
     #>
     [CmdletBinding()]

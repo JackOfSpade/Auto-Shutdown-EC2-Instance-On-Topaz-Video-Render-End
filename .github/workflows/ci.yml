@@ -85,6 +85,19 @@ jobs:
         # which is intended: a discovery gate that finds nothing has proved nothing.
         run: find . -name '*.sh' -not -path './.git/*' -not -path './.claude/*' -print0 | xargs -0 shellcheck -x --source-path=SCRIPTDIR
 
+      - name: Run actionlint
+        # Deliberately ordered here, ahead of the gates below: a workflow-YAML error invalidates every
+        # one of them, and under the `act` pre-push hook (docs/10) waiting for the full bash-suite loop
+        # before being told the YAML is broken costs the developer minutes to learn nothing.
+        # The shellcheck step above only covers standalone *.sh files on disk — it never sees the bash embedded
+        # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
+        # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
+        # so this is the only gate that covers that bash. Pinned to a specific tag (not `:latest`) so a
+        # new actionlint release can't silently turn this job red on an unrelated change.
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
       - name: Lint for bash-4-only syntax (these scripts must run on macOS bash 3.2)
         # The operator runs control-plane/ and scripts/ from a Mac, where /bin/bash
         # is still 3.2 — Apple never shipped bash 4 (GPLv3). `${var^^}` / `${var,,}`
@@ -194,16 +207,6 @@ jobs:
           fi
           echo "Bash test suites passed: $ran."
 
-      - name: Run actionlint
-        # The shellcheck step above only covers standalone *.sh files on disk — it never sees the bash embedded
-        # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
-        # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
-        # so this is the only gate that covers that bash. Pinned to a specific tag (not `:latest`) so a
-        # new actionlint release can't silently turn this job red on an unrelated change.
-        uses: docker://rhysd/actionlint:1.7.7
-        with:
-          args: -color
-
   powershell:
     name: PowerShell analyze + test
     runs-on: ubuntu-latest
@@ -312,7 +315,13 @@ jobs:
           #   Invoke-ScriptAnalyzer -Path in-guest -Recurse -Severity Warning |
           #     ForEach-Object { '{0}:{1} {2}' -f (Split-Path $_.ScriptPath -Leaf), $_.Line, $_.RuleName }
           $allowedWarningRules = @(
-              # Six sites, three kinds, all deliberate:
+              # Seven sites, four kinds, all deliberate:
+              #  - Config.ps1 / Write-TopazLog x1, the `(Get-TopazAutoStopConfig).LogDir` read.
+              #    A config that fails validation is exactly the case the literal LogDir fallback
+              #    on the line above exists for, and the caller has already had the message on the
+              #    stream, so there is nothing to recover and nothing new to say. Re-logging here
+              #    would fire on EVERY line of an otherwise-usable log; the rationale is written out
+              #    in full at the catch itself.
               #  - Config.ps1 / Get-Ec2Identity x3 (the instance-id, placement/region and
               #    availability-zone IMDS lookups): IMDS being unreachable is an expected, handled
               #    case - the caller gets $null, as Get-Ec2Identity's own .DESCRIPTION states.
@@ -331,13 +340,16 @@ jobs:
               #    -ErrorAction Stop - so a task that cannot be torn down at all still fails loudly
               #    instead of being quietly re-registered alongside its own orphan.
               'PSAvoidUsingEmptyCatchBlock',
-              # Nine sites, all plural because the name describes what the function RETURNS and the
-              # singular form would misdescribe it. Watchdog.ps1: Get-TopazPids, Get-TopazWorkers,
+              # Eleven sites, all plural because the name describes what the function RETURNS and
+              # the singular form would misdescribe it. Watchdog.ps1: Get-TopazPids, Get-TopazWorkers,
               # Get-WorkerIoBytes, Get-OutputBytes, Resolve-ProcessDescendants. Config.ps1:
               # Get-TopazOutputFiles, Build-AwsCliArgs, Build-RcloneLogFileArgs,
-              # Find-RenderRecoveryCandidates. Each returns a collection,
-              # an argument list, or a byte total; "Pid"/"Worker"/"Byte"/"Arg"/"File"/"Descendant"/
-              # "Candidate" would name a single item none of them ever returns.
+              # Get-TopazRcloneCommonArgs, Get-TopazRcloneTuningArgs, Find-RenderRecoveryCandidates.
+              # Each returns a collection, an argument list, or a byte total;
+              # "Pid"/"Worker"/"Byte"/"Arg"/"File"/"Descendant"/"Candidate" would name a single item
+              # none of them ever returns. The two Rclone*Args builders are the same case as
+              # Build-AwsCliArgs: both hand back the shared argument ARRAY every rclone invocation
+              # splats, so the singular would describe a single flag.
               'PSUseSingularNouns'
           )
 

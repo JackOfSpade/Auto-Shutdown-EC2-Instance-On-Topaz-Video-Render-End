@@ -180,7 +180,13 @@ observable state:
   counting a worker whose GUI parent crashed or was closed until the worker
   itself exits, so a dead GUI is never misread as "queue complete" mid-encode.
   "Queue complete" = no active render for `DebounceSec` (the debounce absorbs
-  transient live-preview children and ordinary inter-clip lulls).
+  transient live-preview children and ordinary inter-clip lulls) - **and only
+  once the watchdog has armed**. `DebounceSec` guards the far side of the
+  render; `ArmSec` (default **90 s**) guards the near side: the watchdog will
+  not declare a queue complete until a worker has been *continuously* present
+  for `ArmSec` first. Without it a 32-second ffmpeg preview blip counts as "a
+  render happened", and the box is stopped on a machine no render ever ran on.
+  See [Phase 2](04-phase2-watchdog.md).
 - **Stall detection.** Progress is the *union* of two signals: the output
   folder's byte total, and the matched workers' own cumulative disk I/O
   counters. The byte-total signal alone is unreliable on NTFS - a file's
@@ -193,8 +199,13 @@ observable state:
   (up to `UnlockTimeoutMin`) for every output file - other than a `_temp`
   scratch file, anchored so a real deliverable merely containing that text is
   never skipped - to be openable with no sharing, i.e. nothing still holds a
-  write handle. Only then does it power off, so a stop can never truncate a
-  file mid-write.
+  write handle. Only then does it hand off to the stop step, so a stop can never
+  truncate a file mid-write. If the timeout expires with files still locked, what
+  happens depends on `OutputIsEphemeral`: on this deployment (`$true`) it
+  **refuses to stop** and re-arms rather than erase a file something may still be
+  writing - an unbounded retry that costs money, chosen over a stop that costs
+  the render. With `OutputIsEphemeral = $false` it warns and proceeds, because
+  the output survives the stop either way. See [Phase 2](04-phase2-watchdog.md).
 - **Unreadable signals freeze, they never guess.** Both the worker-presence and
   GPU signals can come back "unknown this poll" (e.g. a transient CIM query
   failure); when that happens the watchdog freezes its idle/stall bookkeeping

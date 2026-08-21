@@ -185,10 +185,24 @@ ever fires after `ArmSec` of continuously confirmed worker activity (see
   occurred` lines into `stop.log` on either error branch, best-effort and bounded
   (`TopazForensicTimeoutSec`, default **10 s**) - the piece that puts Topaz's own crash signature
   into THIS pipeline's own logs, rather than only into a session log that may not outlive the box.
-- **`Invoke-TopazRecoveryUpload`** attempts a best-effort `rclone copy` + `rclone check` of
-  exactly the discovered `ErrorClassA` candidate(s) to `<UploadTarget>/recovered`, reusing the
-  same one-retry policy as the normal upload above, and logs a `RECOVERY DISPOSITION` line per
-  file (`uploaded+verified` / `uploaded-but-unverified` / `NOT RECOVERED`).
+- **`Invoke-TopazRecoveryUpload`** attempts a best-effort upload of exactly the discovered
+  `ErrorClassA` candidate(s) to `<UploadTarget>/recovered/<path relative to the OutputDir
+  volume's root>`, reusing the same one-retry policy as the normal upload above, and logs a
+  `RECOVERY DISPOSITION` line per file (`uploaded+verified` / `uploaded-but-unverified` /
+  `NOT RECOVERED`). **One literal `rclone copyto` + `rclone check --one-way` pair PER CANDIDATE,
+  each producing its own independent verdict** - not one batched `copy` narrowed by `--include`.
+  The batched form was removed because rclone filter patterns are globs: a deliverable named
+  `cut[final].mov` produced an include pattern matching nothing, `copy` and `check --one-way`
+  both exited 0 over zero files, and every candidate was logged `uploaded+verified` for a file
+  that had never been transferred - moments before the stop erased the volume. (`copyto` passes
+  the name through untouched; `check` compares the file against the destination's **parent
+  directory**, which keeps the comparison to that one leaf on both sides. See the rationale block
+  on the function in `Config.ps1`.) The phase as a whole is bounded by **`RecoveryUploadTimeoutSec`**
+  (default **5400 s**), checked *between* candidates and never mid-transfer - so the first
+  candidate is always attempted in full - and a candidate the budget never reached is reported
+  `NOT RECOVERED` with "rclone was NEVER RUN for it" as the stated reason. That distinction is
+  the point: "we ran out of time before trying" is a different fact from "rclone tried and
+  failed", and only the disposition line tells the operator which one happened.
 
 All of this runs inside `Invoke-TopazOutputAnomalyHandling` (renamed from
 `Invoke-TopazEmptyOutputDirHandling`), which `Invoke-TopazRenderUpload` calls unconditionally on
@@ -297,15 +311,37 @@ stream**:
   `DryRun`. ("Suppressed on purpose" is not a failure, and conflating it with a
   refusal would break the watchdog's own `DryRun` re-arm path.)
 
-`Watchdog.ps1` tests that value with `$stopResult -eq $false` to decide whether
-to re-arm and retry. That is the retry loop keeping an un-uploaded render alive,
-so two properties are non-negotiable and are now pinned by
+`Watchdog.ps1` does **not** test that value with `$stopResult -eq $false`. It
+passes the raw return to `Resolve-StopSequenceResult` (`Watchdog.ps1`), a pure
+classifier that fails closed and yields one of three outcomes:
+
+- **`'stopped'`** - the return was *exactly one* `[bool]` `$true`.
+- **`'refused'`** - the return was *exactly one* `[bool]` `$false`.
+- **`'untrustworthy'`** - every other shape: no value at all, several values, a
+  non-boolean, or one boolean travelling alongside stray output.
+
+The caller treats **both `'refused'` and `'untrustworthy'` as a refusal** - stay
+up, re-arm, retry - because a wrongly-refused stop costs money while a
+wrongly-trusted one costs the render. The strictness is the point: against a
+*collection*, PowerShell's `-eq` is a filter rather than a comparison, so the
+old inline test could have swallowed a refusal inside a contaminated return and
+stopped the box anyway. Its own doc comment records that this class of bug has
+already happened here once.
+
+That retry loop is what keeps an un-uploaded render alive, so two properties are
+non-negotiable and are now pinned by
 [`in-guest/tests/Stop-Sequence.Tests.ps1`](../in-guest/tests/Stop-Sequence.Tests.ps1):
 **exactly one object** is emitted (this is why `Write-TopazLog` writes to the
 Information/Warning/Error streams and never to output - see its comment in
-`Config.ps1`), and the watchdog's call path must never `exit`, because `exit`
-makes the `& <script>` expression yield `$null`, and `$null -eq $false` is
-false, so the re-arm block would simply be skipped.
+`Config.ps1`), and the watchdog's call path must never `exit`. Note that the
+classifier changed the *cost* of breaking that second rule, not its importance:
+an `exit` makes the `& <script>` expression yield `$null`, which now classifies
+as `'untrustworthy'` and therefore **re-arms**. So the failure mode is no longer
+a silently skipped retry - it is an endless refusal loop for a stop that
+actually happened, i.e. a box that keeps billing because nothing can ever
+confirm it should go down. See
+[Phase 2 §The three pre-stop refusals](04-phase2-watchdog.md#the-three-pre-stop-refusals-and-the-retry-loop-they-create)
+for the watchdog-side view of the same seam.
 
 ### `-ExitCodeOnRefusal`, for the scheduled-task caller only
 

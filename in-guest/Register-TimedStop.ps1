@@ -184,7 +184,9 @@ $fireAt = (Get-Date).AddHours($Hours)
 # LastTaskResult=0 -- success -- for a backstop that had refused to stop the
 # box and would keep refusing. The switch makes THIS invocation translate the
 # refusal into exit 2 while leaving Watchdog.ps1's `& <script>` call returning
-# a bare $false, which is the value its re-arm branch tests with `-eq $false`.
+# a bare $false, which is what its Resolve-StopSequenceResult classifier needs:
+# it only trusts a return that is exactly one [bool], so anything else -- an
+# exit-induced $null included -- is 'untrustworthy' and re-arms.
 $action = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
     -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}`" -Reason maxlifetime -IgnoreDryRun -ExitCodeOnRefusal" -f $stopScript)

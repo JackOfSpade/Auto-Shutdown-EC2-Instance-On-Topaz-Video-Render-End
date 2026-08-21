@@ -80,9 +80,13 @@ run for the merge commit it pushes (GitHub raises no workflow events for a
   are run by the operator from a Mac, where `/bin/bash` is still 3.2, and there
   the construct is not a no-op but a fatal `bad substitution` parse error;
   shellcheck does not flag it by default, so nothing else in the pipeline would
-  catch it. Use `tr '[:lower:]' '[:upper:]'` instead. The grep matches the
-  syntax inside comments too, so keep prose about the rule in `docs/` (as here)
-  rather than in the scripts themselves.
+  catch it. Use `tr '[:lower:]' '[:upper:]'` instead. Whole-line `#` comments are
+  filtered out of the matches **on purpose**, so a fix site can keep a rationale
+  comment naming the expansion it replaced right where the temptation to regress
+  lives (see [`control-plane/00-verify-prerequisites.sh`](../control-plane/00-verify-prerequisites.sh));
+  a lint that forbids explaining itself would push that rationale out of the
+  scripts. An expansion in *code* still fails, including when a trailing comment
+  follows it on the same line.
 - **IAM policy JSON validation** - `control-plane/iam/*.json` is handed verbatim
   to AWS by `02-create-iam-role.sh`, `04-deploy-max-lifetime-lambda.sh` and
   `05-grant-audit-reads.sh` via `file://`, and nothing else in the pipeline
@@ -91,6 +95,13 @@ run for the merge commit it pushes (GitHub raises no workflow events for a
   the instance, zipped the code and created the role. `python3`'s `json.load` is
   used rather than `jq empty` because it accepts exactly one document, where
   `jq` would accept a stream of two concatenated objects that AWS still rejects.
+- **Executable-bit assertion** - every operator-run `control-plane/[0-9]*.sh` and
+  `tests/test_*.sh` must carry its exec bit, because the runbooks invoke them as
+  `./control-plane/NN-*.sh`. Git tracks the bit through clone and checkout, so a
+  script committed `644` dies with "permission denied" at the *first* command of
+  a deployment while CI stays green - CI always ran them as `bash <file>`. Two of
+  the six numbered scripts were committed `644` exactly that way (fixed
+  2026-08-21). The check names each offender and prints the `chmod +x` fix.
 - **`actionlint`** (pinned Docker tag, not `:latest`, so an unrelated actionlint
   release can't silently turn this job red) statically checks the workflow YAML
   under `.github/workflows/` **and** shells out to `shellcheck` on every
@@ -154,6 +165,19 @@ run for the merge commit it pushes (GitHub raises no workflow events for a
   defines its functions, because a top-level guard skips the file's
   Windows-only wait-for-Topaz/monitoring loop whenever it is dot-sourced
   rather than run directly.
+  [`in-guest/tests/Stop-Sequence.Tests.ps1`](../in-guest/tests/Stop-Sequence.Tests.ps1)
+  pins the stop contract itself: that `Stop-Sequence.ps1` emits **exactly one
+  boolean** and nothing else on the output stream (the property
+  `Resolve-StopSequenceResult` in the watchdog refuses to trust anything but -
+  see [Phase 3](05-phase3-stop-sequence.md)), that the watchdog's call path never
+  `exit`s, the ordering of the ephemeral safety gate against the `DryRun` guard,
+  and `-ExitCodeOnRefusal`.
+  [`in-guest/tests/Test-Deployment.Tests.ps1`](../in-guest/tests/Test-Deployment.Tests.ps1)
+  covers the preflight's two destruction-relevant predicates. Both of those load
+  their target through the **`-LibraryOnly`** dot-source seam - the same idea as
+  the Watchdog suite's top-level guard, made an explicit switch: the file defines
+  its functions without loading config, touching IMDS, printing a verdict or
+  attempting a stop.
 - **`ruff`** lints the Lambda handler in
   [`lambda/max-lifetime-stop/`](../lambda/max-lifetime-stop/). CI installs the
   committed `requirements-dev.txt`, which pins its reviewed Python test and
@@ -287,14 +311,25 @@ unlisted gap eventually gets mistaken for coverage.
   PowerShell 7. `PSUseCompatibleSyntax` remains the 5.1 gate, and it is the
   cheaper one anyway, since it covers every in-guest script rather than only the
   code the tests reach.
-- **The control-plane deploy scripts are lint-only, with one exception.** Only
-  `04-deploy-max-lifetime-lambda.sh` is executed by a test (against the fake-AWS
-  fixtures). `00`, `01`, `02`, `03` and `05` get `shellcheck` and the bash-3.2
-  grep and nothing more, so the *shape* of the AWS calls they make is unverified
-  - including `03-create-idle-alarm.sh`, which provisions the CloudWatch alarm
-  that can stop the instance from outside the guest entirely, where a wrong
-  `--period` / `--evaluation-periods` / `--threshold` produces a stop that
-  bypasses every in-guest refusal. The fixture harness to close this already
-  exists and is proven; a new `tests/test_*.sh` is picked up by CI automatically.
+- **Two control-plane deploy scripts are still lint-only.** `00`, `02`, `03` and
+  `04` are each executed by a `tests/test_*.sh` suite against the fake-AWS
+  fixtures ([`test_verify_prerequisites.sh`](../tests/test_verify_prerequisites.sh),
+  [`test_create_iam_role.sh`](../tests/test_create_iam_role.sh),
+  [`test_create_idle_alarm.sh`](../tests/test_create_idle_alarm.sh),
+  [`test_deploy_max_lifetime_scheduler.sh`](../tests/test_deploy_max_lifetime_scheduler.sh)).
+  `01-set-shutdown-behavior.sh` and `05-grant-audit-reads.sh` get `shellcheck`,
+  the bash-3.2 grep and the exec-bit assertion and nothing more, so the *shape*
+  of the AWS calls those two make is unverified. The fixture harness to close it
+  exists and is proven - a new `tests/test_*.sh` is picked up by CI
+  automatically - so this is a small, well-understood remaining hole rather than
+  an open question about how.
+
+  For the record of what closing it bought: `03-create-idle-alarm.sh` provisions
+  the CloudWatch alarm that can stop the instance from outside the guest
+  entirely, where a wrong `--period` / `--evaluation-periods` / `--threshold`
+  produces a stop that bypasses every in-guest refusal. `test_create_idle_alarm.sh`
+  now pins exactly that: the `ENABLE_IDLE_ALARM` opt-in gate, the
+  statistic/threshold pairing, `ActionsEnabled` preservation across a re-run, and
+  the teardown path.
 
 Back to the [README](../README.md).

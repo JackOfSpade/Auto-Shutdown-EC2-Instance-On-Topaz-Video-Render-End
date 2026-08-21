@@ -145,11 +145,18 @@ available.
 │   ├── Push-GpuMetric.ps1        <- publishes RenderActive (1/0, the alarm's
 │   │                                 default signal) + GPU% (telemetry) to
 │   │                                 CloudWatch every minute
+│   ├── Initialize-ScratchDisk.ps1  <- formats the instance-store NVMe and re-creates
+│   │                                   OutputDir at every boot (it comes back RAW after
+│   │                                   every stop); runs as its own SYSTEM task
 │   ├── Install.ps1               <- copies scripts into C:\topaz-autostop
-│   ├── Register-ScheduledTasks.ps1  <- registers the two SYSTEM scheduled tasks
-│   ├── Register-TimedStop.ps1    <- optional one-shot wall-clock cost backstop
+│   ├── Register-ScheduledTasks.ps1  <- registers the three SYSTEM scheduled tasks
+│   ├── Register-TimedStop.ps1    <- optional wall-clock cost backstop (repeating
+│   │                                 trigger; honors the upload interlock, so a
+│   │                                 refused stop is retried rather than dropped)
+│   ├── Set-GoogleDriveAuth.ps1   <- one-time rclone/Google Drive credential setup
 │   ├── Test-Deployment.ps1       <- preflight GO/NO-GO doctor (run before arming)
-│   └── tests/                    <- Pester unit tests (Config.ps1 + Watchdog.ps1 pure helpers)
+│   └── tests/                    <- Pester unit tests (Config.ps1 + Watchdog.ps1 pure helpers,
+│                                     Stop-Sequence.ps1 + Test-Deployment.ps1 via -LibraryOnly)
 ├── control-plane/                <- runs from an admin workstation (AWS CLI v2)
 │   ├── 00-verify-prerequisites.sh    <- read-only prerequisite verifier
 │   ├── 01-set-shutdown-behavior.sh   <- set InstanceInitiatedShutdownBehavior=stop
@@ -178,8 +185,10 @@ available.
 ├── scripts/
 │   └── auto_merge_decision.sh    <- sourceable CI-gate predicates for auto-merge-claude.yml
 ├── tests/
-│   ├── test_auto_merge_logic.sh  <- tests for scripts/auto_merge_decision.sh
-│   └── test_control_plane_validation.sh  <- tests for control-plane/lib/*.sh
+│   ├── test_*.sh                 <- glob-discovered bash suites (control-plane deploy
+│   │                                 scripts + lib predicates + auto-merge decisions)
+│   └── fixtures/                 <- fake `aws`/`zip`/`sleep` stand-ins the suites drive
+│                                     the deploy scripts against (no AWS, no network)
 ├── .github/workflows/
 │   ├── ci.yml                    <- shellcheck/actionlint + PSScriptAnalyzer/Pester + ruff/pytest
 │   └── auto-merge-claude.yml     <- auto-merges CI-green branches into main
@@ -217,7 +226,7 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    ```powershell
    .\in-guest\Install.ps1                    # copies scripts into C:\topaz-autostop
    # from an ELEVATED PowerShell:
-   .\in-guest\Register-ScheduledTasks.ps1    # registers the two SYSTEM tasks
+   .\in-guest\Register-ScheduledTasks.ps1    # registers the three SYSTEM tasks
    ```
    See [docs/04-phase2-watchdog.md](docs/04-phase2-watchdog.md) and
    [docs/05-phase3-stop-sequence.md](docs/05-phase3-stop-sequence.md).
@@ -230,8 +239,20 @@ environment. In-guest scripts run in PowerShell 5.1 on the EC2 box.
    Tags the instance `AutoStopEligible=true` (required for the Lambda's
    tag-scoped stop permission to actually work), then deploys a **per-instance**
    function (`topaz-max-lifetime-stop-<instance-id>`) and schedule
-   (`topaz-max-lifetime-schedule-<instance-id>`). See
-   [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
+   (`topaz-max-lifetime-schedule-<instance-id>`).
+
+   > **DANGER: a Lambda stop bypasses `Stop-Sequence.ps1` entirely** - no
+   > upload, no verification, no ephemeral-upload interlock. A finished but
+   > un-uploaded render on the instance-store volume is **destroyed** with the
+   > stop. Prefer [`in-guest/Register-TimedStop.ps1`](in-guest/Register-TimedStop.ps1)
+   > whenever the guest is reachable: it is the wall-clock cap that *honors* the
+   > interlock, refusing and retrying instead of erasing. Full warnings in
+   > [docs/06 §DANGER](docs/06-phase4-safety-net.md#danger-a-lambda-stop-bypasses-stop-sequenceps1-and-can-destroy-a-finished-render),
+   > [`lambda/max-lifetime-stop/README.md`](lambda/max-lifetime-stop/README.md)
+   > and the incident this rule came from,
+   > [docs/16](docs/16-render-loss-incident.md).
+
+   See [docs/06-phase4-safety-net.md](docs/06-phase4-safety-net.md).
 
 That is the entire deployment sequence. **There is no numbered step for the
 CloudWatch idle alarm any more** - see the callout immediately below for why,
@@ -300,7 +321,11 @@ and how to opt into it anyway if you have a specific reason to.
 > CloudWatch idle alarm or deployed the optional max-lifetime Lambda (step 3
 > and its callout above), know that both are separate control-plane resources
 > that are **not** gated by `DryRun` and would really stop the box if the GPU
-> goes idle during your test, even while `DryRun` is on. Neither is armed by
+> goes idle during your test, even while `DryRun` is on. And `DryRun` is the
+> *weaker* half of what they miss: neither is gated by the **ephemeral-upload
+> interlock** either, so their stop can destroy a finished-but-unuploaded render
+> rather than merely surprise you with a powered-off box - see the DANGER note
+> on step 3. Neither is armed by
 > default for this project (see
 > [docs/09-appendix-b-boundaries.md §5](docs/09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)),
 > so this caveat only applies if you deliberately enabled one. See
@@ -337,22 +362,45 @@ deploy it. See [docs/09-appendix-b-boundaries.md](docs/09-appendix-b-boundaries.
 
 ## Testing & CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push/PR:
-`shellcheck` on `control-plane/*.sh`, `control-plane/lib/*.sh`, `scripts/*.sh`,
-and `tests/*.sh`;
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) defines the gates below.
+**GitHub Actions is currently disabled for this repo** - a green checkmark will
+not appear on a push or PR; the gates execute locally via `act` from a
+machine-local pre-push hook that a clone on another machine does not have. Read
+[docs/10 §Where CI actually runs](docs/10-testing-and-ci.md#where-ci-actually-runs-today)
+before relying on a green push from somewhere else.
+
+The gates: `shellcheck` on **every `*.sh` in the tree**, discovered by `find`
+rather than hand-globbed - fixtures included, because
+[`tests/fixtures/`](tests/fixtures/) is what decides which branch of a deploy
+script a test actually exercises;
+a **bash-3.2 lint** that fails the build on the bash-4-only `${var^^}` /
+`${var,,}` expansions, which are a fatal parse error on the macOS `/bin/bash`
+the operator runs these from;
+an **executable-bit assertion** over the operator-run scripts, since the
+runbooks invoke them as `./control-plane/NN-*.sh`;
+**IAM policy JSON validation** of `control-plane/iam/*.json`, the documents
+handed verbatim to AWS mid-deploy;
 `actionlint` (pinned Docker tag) on the workflow YAML, which also lints the
-bash embedded directly in workflow `run:` steps; the
-[`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) suite for
-the auto-merge-to-main decision logic in
-[`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh);
-[`tests/test_control_plane_validation.sh`](tests/test_control_plane_validation.sh)
-for the shared predicates in `control-plane/lib/*.sh`;
+bash embedded directly in workflow `run:` steps;
+**every `tests/test_*.sh` suite** - discovered, not listed, so a new one is
+gated the moment it lands (currently six: the auto-merge decision logic in
+[`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh), the shared
+predicates in `control-plane/lib/*.sh`, and the `00`/`02`/`03`/`04` deploy
+scripts against the fake-AWS fixtures);
 PSScriptAnalyzer + Pester on `in-guest/` (including the
-[`in-guest/tests/`](in-guest/tests/) suite for the `Resolve-RenderActive`
-completion-decision helper and `Watchdog.ps1`'s own pure helpers;
+[`in-guest/tests/`](in-guest/tests/) suites for the `Resolve-RenderActive`
+completion-decision helper, `Watchdog.ps1`'s own pure helpers, the
+`Stop-Sequence.ps1` return contract and `Test-Deployment.ps1`'s
+destruction-relevant predicates;
 PSScriptAnalyzer fails the build on any
 Error/ParseError, and on a Warning too unless its rule is explicitly
-allowlisted in `ci.yml`); and `ruff` + `pytest` on
+allowlisted in `ci.yml`);
+**`PSUseCompatibleSyntax` at `TargetVersions = 5.1, 7.0`** over `in-guest/`,
+which is the *only* automated check that those scripts still parse on the
+Windows PowerShell 5.1 the EC2 guest actually runs - everything else here is
+pwsh 7, so a PS7-only construct passes every other gate and then takes down
+`Config.ps1` on the box that matters;
+and `ruff` + `pytest` on
 [`lambda/max-lifetime-stop/`](lambda/max-lifetime-stop/). Run the Lambda tests
 locally with:
 

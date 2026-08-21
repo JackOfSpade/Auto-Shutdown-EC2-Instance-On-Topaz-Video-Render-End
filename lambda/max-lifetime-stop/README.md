@@ -165,7 +165,10 @@ detection is the only armed stop path**:
   `control-plane/03-create-idle-alarm.sh` refuses to create or update anything
   without `ENABLE_IDLE_ALARM=1`, and the alarm that previously existed for this
   instance was deleted;
-- the one-shot in-guest wall-clock timed stop was removed (2026-07-27);
+- the in-guest wall-clock timed stop was removed (2026-07-27) - as a one-shot
+  task, which is what it then was; `Register-TimedStop.ps1` now arms a
+  **repeating** trigger (see below), so re-arming it today is not re-arming the
+  same thing;
 - and this Lambda is **not deployed**.
 
 See the banner at the top of

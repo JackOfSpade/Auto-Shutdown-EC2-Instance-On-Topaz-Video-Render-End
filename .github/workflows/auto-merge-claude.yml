@@ -3,7 +3,9 @@ name: Auto-merge branches to main
 # Merges one branch (any prefix — claude/*, jack/*, etc.) into main automatically
 # only after both that branch and the exact current main commit have green CI. Each
 # successful merge waits for CI on its resulting main commit before another branch
-# can land, so CI always validates the actual main history.
+# can land, so CI always validates the actual main history — and this workflow
+# DISPATCHES that validation run itself after pushing (see the push step: a
+# GITHUB_TOKEN push creates no workflow run, so waiting for one would deadlock).
 #
 # Why trigger on `workflow_run` (CI completed) instead of `push`:
 #   Triggering when the "CI" workflow completes means (a) every drain happens with a
@@ -15,6 +17,13 @@ name: Auto-merge branches to main
 # repository's DEFAULT branch (main). So the very first branch must be merged into main
 # manually (one PR) to bootstrap main with this workflow + CI; every branch after that
 # is drained automatically once its CI is green.
+#
+# NOTE: GitHub Actions is currently DISABLED on this repository (the last cloud runs were
+# 2026-08-10), so nothing here executes today — local `act` + the pre-push hook are what
+# actually gate changes. This file is still maintained as correct-when-re-enabled: read
+# every change below as "what happens the day Actions is switched back on", which is also
+# why the GITHUB_TOKEN no-recursion trap at the push step is worth fixing now rather than
+# rediscovering it as a dead drain later.
 
 on:
   workflow_run:
@@ -26,7 +35,8 @@ permissions:
   contents: write            # push merges to main, delete merged branches
   pull-requests: write       # the conflict fallback opens a PR
   actions: write             # read: the CI-gate reads workflow runs via the Actions API;
-                             # write: the one-shot retry below calls `gh run rerun --failed`.
+                             # write: the one-shot retry calls `gh run rerun --failed`, and the
+                             # post-push step calls `gh workflow run ci.yml` (workflow_dispatch).
 
 concurrency:
   group: auto-merge-main
@@ -77,6 +87,13 @@ jobs:
           # into) and the origin/HEAD symbolic ref (not a real branch).
           merged_branches=""
           merged_count=0
+          # CI-green candidates that did NOT land (conflict, or a non-conflict merge failure).
+          # Tracked separately from merged_branches so the end-of-run summary can tell "nothing was
+          # eligible" apart from "everything was eligible and nothing could be merged" — the latter
+          # is the outcome an operator most needs to notice, because the drain is then blocked on
+          # human conflict resolution. Initialised here so `set -u` can't bite when the loop body
+          # never runs.
+          unmerged_branches=""
           for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v -E '^origin/(main|HEAD)$' || true); do
             br="${ref#origin/}"
 
@@ -86,13 +103,18 @@ jobs:
               continue
             fi
 
-            # A new branch can land only once per cycle. Already-contained
-            # branches above are cleanup only and can still be batched safely.
-            if ! can_merge_next_branch "$main_ci_conclusion" "$merged_count"; then
-              continue
-            fi
-
             # --- candidate CI gate ---------------------------------------------------
+            # ORDERING: this gate (and the one-shot rerun inside it) deliberately runs BEFORE the
+            # one-merge-per-cycle eligibility check further down. The rerun changes no content and
+            # cannot create an untested combined main, so there is no safety reason to defer it
+            # until a cycle in which nothing has merged yet; gating it behind the merge rule meant
+            # that as soon as one branch landed, a second branch sitting on a transient first-attempt
+            # failure waited at least a full cycle for the retry that exists to rescue it. Do not
+            # "restore" the old order. The cost is one `gh api` call per candidate branch per cycle
+            # instead of stopping after the first merge — fine at this repo's branch count; if the
+            # branch list ever grows large, gate the extra calls on the branch being red rather than
+            # moving this block back below the merge guard.
+            #
             # Only merge a branch whose EXACT tip commit has a successful CI run. We
             # query the "CI" workflow runs for that precise SHA, so a commit pushed
             # after CI passed (new tip, no green run yet) is skipped until its own CI
@@ -130,19 +152,53 @@ jobs:
               continue
             fi
 
+            # A new branch can land only once per cycle: a merge changes main, so a second branch
+            # must wait for CI on that NEW main SHA (otherwise individually green branches form an
+            # untested combined main). Already-contained branches above are cleanup only and can
+            # still be batched safely. This check stays the LAST statement before the merge, and
+            # directly adjacent to it, so no future reordering can put a `git merge` on the wrong
+            # side of it.
+            if ! can_merge_next_branch "$main_ci_conclusion" "$merged_count"; then
+              continue
+            fi
+
             # Fast-forward if possible, else a merge commit.
             if git merge --ff-only "$ref" || git merge --no-ff "$ref" -m "Auto-merge $br into main"; then
               merged_branches="$merged_branches $br"
               merged_count=$((merged_count + 1))
               # Subsequent passes through this loop can collect already-contained
-              # branches for safe cleanup, but can_merge_next_branch now blocks
-              # every other candidate until CI validates the new main SHA.
+              # branches for safe cleanup and can still query/re-run a red candidate's
+              # CI (the gate above), but can_merge_next_branch now blocks every other
+              # candidate from MERGING until CI validates the new main SHA.
               continue
             else
+              # CLASSIFY BEFORE FALLING BACK. `if A || B` routes EVERY non-zero exit of the --no-ff
+              # merge here, not just a content conflict: "refusing to merge unrelated histories" (an
+              # orphan branch pushed to origin is a candidate like any other), "your local changes
+              # would be overwritten", "not something we can merge", or a transient object-store
+              # error all land in exactly the same place. A genuine conflict writes MERGE_HEAD before
+              # failing; those other failures never start a merge at all — so MERGE_HEAD is the
+              # evidence that separates them, and it must be read BEFORE the abort erases it.
+              # (`git merge --ff-only` refusing to fast-forward also leaves no MERGE_HEAD, but that
+              # path always falls through to --no-ff, so it never reaches this classifier.)
+              had_conflict=0
+              if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                had_conflict=1
+              fi
               git merge --abort || true
               if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
                 echo "::error::merge abort failed for $br — repo still mid-merge (MERGE_HEAD present); stopping the drain now to avoid cascading false conflicts on subsequent branches in this loop." >&2
                 exit 1
+              fi
+              unmerged_branches="$unmerged_branches $br"
+              if [ "$had_conflict" -eq 0 ]; then
+                # A `continue`, never an `exit 1`: one branch that git refuses to merge for a
+                # non-conflict reason must not halt the drain for the rest of the queue. And no PR —
+                # a PR titled "Auto-merge conflict: $br" for a failure that is not a conflict sends a
+                # human to resolve something that does not exist, and it persists across runs because
+                # `gh pr create` then just reports "PR already exists".
+                echo "::warning::merging $br failed WITHOUT starting a merge (not a content conflict) — not opening a conflict PR; see the git output above."
+                continue
               fi
               echo "::warning::Unresolved conflict merging $br."
               # --head="$br" (equals form): keeps the flag and its value as a single argv
@@ -158,13 +214,42 @@ jobs:
           done
 
           if [ -z "${merged_branches// }" ]; then
-            echo "No CI-green branches to merge."
+            if [ -n "${unmerged_branches// }" ]; then
+              # Distinct from "nothing was eligible": every green candidate was tried and none
+              # landed, so the drain is now blocked on a human. Saying "No CI-green branches to
+              # merge." here would report the exact opposite of what happened, and the per-branch
+              # warnings above scroll off well before an operator reads the run summary.
+              echo "::warning::No branch merged this cycle — every CI-green candidate failed to merge:${unmerged_branches}. Unresolved conflicts have an auto-opened PR (see the per-branch warnings above); the drain stays blocked until they are resolved."
+            else
+              echo "No CI-green branches to merge."
+            fi
             exit 0
           fi
 
           if ! git push origin main; then
             echo "::warning::push to main failed; branches left intact for the next run."
             exit 0
+          fi
+
+          # DISPATCH CI FOR THE NEW MAIN. A push authenticated with GITHUB_TOKEN (which is what
+          # actions/checkout persists) creates NO workflow runs — GitHub's no-recursion rule, whose
+          # only documented exceptions are workflow_dispatch and repository_dispatch. So the push
+          # above does NOT fire ci.yml's `on: push`, and when the merge was a merge commit (the
+          # normal case once two branches are in flight) that brand-new main SHA carries zero CI
+          # runs. The MAIN GATE at the top of this step would then read "none" for it forever:
+          # no merge could ever happen again, and re-running this workflow by hand re-tests the same
+          # run-less SHA. Dispatching by ref creates a real run whose head_sha IS main's tip, which
+          # is exactly what ci_runs_api_path/ci_conclusion_from_json query.
+          # REQUIRES `workflow_dispatch:` on ci.yml's `on:` block — without it this call fails and
+          # the drain parks (see the warning) instead of proceeding, so the two must stay together.
+          # Only when a branch actually landed: a cleanup-only cycle leaves main's SHA unchanged and
+          # already has its own green run, so a dispatch there would burn a CI run for nothing.
+          # Warned-and-ignored on failure, never fatal: a missed dispatch degrades to the old
+          # behaviour (the drain waits for the next human push), which is the safe direction — it
+          # can park a merge but can never cause a wrong one.
+          if [ "$merged_count" -gt 0 ]; then
+            gh workflow run ci.yml --ref main \
+              || echo "::warning::could not dispatch CI for the new main; the next human push unblocks the drain."
           fi
 
           # Delete each merged branch ONLY after re-confirming its current remote tip is

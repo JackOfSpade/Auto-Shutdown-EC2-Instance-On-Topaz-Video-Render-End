@@ -161,6 +161,16 @@ source "${SCRIPT_DIR}/lib/validation.sh"
 AUDIT_POLICY="${IAM_DIR}/audit-read-optional-policy.json"
 [[ -f "$AUDIT_POLICY" ]] || { echo "ERROR: required policy file not found: $AUDIT_POLICY" >&2; exit 1; }
 
+# Shape-check INSTANCE_ID like every other script here. This one only READS the
+# instance (to discover its role), but a stale `export INSTANCE_ID=` would
+# discover a DIFFERENT box's role and then widen THAT role's privilege -- see
+# lib/validation.sh's is_valid_instance_id. Checked even when ROLE_NAME is set
+# explicitly, so the two never disagree about which box this run is about.
+is_valid_instance_id "$INSTANCE_ID" || {
+  echo "ERROR: INSTANCE_ID='${INSTANCE_ID}' is not a valid EC2 instance id (expected i- followed by 8 or 17 hex digits)." >&2
+  usage
+}
+
 # ---------------------------------------------------------------------------
 # [1/5] Resolve ROLE_NAME
 # ---------------------------------------------------------------------------

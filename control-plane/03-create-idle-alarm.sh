@@ -192,13 +192,35 @@ EOF
 
 [[ -n "${INSTANCE_ID:-}" ]] || { echo "ERROR: INSTANCE_ID is not set." >&2; usage; }
 [[ -n "${AWS_REGION:-}"  ]] || { echo "ERROR: AWS_REGION is not set."  >&2; usage; }
+# Shape-check INSTANCE_ID before anything else: it is baked into the alarm NAME
+# and into the alarm's InstanceId dimension, so a stale `export INSTANCE_ID=`
+# would arm (or tear down) a stop action keyed to the wrong box. See
+# lib/validation.sh's is_valid_instance_id.
+is_valid_instance_id "$INSTANCE_ID" || {
+  echo "ERROR: INSTANCE_ID='${INSTANCE_ID}' is not a valid EC2 instance id (expected i- followed by 8 or 17 hex digits)." >&2
+  usage
+}
 
 # WHY per-instance name: put-metric-alarm OVERWRITES any existing alarm that
 # has the same --alarm-name. A hardcoded shared name meant provisioning a
 # SECOND instance silently repointed (and thereby disabled) the first box's
 # safety net. Keying the name on INSTANCE_ID gives every instance its own
 # alarm. Computed unconditionally (both the teardown and create paths need it).
+#
+# WHY the name still says "gpu" when the DEFAULT signal is RenderActive: the
+# name predates the 2026-07-28 re-key from GPUUtilization to RenderActive and
+# is kept deliberately, so alarms created by earlier runs and
+# 00-verify-prerequisites.sh's own ALARM_NAME literal keep matching. Renaming
+# it would orphan existing alarms and silently point 00's [5/6] check at a name
+# nothing creates. The "gpu" in the name therefore does NOT mean the alarm is
+# GPU-keyed -- IDLE_SIGNAL (default "render") decides that, and a post-mortem
+# reading this name off CloudTrail must check IDLE_SIGNAL/the alarm's
+# MetricName rather than assume a GPU threshold stopped the box.
 ALARM_NAME="topaz-gpu-idle-autostop-${INSTANCE_ID}"
+# The pre-2026-07-28 shared (non-per-instance) name. Only ever probed and
+# reported on, never blind-deleted: its InstanceId dimension may point at a
+# DIFFERENT box in this account.
+LEGACY_ALARM_NAME="topaz-gpu-idle-autostop"
 
 # ---------------------------------------------------------------------------
 # TEARDOWN=1: remove this instance's alarm and exit. Always allowed -- tearing
@@ -210,13 +232,50 @@ ALARM_NAME="topaz-gpu-idle-autostop-${INSTANCE_ID}"
 TEARDOWN="${TEARDOWN:-0}"
 if [[ "$TEARDOWN" == "1" ]]; then
   echo "==> TEARDOWN=1: deleting idle-stop alarm '${ALARM_NAME}' (if it exists)"
-  echo "    aws cloudwatch delete-alarms --region ${AWS_REGION} --alarm-names ${ALARM_NAME}"
+  # WHY the legacy name is probed here and not only on the create path: the
+  # create path already warns about the pre-rename shared alarm, but TEARDOWN
+  # is the command an operator runs precisely to guarantee that NOTHING can
+  # idle-stop this box. Saying "Done" while a legacy 'topaz-gpu-idle-autostop'
+  # still carries dimension InstanceId=<this box> with actions enabled would
+  # leave exactly the sub-5%-GPU stop action that came within five minutes of
+  # false-stopping a healthy render on 2026-07-27 (docs/15) armed and
+  # unmentioned. Probe first, so this box's own orphan can go in the SAME
+  # delete-alarms call.
+  #
+  # shellcheck disable=SC2016 # single-quoted on purpose: this is JMESPath --
+  # the backticked `InstanceId` is a --query string literal, not a bash command
+  # substitution, so it must NOT be double-quoted/interpolated. Same reasoning
+  # as 05-grant-audit-reads.sh's own JMESPath disable.
+  LEGACY_LINE="$(aws cloudwatch describe-alarms \
+    --region "$AWS_REGION" \
+    --alarm-names "$LEGACY_ALARM_NAME" \
+    --query 'MetricAlarms[0].[Dimensions[?Name==`InstanceId`].Value | [0], ActionsEnabled]' \
+    --output text 2>/dev/null || true)"
+  LEGACY_INSTANCE="$(printf '%s' "$LEGACY_LINE" | cut -f1)"
+  LEGACY_ACTIONS="$(printf '%s' "$LEGACY_LINE" | cut -f2)"
+
+  DELETE_NAMES=("$ALARM_NAME")
+  if [[ "$LEGACY_INSTANCE" == "$INSTANCE_ID" ]]; then
+    echo "    NOTE: the pre-2026-07-28 shared-name alarm '${LEGACY_ALARM_NAME}' exists and"
+    echo "          targets THIS instance (actions enabled: ${LEGACY_ACTIONS:-unknown}). It is"
+    echo "          unambiguously this box's orphan, so it is deleted in the same call."
+    DELETE_NAMES+=("$LEGACY_ALARM_NAME")
+  elif [[ -n "$LEGACY_INSTANCE" && "$LEGACY_INSTANCE" != "None" ]]; then
+    echo "    WARNING: the pre-2026-07-28 shared-name alarm '${LEGACY_ALARM_NAME}' also exists,"
+    echo "             but its InstanceId dimension is '${LEGACY_INSTANCE}', NOT ${INSTANCE_ID}"
+    echo "             (actions enabled: ${LEGACY_ACTIONS:-unknown}). It is NOT deleted here --"
+    echo "             it may be another box's live safety net. If it is not, remove it with:"
+    echo "               aws cloudwatch delete-alarms --region ${AWS_REGION} --alarm-names ${LEGACY_ALARM_NAME}"
+  fi
+
+  echo "    aws cloudwatch delete-alarms --region ${AWS_REGION} --alarm-names ${DELETE_NAMES[*]}"
   # delete-alarms is idempotent by design -- CloudWatch does not error when
   # asked to delete an alarm name that does not exist, so no non-existence
   # check/branch is needed here.
-  aws cloudwatch delete-alarms --region "$AWS_REGION" --alarm-names "$ALARM_NAME"
-  echo "==> Done. '${ALARM_NAME}' does not exist (delete-alarms is idempotent --"
-  echo "    it was either just removed, or never existed in the first place)."
+  aws cloudwatch delete-alarms --region "$AWS_REGION" --alarm-names "${DELETE_NAMES[@]}"
+  echo "==> Done. These alarm name(s) no longer exist: ${DELETE_NAMES[*]}"
+  echo "    (delete-alarms is idempotent -- each was either just removed, or never"
+  echo "    existed in the first place.)"
   exit 0
 fi
 
@@ -344,6 +403,44 @@ if [[ "$IDLE_SIGNAL" == 'gpu' ]]; then
   echo ""
 fi
 
+# WHY ActionsEnabled is read first and always passed explicitly: PutMetricAlarm
+# on an existing name is a FULL REPLACE (that overwrite semantics is what the
+# per-instance-name comment above relies on), and the API defaults
+# ActionsEnabled to TRUE when the flag is omitted. Omitting it therefore
+# silently CANCELS a deliberate pause -- and this script's own closing advice
+# is to pause the actions before a long pre-render setup and to re-run with a
+# larger IDLE_MINUTES for exactly that situation. An operator doing both would
+# have re-armed the stop action on a box sitting at RenderActive=0 during
+# setup: the false-stop class the .DECISION block exists for.
+#
+# The read is guarded with `|| true` because it must never turn a working
+# create run into a failure: under `set -euo pipefail`, a denied or throttled
+# DescribeAlarms would otherwise abort the script outright, a brand-new failure
+# mode. Unreadable/absent -> behave exactly as before (actions enabled).
+PRIOR_ACTIONS_ENABLED="$(aws cloudwatch describe-alarms \
+  --region "$AWS_REGION" \
+  --alarm-names "$ALARM_NAME" \
+  --query 'MetricAlarms[0].ActionsEnabled' \
+  --output text 2>/dev/null || true)"
+
+ACTIONS_ENABLED_FLAG="--actions-enabled"
+if [[ "$PRIOR_ACTIONS_ENABLED" == "False" ]]; then
+  ACTIONS_ENABLED_FLAG="--no-actions-enabled"
+  echo ""
+  echo "    NOTE: '${ALARM_NAME}' already exists with its actions DISABLED (paused)."
+  echo "          Preserving that pause -- this update does NOT re-arm the stop action."
+  echo "          Resume it deliberately when you are ready:"
+  echo "            aws cloudwatch enable-alarm-actions --region ${AWS_REGION} --alarm-names ${ALARM_NAME}"
+  echo ""
+elif [[ -z "$PRIOR_ACTIONS_ENABLED" ]]; then
+  echo ""
+  echo "    WARNING: could not read '${ALARM_NAME}''s current ActionsEnabled state"
+  echo "             (describe-alarms failed or was denied). Proceeding with actions"
+  echo "             ENABLED. If you had deliberately paused this alarm, re-pause it:"
+  echo "               aws cloudwatch disable-alarm-actions --region ${AWS_REGION} --alarm-names ${ALARM_NAME}"
+  echo ""
+fi
+
 aws cloudwatch put-metric-alarm \
   --region "$AWS_REGION" \
   --alarm-name "$ALARM_NAME" \
@@ -357,6 +454,7 @@ aws cloudwatch put-metric-alarm \
   --threshold "$THRESHOLD" \
   --comparison-operator LessThanThreshold \
   --treat-missing-data notBreaching \
+  "$ACTIONS_ENABLED_FLAG" \
   --alarm-actions "arn:aws:automate:${AWS_REGION}:ec2:stop"
 
 echo "==> Done. Alarm '${ALARM_NAME}' created/updated."

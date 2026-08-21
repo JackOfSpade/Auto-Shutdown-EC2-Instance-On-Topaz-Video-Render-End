@@ -26,7 +26,7 @@
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/lambda/topaz-max-lifetime-stop-*"
     }
   ]
 }

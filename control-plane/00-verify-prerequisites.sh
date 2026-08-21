@@ -27,6 +27,14 @@
 #        METRIC_NAMESPACE.
 #     5. Whether the per-instance idle alarm (topaz-gpu-idle-autostop-<id>)
 #        exists, its current state, and whether its alarm actions are enabled.
+#        NOTE that this alarm is OPT-IN and, for THIS project, deliberately
+#        absent: the operator decided on 2026-07-28 against any idle-based
+#        auto-stop (see 03-create-idle-alarm.sh's .DECISION header and
+#        docs/09-appendix-b-boundaries.md Sec 5). Its absence is the INTENDED
+#        state here and is reported as a [WARN] purely so the line stays
+#        visible in the report -- it is not a defect to fix, and
+#        docs/11-deploying-on-this-instance.md's troubleshooting table
+#        documents that [WARN] as expected on this box.
 #     6. Whether the AutoStopEligible=true tag is present (optional -- only
 #        required for INCLUDE_EC2_STOP=1 on 02, or the max-lifetime Lambda).
 #
@@ -88,6 +96,10 @@ EOF
 
 [[ -n "${INSTANCE_ID:-}" ]] || { echo "ERROR: INSTANCE_ID is not set." >&2; usage; }
 [[ -n "${AWS_REGION:-}"  ]] || { echo "ERROR: AWS_REGION is not set."  >&2; usage; }
+is_valid_instance_id "$INSTANCE_ID" || {
+  echo "ERROR: INSTANCE_ID='${INSTANCE_ID}' is not a valid EC2 instance id (expected i- followed by 8 or 17 hex digits)." >&2
+  usage
+}
 
 # METRIC_NAME has no meaningful default any more: which metric "matters" now
 # depends on IDLE_SIGNAL (render -> RenderActive, gpu -> GPUUtilization), a
@@ -173,7 +185,17 @@ if SHUTDOWN_BEHAVIOR="$(aws ec2 describe-instance-attribute \
   if is_shutdown_behavior_confirmed "$SHUTDOWN_BEHAVIOR"; then
     report OK "InstanceInitiatedShutdownBehavior='stop' -- a guest shutdown will STOP (not terminate) this instance."
   else
-    report FAIL "!!! InstanceInitiatedShutdownBehavior='${SHUTDOWN_BEHAVIOR}', NOT 'stop' !!! A guest-OS shutdown issued by the watchdog would ${SHUTDOWN_BEHAVIOR^^} this instance, destroying it, not stop it. DO NOT flip DryRun to \$false until this reads back 'stop'. Fix: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ./01-set-shutdown-behavior.sh"
+    # tr, not ${SHUTDOWN_BEHAVIOR^^}: the ^^ uppercase expansion is bash 4.0+,
+    # and macOS still ships /bin/bash 3.2.57, which `#!/usr/bin/env bash`
+    # resolves to on any admin workstation without a newer bash earlier in
+    # PATH. `bash -n` parses ^^ fine on 3.2 (so a syntax pre-check misses it)
+    # and it only blows up at RUNTIME, with "bad substitution" -- aborting the
+    # script mid-report. It would have done so on exactly this line: the one
+    # that fires when a guest shutdown would TERMINATE the box. shellcheck
+    # does not flag bash-version features either (verified 0.11.0, even with
+    # --enable=all), which is why this stays a comment and not a lint rule.
+    SHUTDOWN_BEHAVIOR_UPPER="$(printf '%s' "$SHUTDOWN_BEHAVIOR" | tr '[:lower:]' '[:upper:]')"
+    report FAIL "!!! InstanceInitiatedShutdownBehavior='${SHUTDOWN_BEHAVIOR}', NOT 'stop' !!! A guest-OS shutdown issued by the watchdog would ${SHUTDOWN_BEHAVIOR_UPPER} this instance, destroying it, not stop it. DO NOT flip DryRun to \$false until this reads back 'stop'. Fix: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ./01-set-shutdown-behavior.sh"
   fi
 else
   report FAIL "!!! could not read InstanceInitiatedShutdownBehavior: $(flatten_err "$SHUTDOWN_BEHAVIOR") !!! This is UNVERIFIABLE from here -- until it is confirmed 'stop', DryRun MUST stay \$true. Retry from an admin workstation with ec2:DescribeInstanceAttribute (the instance role itself is commonly denied this action)."
@@ -294,10 +316,16 @@ if ALARM_LINE="$(aws cloudwatch describe-alarms \
       --output text 2>&1)"; then
   ALARM_STATE="$(printf '%s' "$ALARM_LINE" | cut -f1)"
   ALARM_ACTIONS_ENABLED="$(printf '%s' "$ALARM_LINE" | cut -f2)"
+  # WHY these two stay [WARN] and not [OK], even though both describe an
+  # intended state: docs/11-deploying-on-this-instance.md's troubleshooting
+  # table documents "[5/6] reports [WARN]: alarm does not exist" as EXPECTED on
+  # this box, so promoting it to OK would desync the runbook. The level is
+  # deliberately unchanged; only the text is, because the old text called the
+  # intended state something to "Fix" and printed a command 03 now refuses.
   if [[ -z "$ALARM_STATE" || "$ALARM_STATE" == "None" ]]; then
-    report WARN "alarm ${ALARM_NAME} does not exist yet -- the out-of-band GPU-idle safety net is not deployed. Fix: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ./03-create-idle-alarm.sh"
+    report WARN "alarm ${ALARM_NAME} does not exist -- EXPECTED for this project. Idle-based auto-stop was decided against on 2026-07-28 (see 03-create-idle-alarm.sh's .DECISION header and docs/09-appendix-b-boundaries.md Sec 5); the GPU-keyed version of this alarm came within five minutes of stopping a healthy render on 2026-07-27. This is the intended state, NOT something to fix. Only if you deliberately want an idle cap for a different deployment: INSTANCE_ID=${INSTANCE_ID} AWS_REGION=${AWS_REGION} ENABLE_IDLE_ALARM=1 ./03-create-idle-alarm.sh (03 refuses without that opt-in)."
   elif [[ "$ALARM_ACTIONS_ENABLED" != "True" ]]; then
-    report WARN "alarm ${ALARM_NAME} exists (state ${ALARM_STATE}) but its actions are DISABLED -- it will NOT stop the instance even if it fires. Re-enable with: aws cloudwatch enable-alarm-actions --region ${AWS_REGION} --alarm-names ${ALARM_NAME}"
+    report WARN "alarm ${ALARM_NAME} exists (state ${ALARM_STATE}) with its actions DISABLED -- i.e. PAUSED: it will not stop the instance even if it fires. That may be deliberate; 03-create-idle-alarm.sh itself advises pausing the actions before a long pre-render setup. To resume it when the setup is done: aws cloudwatch enable-alarm-actions --region ${AWS_REGION} --alarm-names ${ALARM_NAME}"
   elif [[ "$ALARM_STATE" == "ALARM" ]]; then
     report WARN "alarm ${ALARM_NAME} exists, actions ENABLED, and is currently IN ALARM state -- it may stop this instance imminently if that action is the built-in ec2:stop action."
   else

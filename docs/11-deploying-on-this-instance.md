@@ -412,7 +412,17 @@ Once armed (Section 4) and a render completes or stalls:
    is not deployed, and the in-guest `Register-TimedStop.ps1` timed stop was
    cancelled once this section's steps were verified. If steps 1-5 above all
    fail to stop the instance, nothing else will - a human has to notice and
-   stop it by hand. See
+   stop it by hand.
+   **If you ever re-arm one of these, prefer `Register-TimedStop.ps1` over the
+   max-lifetime Lambda.** The timed stop runs *through* `Stop-Sequence.ps1`, so
+   the ephemeral-upload interlock still refuses a stop that would erase a
+   finished-but-not-uploaded render (it simply retries on its repeating
+   trigger). The Lambda stops the instance from *outside* the guest and so
+   bypasses that interlock entirely - a render sitting unuploaded on the
+   instance-store scratch volume is destroyed with the stop. See the `.DANGER`
+   header of
+   [`04-deploy-max-lifetime-lambda.sh`](../control-plane/04-deploy-max-lifetime-lambda.sh)
+   and [docs/16](16-render-loss-incident.md). See
    [docs/09 §5](09-appendix-b-boundaries.md#5-no-idle-alarm-no-timed-stop-the-watchdog-is-the-only-thing-that-will-ever-stop-this-box)
    for that trade-off and its manual mitigations, and
    [Phase 4](06-phase4-safety-net.md) for how to re-arm any of these layers

@@ -92,6 +92,15 @@ source "${SCRIPT_DIR}/lib/aws-idempotent.sh"
 # shellcheck source=lib/validation.sh
 source "${SCRIPT_DIR}/lib/validation.sh"
 
+# Shape-check INSTANCE_ID before ANY mutating call. This script tags the
+# instance (INCLUDE_EC2_STOP=1) and associates an instance profile onto it, so
+# a stale `export INSTANCE_ID=` from an earlier session would apply both to the
+# wrong box -- see lib/validation.sh's is_valid_instance_id for the full WHY.
+if ! is_valid_instance_id "$INSTANCE_ID"; then
+  echo "ERROR: INSTANCE_ID='${INSTANCE_ID}' is not a valid EC2 instance id (expected i- followed by 8 or 17 hex digits)." >&2
+  usage
+fi
+
 TRUST_POLICY="${IAM_DIR}/instance-role-trust-policy.json"
 PUTMETRIC_POLICY="${IAM_DIR}/cloudwatch-putmetric-policy.json"
 EC2_STOP_POLICY="${IAM_DIR}/ec2-stop-optional-policy.json"
@@ -117,6 +126,20 @@ PUTMETRIC_POLICY_RENDERED="${PUTMETRIC_TMP_DIR}/cloudwatch-putmetric-policy.json
 putmetric_policy_json="$(cat "$PUTMETRIC_POLICY")"
 putmetric_policy_json="${putmetric_policy_json//TopazRender\/GPU/$METRIC_NAMESPACE}"
 printf '%s' "$putmetric_policy_json" > "$PUTMETRIC_POLICY_RENDERED"
+# Defensive check, mirroring 05-grant-audit-reads.sh's identical guard on its
+# own placeholder render: if the hardcoded "TopazRender/GPU" literal above ever
+# drifts from what the checked-in JSON actually contains, the substitution
+# silently becomes a no-op and this script applies a policy scoped to the OLD
+# namespace while every line it prints -- including the final "can now publish
+# ... into the <operator's value> namespace" -- claims the new one. The
+# watchdog's PutMetricData calls would then come back AccessDenied every
+# minute, and 00-verify-prerequisites.sh's [4/6] would report only a WARN.
+if ! grep -qF -- "$METRIC_NAMESPACE" "$PUTMETRIC_POLICY_RENDERED"; then
+  echo "ERROR: rendering ${PUTMETRIC_POLICY}'s cloudwatch:namespace placeholder failed -- the" >&2
+  echo "       rendered policy does not contain '${METRIC_NAMESPACE}'. Check the placeholder" >&2
+  echo "       literal in both this script and ${PUTMETRIC_POLICY} still match." >&2
+  exit 1
+fi
 
 echo "==> [1/6] Creating IAM role ${ROLE_NAME}"
 echo "    aws iam create-role --role-name ${ROLE_NAME} --assume-role-policy-document file://${TRUST_POLICY}"
@@ -126,6 +149,38 @@ if ! run_idempotent "EntityAlreadyExists" aws iam create-role \
       --assume-role-policy-document "file://${TRUST_POLICY}" \
       --description "Least-privilege role for the Topaz render auto-stop watchdog"; then
   echo "    NOTE: role ${ROLE_NAME} already exists; reusing it."
+  # WHY read the trust policy back instead of just reusing the role: the trust
+  # policy is the ONE binding in this script that was previously accepted
+  # unverified. put-role-policy below is declarative (it overwrites), and both
+  # the profile/role and profile/instance bindings already have explicit
+  # reconcile branches -- but a pre-existing role that does not trust
+  # ec2.amazonaws.com (hand-edited, or created by an unrelated experiment that
+  # happened to pick this name) makes every subsequent step report success
+  # while EC2 cannot assume the role at all: IMDS serves no credentials,
+  # Push-GpuMetric.ps1's PutMetricData fails, and 00-verify-prerequisites.sh's
+  # [4/6] still reports OK because the POLICY TEXT is correct. The failure only
+  # ever surfaces as missing CloudWatch data.
+  #
+  # WHY detect-and-exit rather than an unconditional update-assume-role-policy:
+  # that API replaces the ENTIRE trust document. Silently hijacking a role this
+  # script did not create is a bigger surprise than put-role-policy, which only
+  # adds one name-scoped inline policy. Same convention as the two
+  # ambiguous-existing-entity branches below: detect, explain, print the exact
+  # remediation, exit 1.
+  EXISTING_TRUST="$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.AssumeRolePolicyDocument' --output json)"
+  if ! printf '%s' "$EXISTING_TRUST" | grep -qF -- "ec2.amazonaws.com"; then
+    echo "ERROR: the existing role ${ROLE_NAME} does not trust ec2.amazonaws.com." >&2
+    echo "       EC2 cannot assume it, so the instance would get NO credentials and the" >&2
+    echo "       watchdog's PutMetricData (and any tag-scoped stop) would fail silently." >&2
+    echo "       Inspect it, and if this role really is meant to be ours, replace its" >&2
+    echo "       trust policy with:" >&2
+    echo "         aws iam get-role --role-name ${ROLE_NAME} --query Role.AssumeRolePolicyDocument" >&2
+    echo "         aws iam update-assume-role-policy --role-name ${ROLE_NAME} \\" >&2
+    echo "             --policy-document file://${TRUST_POLICY}" >&2
+    echo "       (that REPLACES the whole trust document -- check what is there first)." >&2
+    exit 1
+  fi
+  echo "    NOTE: confirmed -- ${ROLE_NAME}'s trust policy still allows ec2.amazonaws.com to assume it."
 fi
 
 echo "==> [2/6] Attaching inline PutMetricData policy (cloudwatch:PutMetricData, namespace=${METRIC_NAMESPACE} only)"
@@ -149,6 +204,46 @@ aws iam put-role-policy \
 
 if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
   [[ -f "$EC2_STOP_POLICY" ]] || { echo "ERROR: INCLUDE_EC2_STOP=1 but ${EC2_STOP_POLICY} not found." >&2; exit 1; }
+  # ###########################################################################
+  # WHAT THE TAG CONDITION ACTUALLY BOUNDS -- READ BEFORE ADDING A SECOND BOX.
+  #
+  # iam/ec2-stop-optional-policy.json grants ec2:StopInstances on Resource "*"
+  # with a single condition: aws:ResourceTag/AutoStopEligible=true. Step [2c/6]
+  # below applies exactly that tag, and 04-deploy-max-lifetime-lambda.sh
+  # applies it too. So the tag is not an instance identifier -- it is a
+  # FLEET MEMBERSHIP marker that this very pipeline stamps onto every managed
+  # box. The honest statement of the boundary is therefore:
+  #
+  #     every AutoStopEligible=true instance's role can stop EVERY OTHER
+  #     AutoStopEligible=true instance in this account.
+  #
+  # This is ACCEPTED for this single-box deployment: there is exactly one
+  # tagged instance, so the fleet and the instance are the same thing. It is
+  # recorded here because the credential lives on a Windows box running
+  # third-party GUI software, and today the only thing keeping a stop scoped to
+  # ONE machine is in-guest: Stop-Sequence.ps1 passes its own IMDS-derived
+  # instance id. IAM, which is supposed to be the backstop, does not constrain
+  # it. A bug or stale cached id in that resolution would be permitted by IAM.
+  #
+  # WHAT TO CHANGE FOR MULTI-BOX (and why it is not done here): scoping
+  # Resource to a single instance ARN does NOT work as-is, because ROLE_NAME
+  # and PROFILE_NAME above are fixed literals shared by every box -- box B's
+  # deploy would overwrite the topaz-ec2-stop inline policy that box A's role
+  # depends on, silently REVOKING A's ability to stop itself. That trades a
+  # broad grant for a dead one, which is strictly worse under this project's
+  # own "no silently dead safety net" standard. Do it in this order instead:
+  #   1. make ROLE_NAME/PROFILE_NAME per-instance (suffix with INSTANCE_ID,
+  #      exactly as 04 already does for its function/schedule names), THEN
+  #   2. either give each box a distinct tag VALUE and condition on the value,
+  #      or render Resource to that box's instance ARN, and
+  #   3. update docs/11-deploying-on-this-instance.md Sec 3.3 Option B, whose
+  #      manual `file://control-plane/iam/ec2-stop-optional-policy.json`
+  #      fallback would then be applying a placeholder-bearing file.
+  # (ec2:SourceInstanceARN is also worth evaluating first -- it can express
+  # "this instance only" for requests made via an instance profile without
+  # per-instance roles -- but verify its exact semantics against current AWS
+  # docs rather than taking that on trust.)
+  # ###########################################################################
   echo "==> [2b/6] INCLUDE_EC2_STOP=1: attaching tag-scoped ec2:StopInstances policy"
   echo "    aws iam put-role-policy --role-name ${ROLE_NAME} --policy-name topaz-ec2-stop --policy-document file://${EC2_STOP_POLICY}"
   aws iam put-role-policy \
@@ -222,14 +317,27 @@ fi
 
 echo "==> [5/6] Waiting briefly for the instance profile to propagate (IAM is eventually consistent)..."
 # Give IAM a moment; association can fail with 'Invalid IAM Instance Profile' if
-# attempted too quickly after creation.
+# attempted too quickly after creation. 10s is NOT a guarantee -- propagation
+# to EC2 routinely takes 30-60s on a first creation -- so the association below
+# also recognizes that specific failure and tells the operator to re-run rather
+# than leaving them with an error that reads like a typo in the profile name.
 sleep 10
 
 echo "==> [6/6] Associating instance profile ${PROFILE_NAME} with ${INSTANCE_ID}"
 echo "    aws ec2 associate-iam-instance-profile --region ${AWS_REGION} \\"
 echo "        --instance-id ${INSTANCE_ID} \\"
 echo "        --iam-instance-profile Name=${PROFILE_NAME}"
-if ! run_idempotent "IncorrectState|already" aws ec2 associate-iam-instance-profile \
+# run_idempotent_hinted, not run_idempotent: 'Invalid IAM Instance Profile' /
+# InvalidParameterValue here is almost always propagation lag, not a bad name,
+# and this script is idempotent so "wait and re-run" costs nothing. The hint
+# must NOT be folded into the idempotency pattern above -- a match there
+# returns 2 and drops into the reconciliation block below, which would then
+# read back a nonexistent association and abort with the actively misleading
+# "associated with a DIFFERENT IAM instance profile: None".
+if ! run_idempotent_hinted "IncorrectState|already" \
+      "Invalid IAM Instance Profile|InvalidParameterValue" \
+      "HINT: IAM instance-profile propagation to EC2 is eventually consistent and can take 30-60s on first creation, while step [5/6] waits only 10s. This script is idempotent -- wait a minute and re-run it before treating the error above as a real problem." \
+      aws ec2 associate-iam-instance-profile \
       --region "$AWS_REGION" \
       --instance-id "$INSTANCE_ID" \
       --iam-instance-profile "Name=${PROFILE_NAME}"; then
@@ -266,5 +374,9 @@ fi
 
 echo "==> Done. Instance ${INSTANCE_ID} can now publish any metric (RenderActive, GPUUtilization, ...) into the ${METRIC_NAMESPACE} namespace."
 if [[ "$INCLUDE_EC2_STOP" == "1" ]]; then
-  echo "    (Optional ec2:StopInstances also granted, tag-scoped to AutoStopEligible=true.)"
+  echo "    (Optional ec2:StopInstances also granted, tag-scoped to AutoStopEligible=true."
+  echo "     NOTE that AutoStopEligible is a FLEET marker this pipeline applies to every"
+  echo "     managed box, not an instance identifier: any tagged instance's role can stop"
+  echo "     any other tagged instance in this account. Accepted for a single-box"
+  echo "     deployment -- see the boundary comment at step [2b/6] before adding a second.)"
 fi

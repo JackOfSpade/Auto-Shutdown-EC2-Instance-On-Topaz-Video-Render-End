@@ -41,6 +41,14 @@ EOF
 
 if [[ -z "${INSTANCE_ID:-}" ]]; then echo "ERROR: INSTANCE_ID is not set." >&2; usage; fi
 if [[ -z "${AWS_REGION:-}" ]];  then echo "ERROR: AWS_REGION is not set."  >&2; usage; fi
+# Shape-check the id before the modify call: this script CHANGES an attribute
+# on whatever instance it is pointed at, and a stale `export INSTANCE_ID=`
+# from an earlier session is the documented way to end up pointed at the
+# wrong one (see lib/validation.sh's is_valid_instance_id).
+if ! is_valid_instance_id "$INSTANCE_ID"; then
+  echo "ERROR: INSTANCE_ID='${INSTANCE_ID}' is not a valid EC2 instance id (expected i- followed by 8 or 17 hex digits)." >&2
+  usage
+fi
 
 echo "==> Setting instance-initiated-shutdown-behavior=stop on ${INSTANCE_ID} in ${AWS_REGION}"
 echo "    aws ec2 modify-instance-attribute --instance-id \"${INSTANCE_ID}\" --region \"${AWS_REGION}\" \\"

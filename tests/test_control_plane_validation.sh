@@ -50,6 +50,30 @@ assert_eq() {     # assert_eq <description> <actual> <expected>
   fi
 }
 
+# ---- is_valid_instance_id: the one input EVERY control-plane script takes ----------------------
+# The scripts tag instances, associate instance profiles onto them, and arm schedules that call
+# ec2:StopInstances against them, from an INSTANCE_ID the runbook has the operator `export` into
+# their shell -- so a stale export survives across sessions and across scripts. AWS has only ever
+# issued the 8-hex legacy form and the 17-hex current form, always lowercase.
+
+assert_true  "instance id: 17-hex current form is valid"  is_valid_instance_id "i-0123456789abcdef0"
+assert_true  "instance id: 8-hex legacy form is valid"    is_valid_instance_id "i-1234abcd"
+assert_true  "instance id: all-digits 17-hex is valid"    is_valid_instance_id "i-01234567890123456"
+
+assert_false "instance id: '' is invalid"                        is_valid_instance_id ""
+assert_false "instance id: bare id without the i- prefix is invalid" is_valid_instance_id "0123456789abcdef0"
+assert_false "instance id: a name-like value is invalid"         is_valid_instance_id "i-not-an-id"
+assert_false "instance id: 16 hex digits (one short) is invalid"  is_valid_instance_id "i-0123456789abcde"
+assert_false "instance id: 18 hex digits (one long) is invalid"   is_valid_instance_id "i-0123456789abcdef01"
+assert_false "instance id: 9 hex digits is invalid (between the two legal widths)" is_valid_instance_id "i-1234abcde"
+assert_false "instance id: uppercase hex is invalid (AWS emits lowercase)" is_valid_instance_id "i-0123456789ABCDEF0"
+assert_false "instance id: non-hex letters are invalid"          is_valid_instance_id "i-0123456789abcdefg"
+assert_false "instance id: a volume id is invalid"               is_valid_instance_id "vol-0123456789abcdef0"
+# The regex is anchored at both ends; without ^ and $ a shell-mangled value like a trailing newline
+# or an extra word would still match somewhere inside.
+assert_false "instance id: trailing junk after a valid id is invalid" is_valid_instance_id "i-0123456789abcdef0 extra"
+assert_false "instance id: leading junk before a valid id is invalid" is_valid_instance_id "x i-0123456789abcdef0"
+
 # ---- is_valid_idle_minutes: 03's IDLE_MINUTES rule --------------------------------------------
 
 assert_true  "idle minutes '1' is valid"  is_valid_idle_minutes "1"
@@ -135,7 +159,64 @@ fi
 assert_eq "run_idempotent: non-matching-pattern failure exits the subshell with 1" "$subshell_rc" "1"
 assert_true "run_idempotent: non-matching-pattern stderr is passed through, not swallowed" \
   grep -q "AccessDeniedException" "$SUBSHELL_ERR"
+assert_false "run_idempotent: with no hint configured, nothing extra is appended to the stderr" \
+  grep -q "HINT:" "$SUBSHELL_ERR"
 rm -f "$SUBSHELL_ERR"
+
+# ---- run_idempotent_hinted: the same wrapper, plus an operator hint on the hard-exit path ------
+# 02's instance-profile association and 04's create-function both fail in a way that reads like a
+# typo when it is really just IAM's eventual consistency. The hint must NOT be folded into the
+# idempotency pattern: a match there returns 2, which sends both call sites into a reconciliation
+# branch that reads back a nonexistent entity and reports something actively misleading.
+
+_stub_fail_propagation_lag() {
+  echo "An error occurred (InvalidParameterValue) when calling the AssociateIamInstanceProfile operation: Invalid IAM Instance Profile name" >&2
+  return 1
+}
+
+# (a) success is untouched by the hint arguments.
+if run_idempotent_hinted "EntityAlreadyExists" "Invalid IAM Instance Profile" "HINT: wait and re-run." true; then rc=0; else rc=$?; fi
+assert_eq "run_idempotent_hinted: successful command returns 0" "$rc" "0"
+
+# (b) the idempotency pattern still wins over the hint pattern -- an "already exists" failure must
+# stay a return 2 the caller reconciles, never a hinted hard exit.
+if run_idempotent_hinted "EntityAlreadyExists" "Invalid IAM Instance Profile" "HINT: wait and re-run." _stub_fail_matching_pattern; then rc=0; else rc=$?; fi
+assert_eq "run_idempotent_hinted: matching-idempotency-pattern failure still returns 2" "$rc" "2"
+
+# (c) an unexpected failure that matches the hint pattern: still a hard exit 1, still passes the
+# original stderr through, and ADDS the hint. Driven in a subshell because it calls `exit`.
+HINTED_ERR="$(mktemp)"
+if ( run_idempotent_hinted "IncorrectState|already" "Invalid IAM Instance Profile|InvalidParameterValue" \
+       "HINT: IAM propagation is eventually consistent -- wait a minute and re-run." \
+       _stub_fail_propagation_lag ) 2>"$HINTED_ERR"; then
+  hinted_rc=0
+else
+  hinted_rc=$?
+fi
+assert_eq "run_idempotent_hinted: hint-matching failure still exits 1 (it is still a real failure)" "$hinted_rc" "1"
+assert_true "run_idempotent_hinted: the raw AWS stderr is still passed through" \
+  grep -q "Invalid IAM Instance Profile name" "$HINTED_ERR"
+assert_true "run_idempotent_hinted: the propagation hint is appended for a hint-matching failure" \
+  grep -q "wait a minute and re-run" "$HINTED_ERR"
+rm -f "$HINTED_ERR"
+
+# (d) an unexpected failure that does NOT match the hint pattern must not get the hint -- a hint
+# glued onto an AccessDenied would send the operator off to wait for propagation that is not the
+# problem.
+UNHINTED_ERR="$(mktemp)"
+if ( run_idempotent_hinted "IncorrectState|already" "Invalid IAM Instance Profile|InvalidParameterValue" \
+       "HINT: IAM propagation is eventually consistent -- wait a minute and re-run." \
+       _stub_fail_nonmatching_pattern ) 2>"$UNHINTED_ERR"; then
+  unhinted_rc=0
+else
+  unhinted_rc=$?
+fi
+assert_eq "run_idempotent_hinted: non-hint-matching failure exits 1" "$unhinted_rc" "1"
+assert_true "run_idempotent_hinted: non-hint-matching stderr is passed through" \
+  grep -q "AccessDeniedException" "$UNHINTED_ERR"
+assert_false "run_idempotent_hinted: the hint is NOT shown for an unrelated failure" \
+  grep -q "wait a minute and re-run" "$UNHINTED_ERR"
+rm -f "$UNHINTED_ERR"
 
 echo
 if [ "$fail" -ne 0 ]; then

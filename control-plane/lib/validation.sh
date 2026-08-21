@@ -8,6 +8,25 @@
 # AWS credentials or network access -- these are the only parts of the
 # control plane that CAN be tested end-to-end outside a real AWS account.
 
+# is_valid_instance_id <v> — true iff <v> looks like an EC2 instance id: the
+# 8-hex-digit legacy form (i-1234abcd) or the 17-hex-digit current form
+# (i-0123456789abcdef0). AWS has only ever issued those two widths, and always
+# lowercase hex.
+#
+# WHY every script that consumes INSTANCE_ID calls this: docs/11's runbook
+# tells the operator to `export INSTANCE_ID=...` into their shell, so a stale
+# export or a mistyped id survives across sessions and across scripts. The
+# scripts here TAG instances, ASSOCIATE instance profiles onto them, and arm
+# schedules that call ec2:StopInstances against them -- pointing any of that at
+# the wrong box is the "wrong instance stop" class this project's safety bias
+# exists to prevent. A shape check cannot catch a transposition that still
+# names a real instance (04's pre-flight identity echo covers that half), but
+# it does make a malformed id fail before the FIRST mutating AWS call instead
+# of half-way through a multi-step deployment.
+is_valid_instance_id() {
+  [[ "$1" =~ ^i-([0-9a-f]{8}|[0-9a-f]{17})$ ]]
+}
+
 # is_valid_idle_minutes <v> — true iff <v> is a positive integer with no
 # leading zeros (03-create-idle-alarm.sh's IDLE_MINUTES rule).
 #

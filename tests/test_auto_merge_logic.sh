@@ -7,6 +7,11 @@
 # them against a scratch git repo with fixture branches/commits, plus canned `gh api` JSON for the
 # CI-conclusion parsing. Wired into ci.yml.
 #
+# The scratch repo is deliberately isolated from the ambient git environment (see the `git init` below):
+# no global/system config, no `init.templateDir` hooks. This suite is meant to be run locally as well as
+# in CI, and a developer's own hooks or `commit.gpgsign` must never run against — or abort — the fixture
+# commits here.
+#
 # Run:  bash tests/test_auto_merge_logic.sh
 set -euo pipefail
 
@@ -30,12 +35,27 @@ assert_true() {   # assert_true <description> <command...>
 
 assert_false() {  # assert_false <description> <command...>
   local desc="$1"; shift
-  if ! "$@"; then
-    echo "PASS: $desc"
-    pass_count=$((pass_count + 1))
-  else
+  local rc=0
+  "$@" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     echo "FAIL: $desc (expected failure/false, got success)"
     fail=1
+  elif [ "$rc" -ge 126 ]; then
+    # 126/127 are the shell's "found but not executable" / "command not found" statuses. A naive
+    # `if ! "$@"` treats those as a PASS, so a predicate renamed or deleted in
+    # scripts/auto_merge_decision.sh would leave MOST of this suite green against a function that no
+    # longer exists — bash's "command not found" goes to stderr, invisible in the PASS/FAIL summary.
+    # The safety-critical assertions here (red CI must skip, a malformed API response must not be
+    # green, an advanced branch must not be deleted) are exactly the assert_false ones, so they are
+    # the ones that must not be able to pass vacuously.
+    # NOTE: only >= 126 is treated as broken, NOT every "large" status — git's own 128 for an
+    # unresolvable ref is a genuine result from a working command, so assertions about it use an
+    # explicit exit-status check instead of assert_false (see the is_ancestor_of error cases below).
+    echo "FAIL: $desc (command '$1' not found or not executable, rc=$rc — not a genuine false)"
+    fail=1
+  else
+    echo "PASS: $desc"
+    pass_count=$((pass_count + 1))
   fi
 }
 
@@ -49,6 +69,31 @@ assert_eq() {     # assert_eq <description> <actual> <expected>
     fail=1
   fi
 }
+
+# ---- predicate existence gate ----------------------------------------------------------------
+# Belt-and-braces for the assert_false hazard above: assert their existence UP FRONT, so a rename or
+# a deletion in scripts/auto_merge_decision.sh reports the missing predicate by name instead of
+# showing up as a wall of rc=127 assertion failures. This list is the public predicate surface the
+# workflow calls; the reverse check below keeps it from rotting when a predicate is added.
+EXPECTED_PREDICATES="ci_conclusion_from_json is_ci_green ci_runs_api_path can_merge_next_branch"
+EXPECTED_PREDICATES="$EXPECTED_PREDICATES is_ancestor_of ci_run_id_from_json ci_run_attempt_from_json"
+EXPECTED_PREDICATES="$EXPECTED_PREDICATES should_retry_failed_ci"
+for fn in $EXPECTED_PREDICATES; do
+  declare -F "$fn" >/dev/null \
+    || { echo "FAIL: predicate $fn is missing from scripts/auto_merge_decision.sh"; fail=1; }
+done
+# Reverse direction: every public (non `_`-prefixed) function the script defines must appear above,
+# so a NEW predicate can't be added to the workflow's decision surface with no test and no notice.
+# `_ci_run_field_from_json` is deliberately excluded — it is the private shared helper behind the two
+# wrappers, exercised through them.
+# `done < <(...)` rather than a pipeline into the loop: a piped loop body runs in a SUBSHELL, so a
+# `fail=1` set inside it would be discarded and this gate would report nothing.
+while read -r fn; do
+  case " $EXPECTED_PREDICATES " in
+    *" $fn "*) ;;
+    *) echo "FAIL: scripts/auto_merge_decision.sh defines $fn, which this suite does not cover — test it and add it to EXPECTED_PREDICATES"; fail=1 ;;
+  esac
+done < <(grep -oE '^[a-z][a-z0-9_]*\(\)' "$ROOT/scripts/auto_merge_decision.sh" | sed 's/()$//')
 
 # ---- ci_conclusion_from_json / is_ci_green: the fail-closed CI gate ------------------------
 
@@ -124,9 +169,26 @@ cleanup() { cd "$ROOT" 2>/dev/null || true; rm -rf "$SCRATCH"; }
 trap cleanup EXIT
 
 cd "$SCRATCH"
-git init -q -b main
+# ISOLATE THE FIXTURE REPO FROM THE AMBIENT GIT ENVIRONMENT. Set before `git init`, so both the
+# config and the template are neutered at creation time:
+#   - GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM=/dev/null — the developer's ~/.gitconfig never applies.
+#     Without this, a global `commit.gpgsign = true` makes the fixture commits below prompt/fail and
+#     abort the whole suite under `set -euo pipefail` with a gpg error rather than a test failure,
+#     and a global `core.hooksPath` points the fixture repo at the developer's own hooks.
+#   - --template= (empty) — do NOT copy `init.templateDir` hooks into this repo. This repo's own
+#     developer setup puts an act-based `pre-push` CI hook there (see .actrc); a bare `git init`
+#     copies it into every scratch repo, so the moment this suite grows an end-to-end delete-safety
+#     test that pushes, the test would recursively invoke `act` inside itself.
+# Both mechanisms need git >= 2.32 / 1.7 respectively (satisfied by CI's ubuntu-latest and by local
+# dev machines); switch to per-command `git -c` prefixes if an older git ever has to be supported.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+git init -q -b main --template=
+# Now MANDATORY rather than merely polite: with the global config neutered there is no identity to
+# fall back on. commit.gpgsign is redundant under /dev/null global config and set only to document
+# that these fixture commits must never reach for a signing key.
 git config user.name "test"
 git config user.email "test@example.com"
+git config commit.gpgsign false
 echo "seed" > f.txt
 git add f.txt
 git commit -q -m "seed"
@@ -161,6 +223,21 @@ git commit -q -am "unmerged"
 git checkout -q main
 assert_false "an unmerged branch is NOT an ancestor of main — must attempt a real merge, not skip as already-merged" \
   is_ancestor_of unmerged-branch main
+
+# The delete gate in auto-merge-claude.yml treats ANY non-zero from this helper as "do not delete"
+# (and, at the top of the loop, as "not already contained — attempt a real merge"). `git merge-base
+# --is-ancestor` exits 128, not 1, for an unresolvable ref, so lock in that the helper passes that
+# status straight through: a ref that vanished mid-run must never read as "already contained in
+# main" and get deleted. Asserted on the exit status EXPLICITLY rather than via assert_false, which
+# (correctly) rejects rc >= 126 as a broken invocation — git's 128 here is a real answer from a
+# working command, not a missing function. 2>/dev/null keeps git's `fatal:` lines out of the suite
+# output, where they would read as a broken test run.
+rc=0; is_ancestor_of no-such-ref-abcdef main 2>/dev/null || rc=$?
+assert_true "an unresolvable ANCESTOR ref is not reported as an ancestor (git's 128 stays non-zero)" \
+  test "$rc" -ne 0
+rc=0; is_ancestor_of merged-branch no-such-ref-abcdef 2>/dev/null || rc=$?
+assert_true "an unresolvable DESCENDANT ref is not reported as containing anything" \
+  test "$rc" -ne 0
 
 # ---- ci_run_id_from_json / ci_run_attempt_from_json / should_retry_failed_ci: the one-shot,
 # content-free CI retry --------------------------------------------------------------------------

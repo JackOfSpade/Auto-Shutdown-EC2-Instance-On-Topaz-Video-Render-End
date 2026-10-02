@@ -38,7 +38,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install shellcheck
         # Pinned, and fetched from the upstream release rather than `apt-get
@@ -91,7 +91,7 @@ jobs:
         # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
         # so this is the only gate that covers that bash. Pinned to a specific tag (not `:latest`) so a
         # new actionlint release can't silently turn this job red on an unrelated change.
-        uses: docker://rhysd/actionlint:1.7.7
+        uses: docker://rhysd/actionlint:1.7.7@sha256:1d74bfc9fd1963af8f89a7c22afaaafd42f49aad711a09951d02cb996398f61d # 1.7.7
         with:
           args: -color
 
@@ -220,7 +220,7 @@ jobs:
         shell: pwsh
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install PSScriptAnalyzer + Pester
         run: |
@@ -362,10 +362,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
           cache: pip

@@ -176,9 +176,9 @@ cd "$SCRATCH"
 #     abort the whole suite under `set -euo pipefail` with a gpg error rather than a test failure,
 #     and a global `core.hooksPath` points the fixture repo at the developer's own hooks.
 #   - --template= (empty) — do NOT copy `init.templateDir` hooks into this repo. This repo's own
-#     developer setup puts an act-based `pre-push` CI hook there (see .actrc); a bare `git init`
+#     developer setup can put a `pre-push` CI hook there; a bare `git init`
 #     copies it into every scratch repo, so the moment this suite grows an end-to-end delete-safety
-#     test that pushes, the test would recursively invoke `act` inside itself.
+#     test that pushes, the test would recursively invoke that hook inside itself.
 # Both mechanisms need git >= 2.32 / 1.7 respectively (satisfied by CI's ubuntu-latest and by local
 # dev machines); switch to per-command `git -c` prefixes if an older git ever has to be supported.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null

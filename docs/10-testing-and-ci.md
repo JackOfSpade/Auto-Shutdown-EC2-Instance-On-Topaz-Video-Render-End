@@ -1,57 +1,24 @@
 # 10 - Testing & CI
 
-[README](../README.md) - [Architecture](01-architecture.md) - [Phase 0](02-phase0-confirmations.md) - [Phase 1](03-phase1-instance-prep.md) - [Phase 2](04-phase2-watchdog.md) - [Phase 3](05-phase3-stop-sequence.md) - [Phase 4](06-phase4-safety-net.md) - [Phase 5](07-phase5-notifications.md) - [Appendix A](08-appendix-a-corrections.md) - [Appendix B](09-appendix-b-boundaries.md) - **Testing & CI**
+[Architecture](01-architecture.md) - [Phase 0](02-phase0-confirmations.md) - [Phase 1](03-phase1-instance-prep.md) - [Phase 2](04-phase2-watchdog.md) - [Phase 3](05-phase3-stop-sequence.md) - [Phase 4](06-phase4-safety-net.md) - [Phase 5](07-phase5-notifications.md) - [Appendix A](08-appendix-a-corrections.md) - [Appendix B](09-appendix-b-boundaries.md) - **Testing & CI**
 
 This project is split across three languages (Bash, PowerShell, Python), each
 with its own linter and, where the code has meaningful logic to exercise, its
 own test suite. All of it is defined in one workflow
 ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) so a bad change is
-caught before it reaches an EC2 box that bills by the hour. **Where that
-workflow actually executes today is not GitHub** - read the next section before
-you rely on it.
+caught before it reaches an EC2 box that bills by the hour.
 
-## Where CI actually runs today
+## Where CI runs
 
-GitHub Actions is currently **disabled** for this repository (`gh api
-repos/:owner/:repo/actions/permissions` returns `{"enabled":false}`). It was
-enabled earlier - the run history still holds 34 runs, the most recent on
-2026-08-10 - and was switched off afterwards. So `ci.yml` is not running in the
-cloud right now, and a green checkmark will not appear on a push or a PR.
+GitHub Actions is the authoritative gate. `ci.yml` runs on every push and pull
+request, and can be started manually with `workflow_dispatch`. It checks code on
+GitHub-hosted Ubuntu runners, with the PowerShell suite also running on
+Windows. New commits cancel stale in-progress runs for the same ref.
 
-The gate that does run is [`act`](https://github.com/nektos/act), invoked by a
-**global pre-push hook** (installed for every repo on this machine via git's
-`init.templateDir`, at `~/.git-templates/hooks/pre-push`). On a push to a
-protected branch (`main`, `master`, `release*`) the hook checks out the exact
-pushed SHA into a temporary detached worktree and runs the whole workflow there
-in Docker, so what gets validated is the commit being pushed and not whatever
-happens to be in your working tree - and the push is blocked unless every job
-passes. Relevant knobs:
-
-| Env | Effect |
-|-----|--------|
-| `SKIP_ACT=1 git push` | skip the hook for one push |
-| `git push --no-verify` | skip all pre-push hooks |
-| `ACT_ARCH` | `native` (default; arm64 containers on Apple Silicon) or `amd64` |
-| `ACT_TIMEOUT` | seconds per local CI run, default `900`, `0` disables |
-| `ACT_JOBS` | max concurrent jobs, default `1` |
-| `ACT_ARGS` | extra flags passed through to `act` |
-| `ACT_PROTECTED_BRANCHES` | branch globs the hook guards; empty protects nothing |
-
-Two consequences worth stating plainly:
-
-- The hook is **machine-local**. A clone on another machine, or a push with
-  `SKIP_ACT=1` / `--no-verify`, has no CI at all. Nothing in the repository can
-  tell you that happened - so if you are working somewhere other than the
-  maintainer's Mac, run the commands in this document by hand.
-- [`.actrc`](../.actrc) exists only for `act` (GitHub never reads it) and works
-  around an `act` PATH bug, not anything wrong with the workflow.
-
-If cloud Actions is ever switched back on, re-verify the auto-merge workflow
-first: it is the one workflow with write permissions, it triggers on `CI`
-completing, and it depends on `ci.yml`'s `workflow_dispatch` trigger to get a CI
-run for the merge commit it pushes (GitHub raises no workflow events for a
-`GITHUB_TOKEN` push). A Windows CI leg is the other thing to add - see
-[Known gaps](#known-gaps) below.
+The security workflows run independently: dependency review evaluates pull
+requests, CodeQL scans supported source on pushes, pull requests, and a weekly
+schedule, and Dependabot opens routine dependency updates. None requires AWS,
+GCP, or other production credentials.
 
 ## What CI checks
 
@@ -292,25 +259,6 @@ need an EC2 GPU box just to run the unit tests.
 Accepted, deliberate holes in the above. They are written down because an
 unlisted gap eventually gets mistaken for coverage.
 
-- **No test executes on Windows anywhere.** `in-guest/tests/Watchdog.Tests.ps1`
-  contains exactly one platform-gated test - the `Test-FileUnlocked` case for a
-  file held open with an exclusive handle, marked `-Skip:(-not $IsWindows)`
-  because `FileShare` advisory-lock semantics are only guaranteed on Windows.
-  The skip is correct; the gap is that no CI leg ever supplies Windows, so that
-  branch of the render-completion decision is verified nowhere. This is the "1
-  skipped" in the suite's pass line, and it is permanent, not incidental.
-  A `windows-latest` matrix leg was considered and **rejected for now**: with
-  cloud Actions disabled and `act` unable to run Windows containers, the leg
-  would never execute on any machine - a gate that looks like coverage and is
-  not, which is the exact failure mode [docs/16](16-render-loss-incident.md)
-  exists to warn about. Until then, run `Invoke-Pester -Path in-guest/tests -CI`
-  manually on the EC2 Windows box when touching `Test-FileUnlocked`. **If cloud
-  Actions is ever re-enabled, adding that leg is the first thing to do.** Note
-  it would buy exactly one thing - the skip stops skipping - and not a 5.1
-  signal: the job sets `defaults.run.shell: pwsh`, so a Windows leg still runs
-  PowerShell 7. `PSUseCompatibleSyntax` remains the 5.1 gate, and it is the
-  cheaper one anyway, since it covers every in-guest script rather than only the
-  code the tests reach.
 - **Two control-plane deploy scripts are still lint-only.** `00`, `02`, `03` and
   `04` are each executed by a `tests/test_*.sh` suite against the fake-AWS
   fixtures ([`test_verify_prerequisites.sh`](../tests/test_verify_prerequisites.sh),
@@ -331,5 +279,3 @@ unlisted gap eventually gets mistaken for coverage.
   now pins exactly that: the `ENABLE_IDLE_ALARM` opt-in gate, the
   statistic/threshold pairing, `ActionsEnabled` preservation across a re-run, and
   the teardown path.
-
-Back to the [README](../README.md).

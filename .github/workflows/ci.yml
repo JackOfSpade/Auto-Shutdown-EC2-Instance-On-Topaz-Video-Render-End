@@ -23,6 +23,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   shell-lint:
     name: Shell + workflow checks (shellcheck, bash 3.2 lint, IAM JSON, bash tests, actionlint)
@@ -46,12 +50,8 @@ jobs:
         # is what lints the bash embedded in workflow `run:` blocks — matching it
         # means .sh files on disk and bash inside a workflow are held to ONE
         # standard instead of two. Bump this and that tag together.
-        # The install cannot be dropped in favour of a preinstalled binary: act's
-        # catthehacker/ubuntu:act-latest image ships no shellcheck at all.
-        # Arch is resolved at runtime rather than hardcoded, for the same reason as
-        # the pwsh install below: the pre-push hook defaults to ACT_ARCH=native, so
-        # on this Apple Silicon host the container is arm64, and an x86_64 tarball
-        # there dies with an opaque exec-format error.
+        # Resolve the runner architecture rather than assuming x86_64 so the
+        # pinned binary remains usable if GitHub changes the hosted image.
         run: |
           set -euo pipefail
           ver=0.10.0
@@ -79,16 +79,13 @@ jobs:
         # actually exercises, so a quoting bug there turns a passing test into a
         # test of the wrong branch. Any new directory is now covered automatically.
         # .claude/ is excluded because this agent tooling keeps full repo copies in
-        # .claude/worktrees/; a clean CI checkout has no such directory, but a
-        # developer running `act push` from a dirty checkout would otherwise lint
-        # every worktree copy. An empty result makes shellcheck exit non-zero,
+        # .claude/worktrees/. An empty result makes shellcheck exit non-zero,
         # which is intended: a discovery gate that finds nothing has proved nothing.
         run: find . -name '*.sh' -not -path './.git/*' -not -path './.claude/*' -print0 | xargs -0 shellcheck -x --source-path=SCRIPTDIR
 
       - name: Run actionlint
         # Deliberately ordered here, ahead of the gates below: a workflow-YAML error invalidates every
-        # one of them, and under the `act` pre-push hook (docs/10) waiting for the full bash-suite loop
-        # before being told the YAML is broken costs the developer minutes to learn nothing.
+        # one of them, and reporting it before the full bash suite saves time.
         # The shellcheck step above only covers standalone *.sh files on disk — it never sees the bash embedded
         # in the workflows' own `run:` blocks (e.g. the merge loop in auto-merge-claude.yml). actionlint
         # statically checks workflow YAML AND shells out to shellcheck on every embedded `run:` script,
@@ -157,7 +154,7 @@ jobs:
         # created the role — leaving a half-provisioned control plane to unwind by
         # hand. These documents are also the tag-scoped guardrails that keep the
         # Lambda from stopping the wrong instance, so they are worth a parse check.
-        # python3 (present on both GitHub's runner and catthehacker's act image)
+        # python3 is available on the GitHub-hosted runner.
         # rather than `jq empty`: json.load accepts exactly ONE document, while jq
         # happily accepts a stream, so a file that ended up with two concatenated
         # objects would pass jq and still be rejected by AWS.
@@ -208,12 +205,16 @@ jobs:
           echo "Bash test suites passed: $ran."
 
   powershell:
-    name: PowerShell analyze + test
-    runs-on: ubuntu-latest
+    name: PowerShell analyze + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     # See the shell-lint job: Install-Module from PSGallery and the pwsh tarball
     # curl below are both unbounded network operations, and 360 idle minutes is
     # the wrong default for this repo of all repos.
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         shell: pwsh
@@ -221,59 +222,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # act-local-CI only. GitHub's ubuntu-latest ships PowerShell preinstalled;
-      # act's runner image (catthehacker/ubuntu:act-latest) has no pwsh at all, so
-      # every step in this job — which defaults to `shell: pwsh` — died with exit
-      # 127 ("pwsh: executable file not found in $PATH") under the global
-      # `act push` pre-push hook. Since this repo's cloud Actions are disabled,
-      # skipping the job locally would leave the PowerShell code with no CI
-      # anywhere, so it is installed rather than skipped.
-      # `shell: bash` is REQUIRED here and is not redundant: the job-level default
-      # is pwsh, which is the very thing that does not exist yet.
-      # `env.ACT == 'true'` rather than a bare truthiness test, because GitHub
-      # treats ANY non-empty string (including "false") as true; the in-script
-      # re-check is a second guard so a misfiring `if:` degrades to a no-op.
-      - name: Install PowerShell (act-local CI only — GitHub's runner already has it)
-        if: ${{ env.ACT == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [ "${ACT:-}" = "true" ] || exit 0
-          if ! command -v pwsh >/dev/null 2>&1; then
-            # Pinned so the act-local gate runs a fixed, reviewed runtime instead
-            # of whatever the download URL serves today; 7.4.x is the LTS line, so
-            # it stays close to the pwsh GitHub's ubuntu-latest preinstalls. It is
-            # deliberately NOT asserted to equal the other hosts this code meets
-            # (GitHub's preinstalled pwsh, and the 7.5.x a developer runs locally
-            # per docs/10) — the floor check and the version line printed by the
-            # next step are what make those differences visible rather than silent.
-            ver=7.4.6
-            # Match the CONTAINER's arch, not the host's. The pre-push hook runs act
-            # with --container-architecture linux/amd64, but a bare `act push` on an
-            # Apple Silicon host gets an arm64 container; downloading the wrong
-            # tarball fails with a rosetta/ld-linux elf error, not a clear message.
-            case "$(uname -m)" in
-              x86_64) arch=x64 ;;
-              aarch64 | arm64) arch=arm64 ;;
-              *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
-            esac
-            curl -fsSLo /tmp/pwsh.tar.gz \
-              "https://github.com/PowerShell/PowerShell/releases/download/v${ver}/powershell-${ver}-linux-${arch}.tar.gz"
-            sudo mkdir -p /opt/microsoft/powershell/7
-            sudo tar -xzf /tmp/pwsh.tar.gz -C /opt/microsoft/powershell/7
-            sudo chmod +x /opt/microsoft/powershell/7/pwsh
-            sudo ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh
-          fi
-          pwsh --version
-
       - name: Install PSScriptAnalyzer + Pester
         run: |
-          # Three different PowerShell hosts run this job's code over its lifetime:
-          # the 7.4.6 installed above under act, whatever pwsh GitHub's
-          # ubuntu-latest preinstalls, and the developer's local pwsh. Record which
-          # one actually ran — a behavior difference between them is otherwise
-          # invisible in the log. The floor is asserted LOOSELY (>= 7.4) on purpose:
-          # these hosts are allowed to differ, they just may not drop below the
+          # Record the GitHub-hosted PowerShell runtime. The floor is asserted
+          # loosely (>= 7.4): hosted images can advance without weakening the
           # version this suite was reviewed on. Compared on Major/Minor rather than
           # cast to [version], because PSVersion is a SemanticVersion on pwsh 7 and
           # a preview build would not cast cleanly.
@@ -416,6 +368,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: lambda/max-lifetime-stop/requirements-dev.txt
 
       - name: Install dependencies
         run: python -m pip install -r lambda/max-lifetime-stop/requirements-dev.txt

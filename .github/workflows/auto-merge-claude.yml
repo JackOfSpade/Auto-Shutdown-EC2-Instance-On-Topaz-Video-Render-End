@@ -18,12 +18,9 @@ name: Auto-merge branches to main
 # manually (one PR) to bootstrap main with this workflow + CI; every branch after that
 # is drained automatically once its CI is green.
 #
-# NOTE: GitHub Actions is currently DISABLED on this repository (the last cloud runs were
-# 2026-08-10), so nothing here executes today — local `act` + the pre-push hook are what
-# actually gate changes. This file is still maintained as correct-when-re-enabled: read
-# every change below as "what happens the day Actions is switched back on", which is also
-# why the GITHUB_TOKEN no-recursion trap at the push step is worth fixing now rather than
-# rediscovering it as a dead drain later.
+# CI is a GitHub Actions gate. The GITHUB_TOKEN no-recursion trap at the push
+# step is handled here so a successful merge cannot leave the next cycle waiting
+# forever for a CI run that GitHub will not create automatically.
 
 on:
   workflow_run:

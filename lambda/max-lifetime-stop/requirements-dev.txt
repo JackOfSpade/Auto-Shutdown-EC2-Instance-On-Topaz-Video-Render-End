@@ -11,6 +11,6 @@
 # separate question, and lives in pyproject.toml next to this file -- pinning
 # the version alone was pinning ruff's near-empty default selection.
 boto3==1.43.104
-botocore==1.43.104
+botocore==1.43.105
 pytest==9.1.1
 ruff==0.16.9

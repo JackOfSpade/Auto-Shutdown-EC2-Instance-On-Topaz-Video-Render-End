@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+    branches: [main]
   # Not merely a manual escape hatch: auto-merge-claude.yml pushes its merge
   # commit to main using GITHUB_TOKEN, and GitHub deliberately raises NO workflow
   # events for a GITHUB_TOKEN push (its recursion guard). So the merge commit
@@ -379,3 +380,39 @@ jobs:
 
       - name: Run pytest
         run: python -m pytest lambda/ -q
+
+  windows-powershell51:
+    name: Windows PowerShell 5.1 runtime
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run pure helpers in the deployment runtime
+        shell: powershell
+        run: ./tests/windows-powershell51-smoke.ps1
+
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs: ["shell-lint", "powershell", "python-lambda", "windows-powershell51", "merge-policy"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every prerequisite to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
+          PY
+  merge-policy:
+    name: Validate merge policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 -m unittest discover -s .github/tests -p 'test_merge_validated_pr.py'

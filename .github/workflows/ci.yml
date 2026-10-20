@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+    branches: [main]
   # Not merely a manual escape hatch: auto-merge-claude.yml pushes its merge
   # commit to main using GITHUB_TOKEN, and GitHub deliberately raises NO workflow
   # events for a GITHUB_TOKEN push (its recursion guard). So the merge commit
@@ -379,3 +380,25 @@ jobs:
 
       - name: Run pytest
         run: python -m pytest lambda/ -q
+
+  windows-powershell51:
+    name: Windows PowerShell 5.1 runtime
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run pure helpers in the deployment runtime
+        shell: powershell
+        run: ./tests/windows-powershell51-smoke.ps1
+
+  required:
+    name: CI required
+    if: always()
+    needs: [shell-lint, powershell, python-lambda, windows-powershell51]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          ALL_PASSED: ${{ needs.shell-lint.result == 'success' && needs.powershell.result == 'success' && needs.python-lambda.result == 'success' && needs.windows-powershell51.result == 'success' }}
+        run: test "$ALL_PASSED" = true

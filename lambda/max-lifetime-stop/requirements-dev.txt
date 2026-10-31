@@ -12,5 +12,5 @@
 # the version alone was pinning ruff's near-empty default selection.
 boto3==1.43.108
 botocore==1.43.113
-pytest==9.1.1
+pytest==9.2.0
 ruff==0.16.10
